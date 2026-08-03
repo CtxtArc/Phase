@@ -1,0 +1,13 @@
+[package]
+name = "phase_driver"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "phase"
+path = "src/main.rs"
+
+[dependencies]
+phase_lexer = { path = "../lexer" }
+phase_ast = { path = "../ast" }
+phase_parser = { path = "../parser" }

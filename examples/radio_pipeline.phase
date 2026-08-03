@@ -1,0 +1,30 @@
+// Minimal end-to-end example pipeline (M1 scope: straight-line, no if/while).
+// Simulated capture -> filter (extern C kernel) -> simulated playback.
+
+entity Sample : @RAM {
+    value: f32
+}
+
+state Packet {
+    Received -> Decoded -> Validated
+}
+
+extern fn fir_filter(in_: buffer<Sample, 1024> @RAM,
+                      out: buffer<Sample, 1024> @RAM);
+
+extern fn device_capture(dst: buffer<Sample, 1024> @DMA);
+extern fn device_playback(src: buffer<Sample, 1024> @DEVICE);
+
+fn main() {
+    buffer<Sample, 1024> raw @DMA;
+    device_capture(raw);
+    sync(raw);
+
+    move raw -> @RAM;
+    buffer<Sample, 1024> filtered @RAM;
+    fir_filter(raw, filtered);
+
+    move filtered -> @DEVICE;
+    device_playback(filtered);
+    sync(filtered);
+}

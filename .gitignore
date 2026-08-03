@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target
+
+# Rust backup files
+**/*.rs.bk
+
+# IDEs
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Vim
+*.swp
+*.swo
+
+# Emacs
+*~
+
+# Environment files
+.env
+.env.*
+
+# Logs
+*.log
