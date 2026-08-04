@@ -12,3 +12,5 @@ phase_lexer = { path = "../lexer" }
 phase_ast = { path = "../ast" }
 phase_parser = { path = "../parser" }
 phase_analysis = { path = "../analysis" }
+phase_pir = { path = "../pir" }
+phase_codegen_c = { path = "../codegen_c" }

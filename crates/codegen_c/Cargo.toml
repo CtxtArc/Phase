@@ -1,0 +1,12 @@
+[package]
+name = "phase_codegen_c"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+phase_ast = { path = "../ast" }
+phase_pir = { path = "../pir" }
+
+[dev-dependencies]
+phase_parser = { path = "../parser" }
+phase_analysis = { path = "../analysis" }

@@ -7,13 +7,43 @@
 
 use std::env;
 use std::fs;
-use std::process::ExitCode;
+use std::path::Path;
+use std::process::{Command, ExitCode};
 
 fn print_usage() {
     eprintln!("usage:");
     eprintln!("  phase check <file>");
+    eprintln!("  phase build <file>          (run from the phase/ project root)");
     eprintln!("  phase --dump-ast <file>");
     eprintln!("  phase --dump-tokens <file>");
+    eprintln!("  phase --dump-pir <file>");
+}
+
+/// Parse and analyze `src`, printing errors to stderr (prefixed with
+/// `path`) and returning `None` on any failure. Shared by every command
+/// past `check` that needs a program known to be safe before proceeding.
+fn parse_and_analyze(path: &str, src: &str) -> Option<phase_ast::Program> {
+    let program = match phase_parser::parse(src) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            return None;
+        }
+    };
+    match phase_analysis::analyze(&program) {
+        Ok(()) => Some(program),
+        Err(errors) => {
+            for e in &errors {
+                eprintln!("{path}: error: {e}");
+            }
+            eprintln!(
+                "{path}: {} error{} found",
+                errors.len(),
+                if errors.len() == 1 { "" } else { "s" }
+            );
+            None
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -97,6 +127,100 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "--dump-pir" => {
+            let Some(program) = parse_and_analyze(path, &src) else {
+                return ExitCode::FAILURE;
+            };
+            match phase_pir::build(&program) {
+                Ok(pir) => {
+                    println!("{:#?}", pir);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{path}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "build" => {
+            let Some(program) = parse_and_analyze(path, &src) else {
+                return ExitCode::FAILURE;
+            };
+            let pir = match phase_pir::build(&program) {
+                Ok(pir) => pir,
+                Err(e) => {
+                    eprintln!("{path}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let stem = Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("out")
+                .to_string();
+
+            let generated = phase_codegen_c::generate(&pir, &stem);
+
+            if let Err(e) = fs::create_dir_all("build") {
+                eprintln!("error: could not create 'build' directory: {e}");
+                return ExitCode::FAILURE;
+            }
+            let header_path = format!("build/{stem}.gen.h");
+            let source_path = format!("build/{stem}.gen.c");
+            if let Err(e) = fs::write(&header_path, &generated.header) {
+                eprintln!("error: could not write '{header_path}': {e}");
+                return ExitCode::FAILURE;
+            }
+            if let Err(e) = fs::write(&source_path, &generated.source) {
+                eprintln!("error: could not write '{source_path}': {e}");
+                return ExitCode::FAILURE;
+            }
+
+            let runtime_c = "runtime/phase_runtime.c";
+            if !Path::new(runtime_c).exists() {
+                eprintln!(
+                    "error: '{runtime_c}' not found -- `phase build` must be run from the phase/ project root, and only links against the demo runtime shipped there"
+                );
+                return ExitCode::FAILURE;
+            }
+
+            let binary_path = format!("build/{stem}");
+            let cc_result = Command::new("cc")
+                .args([
+                    "-std=c11",
+                    "-Wall",
+                    "-I",
+                    "build",
+                    "-I",
+                    "runtime",
+                    "-o",
+                    &binary_path,
+                    &source_path,
+                    runtime_c,
+                    "-lm",
+                ])
+                .output();
+
+            match cc_result {
+                Ok(output) if output.status.success() => {
+                    if !output.stderr.is_empty() {
+                        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                    }
+                    println!("OK: built {binary_path}");
+                    ExitCode::SUCCESS
+                }
+                Ok(output) => {
+                    eprintln!("error: cc failed to compile the generated C:");
+                    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("error: could not invoke 'cc': {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         other => {
             eprintln!("unknown command '{other}'");
             print_usage();

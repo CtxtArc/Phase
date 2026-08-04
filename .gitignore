@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target
+/build
 
 # Rust backup files
 **/*.rs.bk
@@ -8,8 +9,6 @@
 .vscode/
 .idea/
 
-# macOS
-.DS_Store
 
 # Vim
 *.swp
