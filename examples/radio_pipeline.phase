@@ -20,7 +20,6 @@ fn main() {
     device_capture(raw);
     sync(raw);
 
-    move raw -> @RAM;
     buffer<Sample, 1024> filtered @RAM;
     fir_filter(raw, filtered);
 

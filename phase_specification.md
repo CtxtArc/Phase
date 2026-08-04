@@ -264,9 +264,8 @@ extern fn fir_filter(in_: buffer<Sample, 1024> @RAM,
 fn main() {
     buffer<Sample, 1024> raw @DMA;
     device_capture(raw);       // simulated ADC fills the DMA buffer
-    sync(raw);                 // wait for capture to finish, become @RAM-visible
+    sync(raw);                 // wait for capture to finish; entity is now @RAM
 
-    move raw -> @RAM;
     buffer<Sample, 1024> filtered @RAM;
     fir_filter(raw, filtered);
 

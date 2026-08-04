@@ -1,0 +1,13 @@
+// Bug gallery #3: two exclusive write borrows of the same entity at once.
+// Expected: "already has an exclusive write borrow"
+
+fn main() {
+    buffer<u8, 16> x @RAM;
+    let a = borrow x write;
+
+    // BUG: a's write borrow is still live -- b cannot also write-borrow x.
+    let b = borrow x write;
+
+    release a;
+    release b;
+}

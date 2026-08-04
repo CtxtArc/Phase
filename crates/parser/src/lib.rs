@@ -784,7 +784,6 @@ mod tests {
                 device_capture(raw);
                 sync(raw);
 
-                move raw -> @RAM;
                 buffer<Sample, 1024> filtered @RAM;
                 fir_filter(raw, filtered);
 
@@ -796,7 +795,7 @@ mod tests {
         let prog = parse(src).unwrap();
         assert_eq!(prog.items.len(), 2);
         match &prog.items[1] {
-            Item::Fn(f) => assert_eq!(f.body.stmts.len(), 9),
+            Item::Fn(f) => assert_eq!(f.body.stmts.len(), 8),
             other => panic!("expected fn, got {:?}", other),
         }
     }

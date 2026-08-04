@@ -1,0 +1,12 @@
+// Bug gallery #2: moving an entity while a borrow of it is still live.
+// Expected: "has a live borrow; cannot move"
+
+fn main() {
+    buffer<u8, 16> x @RAM;
+    let view = borrow x read;
+
+    // BUG: view is still live -- x cannot be moved out from under it.
+    move x -> @DMA;
+
+    release view;
+}

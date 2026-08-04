@@ -69,12 +69,28 @@ fn main() -> ExitCode {
                     .iter()
                     .filter(|i| matches!(i, phase_ast::Item::Fn(_)))
                     .count();
-                println!(
-                    "OK: {path} parsed successfully ({entities} entit{}, {fns} fn{})",
-                    if entities == 1 { "y" } else { "ies" },
-                    if fns == 1 { "" } else { "s" },
-                );
-                ExitCode::SUCCESS
+
+                match phase_analysis::analyze(&program) {
+                    Ok(()) => {
+                        println!(
+                            "OK: {path} parsed and passed domain/ownership analysis ({entities} entit{}, {fns} fn{})",
+                            if entities == 1 { "y" } else { "ies" },
+                            if fns == 1 { "" } else { "s" },
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(errors) => {
+                        for e in &errors {
+                            eprintln!("{path}: error: {e}");
+                        }
+                        eprintln!(
+                            "{path}: {} error{} found",
+                            errors.len(),
+                            if errors.len() == 1 { "" } else { "s" }
+                        );
+                        ExitCode::FAILURE
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("{path}: {e}");

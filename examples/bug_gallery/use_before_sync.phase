@@ -1,0 +1,17 @@
+// Bug gallery #1: reading a @DMA buffer before it has been synced.
+// Expected: "is in domain @DMA but 'fir_filter' expects @RAM"
+
+entity Sample : @RAM {
+    value: f32
+}
+
+extern fn fir_filter(in_: buffer<Sample, 1024> @RAM,
+                      out: buffer<Sample, 1024> @RAM);
+
+fn main() {
+    buffer<Sample, 1024> raw @DMA;
+    buffer<Sample, 1024> filtered @RAM;
+
+    // BUG: raw is still @DMA here -- no sync(raw) happened.
+    fir_filter(raw, filtered);
+}

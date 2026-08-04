@@ -3,30 +3,42 @@
 A physical-domain safety language for signal/RF/embedded pipelines.
 Full design rationale and roadmap: see `phase_specification.md`.
 
-## Status: M1 — Lexer + Parser + AST (done)
+## Status: M2 — Domain/Ownership/Borrow Analyzer (done)
 
-Straight-line subset only (no `if`/`while` yet — that's M4). Covers:
-entities, `state` (typestate) declarations, `fn` / `extern fn`, buffers,
-`move` / `sync` / `borrow` / `release` / `destroy`, MMIO `volatile_read`/
-`volatile_write` call syntax, expressions with normal arithmetic/comparison
-precedence.
+Builds on M1's lexer/parser/AST. Straight-line subset only (no `if`/`while`
+yet — that's M4). The analyzer walks each `fn` body statement-by-statement
+and enforces:
 
-No semantic analysis yet — the parser accepts any *syntactically* valid
-program, including ones that would violate physical rules (e.g. using a
-`@DMA` buffer without `sync`). Rejecting those is the job of the M2+
-analyzer.
+- every `move`/`sync` follows a legal domain transition (spec §2.4)
+- an entity's domain must match what a call site requires before it's
+  passed as an argument (this is how "reading a `@DMA` buffer without
+  `sync`" gets caught — the call-site domain check *is* the enforcement)
+- `move`/`sync`/`destroy` are rejected while a borrow is live
+- borrows conflict correctly: many readers OK, a writer must be exclusive
+- use of a destroyed entity is rejected
+
+All four bug-gallery items from the spec (`examples/bug_gallery/*.phase`)
+are caught with the exact error text documented in the spec, verified both
+as analysis-crate unit tests and as end-to-end driver integration tests
+that parse the real files on disk and run the real analyzer.
+
+The analyzer intentionally degrades one bad statement at a time rather than
+cascading: an invalid statement is treated as a no-op for state-tracking
+purposes, so one real bug doesn't spam unrelated-looking follow-on errors.
 
 ## Layout
 
 ```
 crates/
-  ast/      AST node definitions (no logic)
-  lexer/    hand-written lexer, source -> Vec<Token>
-  parser/   hand-written recursive-descent parser, tokens -> AST
-  driver/   CLI binary ("phase")
+  ast/       AST node definitions (no logic)
+  lexer/     hand-written lexer, source -> Vec<Token>
+  parser/    hand-written recursive-descent parser, tokens -> AST
+  analysis/  M2 domain/ownership/borrow analyzer
+  driver/    CLI binary ("phase")
 examples/
-  radio_pipeline.phase   the running example from the spec
-phase_specification.md   full language spec, roadmap, bug gallery
+  radio_pipeline.phase        the running example from the spec
+  bug_gallery/                one deliberately-broken file per bug class
+phase_specification.md        full language spec, roadmap, bug gallery
 ```
 
 ## Building & testing
@@ -38,21 +50,23 @@ cargo test --workspace
 
 Tests are plain `cargo test` — no custom test runner. Each crate has unit
 tests in `src/lib.rs` (`#[cfg(test)] mod tests`); the driver crate has
-integration tests in `crates/driver/tests/parses_examples.rs` that parse
-`examples/radio_pipeline.phase` end-to-end and pin down its AST shape, so
-grammar regressions are caught immediately as the language grows.
+integration tests in `crates/driver/tests/parses_examples.rs` that run the
+real files under `examples/` through the real parser and analyzer end to
+end, so regressions anywhere in the pipeline are caught immediately.
 
 ## CLI
 
 ```
 cargo run --bin phase -- check examples/radio_pipeline.phase
+cargo run --bin phase -- check examples/bug_gallery/use_before_sync.phase
 cargo run --bin phase -- --dump-ast examples/radio_pipeline.phase
 cargo run --bin phase -- --dump-tokens examples/radio_pipeline.phase
 ```
 
-## Next milestone (M2)
+## Next milestone (M3)
 
-Type checker + fixed domain-transition table, still straight-line only:
-reject bug-gallery items #1-#4 from the spec (use of a `DeviceOwned`
-buffer without `sync`, move/destroy while borrowed, conflicting write
-borrows, use-after-destroy).
+State analyzer: implement typestate checking for `state` declarations
+(`Packet<Received>` vs `Packet<Decoded>`), rejecting bug-gallery item #5
+(calling a function that requires one state with a value proven to be in
+another).
+

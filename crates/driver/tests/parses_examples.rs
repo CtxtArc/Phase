@@ -104,7 +104,6 @@ fn radio_pipeline_main_body_statement_sequence() {
             "VarDecl", // buffer<Sample, 1024> raw @DMA;
             "Expr",    // device_capture(raw);
             "Sync",    // sync(raw);
-            "Move",    // move raw -> @RAM;
             "VarDecl", // buffer<Sample, 1024> filtered @RAM;
             "Expr",    // fir_filter(raw, filtered);
             "Move",    // move filtered -> @DEVICE;
@@ -158,5 +157,59 @@ mod syntax_smoke_tests {
     fn syntax_error_reports_a_span() {
         let err = phase_parser::parse("fn main() { let x = ; }").unwrap_err();
         assert!(err.span.line >= 1);
+    }
+}
+
+/// M2: the domain/ownership/borrow analyzer, exercised end-to-end (real
+/// files on disk -> parse -> analyze) rather than through the analysis
+/// crate's own unit tests, so a regression anywhere in the pipeline
+/// (parser AST shape drifting out from under the analyzer, etc.) shows up
+/// here too.
+mod analysis_end_to_end {
+    use super::read_example;
+
+    fn analyze_example(path: &str) -> Result<(), Vec<phase_analysis::AnalysisError>> {
+        let src = read_example(path);
+        let program = phase_parser::parse(&src)
+            .unwrap_or_else(|e| panic!("{path} failed to parse: {e}"));
+        phase_analysis::analyze(&program)
+    }
+
+    #[test]
+    fn happy_path_pipeline_passes_analysis() {
+        let result = analyze_example("radio_pipeline.phase");
+        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+    }
+
+    #[test]
+    fn bug_gallery_1_use_before_sync_is_rejected() {
+        let errs = analyze_example("bug_gallery/use_before_sync.phase").unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| e.message.contains("is in domain @DMA but 'fir_filter' expects @RAM")));
+    }
+
+    #[test]
+    fn bug_gallery_2_move_while_borrowed_is_rejected() {
+        let errs = analyze_example("bug_gallery/move_while_borrowed.phase").unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| e.message.contains("has a live borrow; cannot move")));
+    }
+
+    #[test]
+    fn bug_gallery_3_write_borrow_conflict_is_rejected() {
+        let errs = analyze_example("bug_gallery/write_borrow_conflict.phase").unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| e.message.contains("already has an exclusive write borrow")));
+    }
+
+    #[test]
+    fn bug_gallery_4_use_after_destroy_is_rejected() {
+        let errs = analyze_example("bug_gallery/use_after_destroy.phase").unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| e.message.contains("was destroyed; cannot use as argument")));
     }
 }

@@ -11,3 +11,4 @@ path = "src/main.rs"
 phase_lexer = { path = "../lexer" }
 phase_ast = { path = "../ast" }
 phase_parser = { path = "../parser" }
+phase_analysis = { path = "../analysis" }
