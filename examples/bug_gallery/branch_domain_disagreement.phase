@@ -1,0 +1,18 @@
+// Bug gallery #6: the two branches leave an entity in different domains,
+// and the merge point after the `if` has no way to know which one holds.
+// Expected: "entity 'x' disagrees on domain across incoming branches"
+
+fn main() {
+    buffer<u8, 16> x @RAM;
+
+    if use_dma {
+        move x -> @DMA;
+        // BUG: no sync(x) here -- this path leaves x as @DMA.
+    } else {
+        move x -> @DEVICE;
+        // BUG: no sync(x) here either -- this path leaves x as @DEVICE.
+    }
+
+    // x's domain here depends on which branch ran -- the compiler can't
+    // allow that ambiguity to propagate any further.
+}

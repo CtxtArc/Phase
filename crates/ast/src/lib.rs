@@ -156,6 +156,16 @@ pub enum Stmt {
     Expr(Expr),
     /// `return expr?;`
     Return(Option<Expr>),
+    /// `if cond { .. } else { .. }` — `else_block` is `None` when there's
+    /// no `else` clause. `else if` chains desugar to a single nested `If`
+    /// as the sole statement of the (implicit) else block.
+    If {
+        cond: Expr,
+        then_block: Block,
+        else_block: Option<Block>,
+    },
+    /// `while cond { .. }`
+    While { cond: Expr, body: Block },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

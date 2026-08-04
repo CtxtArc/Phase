@@ -411,6 +411,182 @@ impl<'a> FnChecker<'a> {
 
             Stmt::Return(Some(e)) => self.check_expr(e, errors),
             Stmt::Return(None) => {}
+
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => self.check_if(cond, then_block, else_block.as_ref(), errors),
+
+            Stmt::While { cond, body } => self.check_while(cond, body, errors),
+        }
+    }
+
+    fn check_block(&mut self, block: &phase_ast::Block, errors: &mut Vec<AnalysisError>) {
+        for stmt in &block.stmts {
+            self.check_stmt(stmt, errors);
+        }
+    }
+
+    /// M4 — `ENTITY_PHI`: check each branch starting from the *same*
+    /// pre-branch state, then merge. A variable that already existed
+    /// before the `if` must agree on domain/typestate/destroyed-ness on
+    /// every incoming path, or the merge is rejected (bug-gallery #6).
+    /// A variable introduced *inside* a branch is properly out of scope
+    /// afterward — it's simply not carried into the merged state, since
+    /// only pre-existing names are merged.
+    fn check_if(
+        &mut self,
+        cond: &Expr,
+        then_block: &phase_ast::Block,
+        else_block: Option<&phase_ast::Block>,
+        errors: &mut Vec<AnalysisError>,
+    ) {
+        self.check_expr(cond, errors);
+
+        let base_locals = self.locals.clone();
+        let base_borrows = self.borrows.clone();
+
+        self.check_block(then_block, errors);
+        let then_locals = std::mem::replace(&mut self.locals, base_locals.clone());
+        let then_borrows = std::mem::replace(&mut self.borrows, base_borrows.clone());
+
+        if let Some(eb) = else_block {
+            self.check_block(eb, errors);
+        }
+        let else_locals = std::mem::replace(&mut self.locals, base_locals.clone());
+        let else_borrows = std::mem::replace(&mut self.borrows, base_borrows.clone());
+
+        self.merge_branches(
+            &base_locals,
+            &base_borrows,
+            &then_locals,
+            &then_borrows,
+            &else_locals,
+            &else_borrows,
+            errors,
+        );
+    }
+
+    /// M4 — a `while` loop is checked as "body executed once" merged
+    /// against "body executed zero times" (the pre-loop state itself).
+    /// This is a deliberate, documented scope cut: it verifies the body is
+    /// internally consistent and that one pass through it agrees with
+    /// skipping it entirely, but it does not compute a true fixed point
+    /// across arbitrarily many iterations. See phase_specification.md, M4.
+    fn check_while(&mut self, cond: &Expr, body: &phase_ast::Block, errors: &mut Vec<AnalysisError>) {
+        self.check_expr(cond, errors);
+
+        let base_locals = self.locals.clone();
+        let base_borrows = self.borrows.clone();
+
+        self.check_block(body, errors);
+        let body_locals = std::mem::replace(&mut self.locals, base_locals.clone());
+        let body_borrows = std::mem::replace(&mut self.borrows, base_borrows.clone());
+
+        self.merge_branches(
+            &base_locals,
+            &base_borrows,
+            &body_locals,
+            &body_borrows,
+            &base_locals,
+            &base_borrows,
+            errors,
+        );
+    }
+
+    fn merge_branches(
+        &mut self,
+        base_locals: &HashMap<String, VarState>,
+        base_borrows: &HashMap<String, BorrowState>,
+        a_locals: &HashMap<String, VarState>,
+        a_borrows: &HashMap<String, BorrowState>,
+        b_locals: &HashMap<String, VarState>,
+        b_borrows: &HashMap<String, BorrowState>,
+        errors: &mut Vec<AnalysisError>,
+    ) {
+        // Only names that existed *before* the branch are merged -- a name
+        // introduced inside a branch is out of scope once it ends, on
+        // either path, so it's simply dropped rather than merged.
+        let mut merged_locals = HashMap::new();
+        for (name, base_var) in base_locals {
+            let a = a_locals.get(name).expect("pre-existing local must survive both branches");
+            let b = b_locals.get(name).expect("pre-existing local must survive both branches");
+
+            let domain = if a.domain == b.domain {
+                a.domain
+            } else {
+                errors.push(err(format!(
+                    "entity '{name}' disagrees on domain across incoming branches (@{} vs @{})",
+                    a.domain.map(|d| d.name()).unwrap_or("?"),
+                    b.domain.map(|d| d.name()).unwrap_or("?"),
+                )));
+                None
+            };
+
+            let typestate = if a.typestate == b.typestate {
+                a.typestate.clone()
+            } else {
+                errors.push(err(format!(
+                    "entity '{name}' disagrees on typestate across incoming branches"
+                )));
+                None
+            };
+
+            let destroyed = if a.destroyed == b.destroyed {
+                a.destroyed
+            } else {
+                errors.push(err(format!(
+                    "entity '{name}' disagrees on destroyed-state across incoming branches (destroyed on one path but not the other)"
+                )));
+                true // conservative: treat as destroyed so further use is blocked
+            };
+
+            merged_locals.insert(
+                name.clone(),
+                VarState {
+                    domain,
+                    typestate,
+                    destroyed,
+                    borrow_of: base_var.borrow_of.clone(),
+                    released: a.released || b.released,
+                },
+            );
+        }
+        self.locals = merged_locals;
+
+        // Borrow targets that already existed before the branch must agree
+        // on borrow state across both paths (e.g. released on one path but
+        // not the other is a disagreement, same as any other property).
+        let empty = BorrowState::default();
+        let mut merged_borrows = HashMap::new();
+        for (target, _) in base_borrows {
+            let a_bs = a_borrows.get(target).unwrap_or(&empty);
+            let b_bs = b_borrows.get(target).unwrap_or(&empty);
+            let agrees =
+                a_bs.readers == b_bs.readers && a_bs.writer == b_bs.writer;
+            if !agrees {
+                errors.push(err(format!(
+                    "entity '{target}' disagrees on borrow state across incoming branches"
+                )));
+            }
+            let chosen = if !a_bs.is_empty() { a_bs.clone() } else { b_bs.clone() };
+            merged_borrows.insert(target.clone(), chosen);
+        }
+        self.borrows = merged_borrows;
+
+        // A borrow first taken *inside* a branch (its target wasn't
+        // borrowed before the branch) must be fully released before that
+        // branch ends -- its handle variable is scoped to the branch and
+        // has no way to be released afterward, so an outstanding borrow
+        // here can never be released at all.
+        let mut already_reported = HashSet::new();
+        for (target, bs) in a_borrows.iter().chain(b_borrows.iter()) {
+            if !base_borrows.contains_key(target) && !bs.is_empty() && already_reported.insert(target.clone()) {
+                errors.push(err(format!(
+                    "borrow of '{target}' taken inside a branch must be released before the branch ends"
+                )));
+            }
         }
     }
 
@@ -994,5 +1170,197 @@ mod tests {
         "#
         );
         assert_single_error_containing(&src, "expected state Decoded, found Received");
+    }
+
+    // ---- M4: control flow + branch merging ("ENTITY_PHI") -----------------
+
+    #[test]
+    fn if_else_with_consistent_domain_on_both_paths_is_accepted() {
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @RAM;
+                if flag {
+                    move x -> @DMA;
+                    sync(x);
+                } else {
+                    move x -> @DEVICE;
+                    sync(x);
+                }
+            }
+        "#;
+        // Both paths independently return x to @RAM by the time they join.
+        assert_eq!(check_src(src), Ok(()));
+    }
+
+    #[test]
+    fn bug6_if_else_domain_disagreement_is_rejected() {
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @RAM;
+                if flag {
+                    move x -> @DMA;
+                } else {
+                    move x -> @DEVICE;
+                }
+            }
+        "#;
+        // then: x is @DMA, else: x is @DEVICE -- they disagree at the join.
+        assert_single_error_containing(src, "entity 'x' disagrees on domain across incoming branches");
+    }
+
+    #[test]
+    fn if_without_else_must_agree_with_the_implicit_unchanged_path() {
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @RAM;
+                if flag {
+                    move x -> @DMA;
+                }
+            }
+        "#;
+        // No else means the implicit "else" is "x is still @RAM" -- which
+        // disagrees with the then-branch's @DMA.
+        assert_single_error_containing(src, "entity 'x' disagrees on domain across incoming branches");
+    }
+
+    #[test]
+    fn destroy_on_only_one_branch_is_rejected() {
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @RAM;
+                if flag {
+                    destroy x;
+                } else {
+                }
+            }
+        "#;
+        assert_single_error_containing(
+            src,
+            "entity 'x' disagrees on destroyed-state across incoming branches",
+        );
+    }
+
+    #[test]
+    fn variable_declared_inside_a_branch_is_out_of_scope_after_it() {
+        let src = r#"
+            fn main() {
+                if flag {
+                    buffer<u8, 16> y @RAM;
+                }
+                move y -> @DMA;
+            }
+        "#;
+        assert_single_error_containing(src, "unknown entity 'y'");
+    }
+
+    #[test]
+    fn borrow_taken_and_released_within_one_branch_is_fine() {
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @RAM;
+                if flag {
+                    let v = borrow x read;
+                    release v;
+                }
+            }
+        "#;
+        assert_eq!(check_src(src), Ok(()));
+    }
+
+    #[test]
+    fn borrow_taken_inside_a_branch_and_not_released_is_rejected() {
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @RAM;
+                if flag {
+                    let v = borrow x read;
+                }
+            }
+        "#;
+        assert_single_error_containing(
+            src,
+            "borrow of 'x' taken inside a branch must be released before the branch ends",
+        );
+    }
+
+    #[test]
+    fn borrow_from_before_the_branch_released_on_only_one_path_is_rejected() {
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @RAM;
+                let v = borrow x read;
+                if flag {
+                    release v;
+                } else {
+                }
+            }
+        "#;
+        assert_single_error_containing(src, "entity 'x' disagrees on borrow state across incoming branches");
+    }
+
+    #[test]
+    fn nested_if_inside_if_is_checked() {
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @RAM;
+                if a {
+                    if b {
+                        move x -> @DMA;
+                    } else {
+                        move x -> @DEVICE;
+                    }
+                } else {
+                }
+            }
+        "#;
+        // Inner branch already disagrees, regardless of the outer branch.
+        assert_single_error_containing(src, "entity 'x' disagrees on domain across incoming branches");
+    }
+
+    #[test]
+    fn while_body_consistent_with_pre_loop_state_is_accepted() {
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @RAM;
+                while flag {
+                    move x -> @DMA;
+                    sync(x);
+                }
+            }
+        "#;
+        // One pass through the body returns x to @RAM, matching skipping
+        // the loop entirely -- consistent either way.
+        assert_eq!(check_src(src), Ok(()));
+    }
+
+    #[test]
+    fn while_body_that_changes_domain_permanently_is_rejected() {
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @RAM;
+                while flag {
+                    move x -> @DMA;
+                }
+            }
+        "#;
+        // Body-exit state (@DMA) disagrees with pre-loop state (@RAM) --
+        // unsound if the loop runs a variable number of times.
+        assert_single_error_containing(src, "entity 'x' disagrees on domain across incoming branches");
+    }
+
+    #[test]
+    fn if_still_checks_statements_inside_each_branch_normally() {
+        // The move inside the branch is illegal on its own terms (MMIO has
+        // no legal move target to RAM), independent of any merge issue.
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @MMIO;
+                if flag {
+                    move x -> @RAM;
+                } else {
+                }
+            }
+        "#;
+        assert_single_error_containing(src, "no legal transition from @MMIO to @RAM via move");
     }
 }

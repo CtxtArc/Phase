@@ -1,0 +1,22 @@
+// Demonstrates a branch where both paths independently return the buffer
+// to @RAM before the branches join -- the merge point agrees, so this is
+// accepted even though the two paths take different routes to get there.
+
+extern fn device_capture(dst: buffer<u8, 16> @DMA);
+extern fn device_stream(dst: buffer<u8, 16> @DEVICE);
+
+fn main() {
+    buffer<u8, 16> x @RAM;
+
+    if use_dma {
+        move x -> @DMA;
+        device_capture(x);
+        sync(x);
+    } else {
+        move x -> @DEVICE;
+        device_stream(x);
+        sync(x);
+    }
+
+    // x is @RAM on every incoming path here, however it got here.
+}

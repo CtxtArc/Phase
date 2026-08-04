@@ -31,6 +31,10 @@ impl From<LexError> for ParseError {
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// When true, a bare `Ident {` is *not* parsed as a struct literal --
+    /// used while parsing `if`/`while` conditions, where `{` instead opens
+    /// the following block (the same ambiguity Rust resolves the same way).
+    restrict_struct_lit: bool,
 }
 
 /// Parse a full PHASE source file into a `Program`.
@@ -41,7 +45,11 @@ pub fn parse(src: &str) -> Result<Program, ParseError> {
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser {
+            tokens,
+            pos: 0,
+            restrict_struct_lit: false,
+        }
     }
 
     // ---- token stream helpers ----------------------------------------
@@ -289,8 +297,42 @@ impl Parser {
             TokenKind::KwRelease => self.parse_release_stmt(),
             TokenKind::KwDestroy => self.parse_destroy_stmt(),
             TokenKind::KwReturn => self.parse_return_stmt(),
+            TokenKind::KwIf => self.parse_if_stmt(),
+            TokenKind::KwWhile => self.parse_while_stmt(),
             _ => self.parse_expr_stmt(),
         }
+    }
+
+    /// `if cond { .. } else if cond2 { .. } else { .. }` — the `else if`
+    /// chain desugars to nested `If`s, each the sole statement of an
+    /// implicit else-block, so the AST only ever needs one `If` shape.
+    fn parse_if_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(TokenKind::KwIf)?;
+        let cond = self.parse_condition()?;
+        let then_block = self.parse_block()?;
+        let else_block = if self.at(&TokenKind::KwElse) {
+            self.bump();
+            if self.at(&TokenKind::KwIf) {
+                let inner = self.parse_if_stmt()?;
+                Some(Block { stmts: vec![inner] })
+            } else {
+                Some(self.parse_block()?)
+            }
+        } else {
+            None
+        };
+        Ok(Stmt::If {
+            cond,
+            then_block,
+            else_block,
+        })
+    }
+
+    fn parse_while_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(TokenKind::KwWhile)?;
+        let cond = self.parse_condition()?;
+        let body = self.parse_block()?;
+        Ok(Stmt::While { cond, body })
     }
 
     fn parse_let_stmt(&mut self) -> Result<Stmt, ParseError> {
@@ -392,6 +434,17 @@ impl Parser {
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.parse_comparison()
+    }
+
+    /// Parse an `if`/`while` condition: same expression grammar, but a bare
+    /// `Ident {` must not be swallowed as a struct literal, since `{` opens
+    /// the following block instead. See `restrict_struct_lit`.
+    fn parse_condition(&mut self) -> Result<Expr, ParseError> {
+        let prev = self.restrict_struct_lit;
+        self.restrict_struct_lit = true;
+        let result = self.parse_expr();
+        self.restrict_struct_lit = prev;
+        result
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
@@ -553,7 +606,7 @@ impl Parser {
                 self.expect(TokenKind::RParen)?;
                 Ok(Expr::Call { callee: name, args })
             }
-            TokenKind::LBrace => {
+            TokenKind::LBrace if !self.restrict_struct_lit => {
                 self.bump();
                 let mut fields = Vec::new();
                 while !self.at(&TokenKind::RBrace) {
@@ -871,6 +924,106 @@ mod tests {
                     })
                 ),
                 other => panic!("expected var decl, got {:?}", other),
+            },
+            other => panic!("expected fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_if_without_else() {
+        let src = "fn main() { if flag { destroy x; } }";
+        let prog = parse(src).unwrap();
+        match &prog.items[0] {
+            Item::Fn(f) => match &f.body.stmts[0] {
+                Stmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    assert_eq!(*cond, Expr::Ident("flag".into()));
+                    assert_eq!(then_block.stmts.len(), 1);
+                    assert_eq!(*else_block, None);
+                }
+                other => panic!("expected if, got {:?}", other),
+            },
+            other => panic!("expected fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_if_else() {
+        let src = "fn main() { if flag { destroy x; } else { destroy y; } }";
+        let prog = parse(src).unwrap();
+        match &prog.items[0] {
+            Item::Fn(f) => match &f.body.stmts[0] {
+                Stmt::If { else_block, .. } => {
+                    let eb = else_block.as_ref().expect("expected else block");
+                    assert_eq!(eb.stmts.len(), 1);
+                }
+                other => panic!("expected if, got {:?}", other),
+            },
+            other => panic!("expected fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_else_if_chain_as_nested_if() {
+        let src = "fn main() { if a { destroy x; } else if b { destroy y; } else { destroy z; } }";
+        let prog = parse(src).unwrap();
+        match &prog.items[0] {
+            Item::Fn(f) => match &f.body.stmts[0] {
+                Stmt::If { else_block, .. } => {
+                    let eb = else_block.as_ref().unwrap();
+                    assert_eq!(eb.stmts.len(), 1);
+                    match &eb.stmts[0] {
+                        Stmt::If { cond, else_block, .. } => {
+                            assert_eq!(*cond, Expr::Ident("b".into()));
+                            assert!(else_block.is_some());
+                        }
+                        other => panic!("expected nested if, got {:?}", other),
+                    }
+                }
+                other => panic!("expected if, got {:?}", other),
+            },
+            other => panic!("expected fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_while() {
+        let src = "fn main() { while flag { destroy x; } }";
+        let prog = parse(src).unwrap();
+        match &prog.items[0] {
+            Item::Fn(f) => match &f.body.stmts[0] {
+                Stmt::While { cond, body } => {
+                    assert_eq!(*cond, Expr::Ident("flag".into()));
+                    assert_eq!(body.stmts.len(), 1);
+                }
+                other => panic!("expected while, got {:?}", other),
+            },
+            other => panic!("expected fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bare_ident_condition_is_not_parsed_as_struct_literal() {
+        // Without the restrict_struct_lit fix, `flag { ... }` would try to
+        // parse as a struct literal and fail on the first real statement.
+        let src = "fn main() { if flag { let x = 1; } }";
+        assert!(parse(src).is_ok());
+    }
+
+    #[test]
+    fn struct_literal_still_works_outside_condition_position() {
+        let src = "fn main() { let s = Sample { value: 1.0 }; }";
+        let prog = parse(src).unwrap();
+        match &prog.items[0] {
+            Item::Fn(f) => match &f.body.stmts[0] {
+                Stmt::VarDecl {
+                    init: Some(Expr::StructLit { name, .. }),
+                    ..
+                } => assert_eq!(name, "Sample"),
+                other => panic!("expected struct-lit var decl, got {:?}", other),
             },
             other => panic!("expected fn, got {:?}", other),
         }

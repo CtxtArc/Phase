@@ -95,6 +95,8 @@ fn radio_pipeline_main_body_statement_sequence() {
             Stmt::Destroy { .. } => "Destroy",
             Stmt::Expr(_) => "Expr",
             Stmt::Return(_) => "Return",
+            Stmt::If { .. } => "If",
+            Stmt::While { .. } => "While",
         })
         .collect();
 
@@ -225,5 +227,19 @@ mod analysis_end_to_end {
         assert!(errs
             .iter()
             .any(|e| e.message.contains("expected state Decoded, found Received")));
+    }
+
+    #[test]
+    fn branching_pipeline_passes_analysis() {
+        let result = analyze_example("branching_pipeline.phase");
+        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+    }
+
+    #[test]
+    fn bug_gallery_6_branch_domain_disagreement_is_rejected() {
+        let errs = analyze_example("bug_gallery/branch_domain_disagreement.phase").unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| e.message.contains("disagrees on domain across incoming branches")));
     }
 }
