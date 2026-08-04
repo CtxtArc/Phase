@@ -212,4 +212,18 @@ mod analysis_end_to_end {
             .iter()
             .any(|e| e.message.contains("was destroyed; cannot use as argument")));
     }
+
+    #[test]
+    fn typestate_pipeline_passes_analysis() {
+        let result = analyze_example("packet_pipeline.phase");
+        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+    }
+
+    #[test]
+    fn bug_gallery_5_skipped_state_transition_is_rejected() {
+        let errs = analyze_example("bug_gallery/skipped_state_transition.phase").unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| e.message.contains("expected state Decoded, found Received")));
+    }
 }

@@ -1,0 +1,19 @@
+// Bug gallery #5: calling a function that requires one typestate with a
+// value proven to be in a different state -- here, skipping decode()
+// entirely and handing a still-Received packet to validate().
+// Expected: "expected state Decoded, found Received"
+
+state Packet {
+    Received -> Decoded -> Validated
+}
+
+extern fn receive_packet() -> Packet<Received>;
+extern fn decode(p: Packet<Received>) -> Packet<Decoded>;
+extern fn validate(p: Packet<Decoded>) -> Packet<Validated>;
+
+fn main() {
+    let p1 = receive_packet();
+
+    // BUG: skipped decode() -- p1 is still Packet<Received>.
+    let p3 = validate(p1);
+}

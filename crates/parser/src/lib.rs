@@ -257,7 +257,14 @@ impl Parser {
             })
         } else {
             let name = self.expect_ident()?;
-            Ok(TypeExpr::Named(name))
+            if self.at(&TokenKind::LAngle) {
+                self.bump();
+                let state = self.expect_ident()?;
+                self.expect(TokenKind::RAngle)?;
+                Ok(TypeExpr::Stateful { name, state })
+            } else {
+                Ok(TypeExpr::Named(name))
+            }
         }
     }
 
@@ -820,6 +827,50 @@ mod tests {
                     );
                 }
                 other => panic!("expected var decl with init, got {:?}", other),
+            },
+            other => panic!("expected fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_stateful_type_in_fn_signature() {
+        let src = "fn decode(p: Packet<Received>) -> Packet<Decoded> { }";
+        let prog = parse(src).unwrap();
+        match &prog.items[0] {
+            Item::Fn(f) => {
+                assert_eq!(
+                    f.params[0].ty,
+                    TypeExpr::Stateful {
+                        name: "Packet".into(),
+                        state: "Received".into()
+                    }
+                );
+                assert_eq!(
+                    f.return_type,
+                    Some(TypeExpr::Stateful {
+                        name: "Packet".into(),
+                        state: "Decoded".into()
+                    })
+                );
+            }
+            other => panic!("expected fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_stateful_type_in_let_annotation() {
+        let src = "fn main() { let p: Packet<Received> = receive(); }";
+        let prog = parse(src).unwrap();
+        match &prog.items[0] {
+            Item::Fn(f) => match &f.body.stmts[0] {
+                Stmt::VarDecl { ty, .. } => assert_eq!(
+                    *ty,
+                    Some(TypeExpr::Stateful {
+                        name: "Packet".into(),
+                        state: "Received".into()
+                    })
+                ),
+                other => panic!("expected var decl, got {:?}", other),
             },
             other => panic!("expected fn, got {:?}", other),
         }

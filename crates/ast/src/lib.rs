@@ -38,12 +38,29 @@ impl Domain {
     }
 }
 
-/// A type expression: either a named type (`Sample`, `f32`, `i16`, ...)
-/// or a fixed-size buffer of some element type (`buffer<Sample, 1024>`).
+/// A type expression: either a named type (`Sample`, `f32`, `i16`, ...),
+/// a fixed-size buffer of some element type (`buffer<Sample, 1024>`), or a
+/// typestate-parameterized type (`Packet<Received>`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
     Named(String),
     Buffer { elem: Box<TypeExpr>, len: u64 },
+    /// `Packet<Received>` — `name` is the `state`-declared machine name
+    /// (`Packet`), `state` is the specific state (`Received`).
+    Stateful { name: String, state: String },
+}
+
+impl TypeExpr {
+    /// The base type name, ignoring any typestate parameter — used to look
+    /// up a default domain the same way for `Sample` and `Packet<Received>`
+    /// alike. `None` for `buffer<...>`, which has no single base name.
+    pub fn base_name(&self) -> Option<&str> {
+        match self {
+            TypeExpr::Named(n) => Some(n),
+            TypeExpr::Stateful { name, .. } => Some(name),
+            TypeExpr::Buffer { .. } => None,
+        }
+    }
 }
 
 /// Borrow mode used by `borrow x read` / `borrow x write`.

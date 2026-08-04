@@ -1,0 +1,19 @@
+// Demonstrates typestate (spec §3.8): a Packet moves through
+// Received -> Decoded -> Validated, and each stage's function only
+// accepts a packet already proven to be in the right state.
+
+state Packet {
+    Received -> Decoded -> Validated
+}
+
+extern fn receive_packet() -> Packet<Received>;
+extern fn decode(p: Packet<Received>) -> Packet<Decoded>;
+extern fn validate(p: Packet<Decoded>) -> Packet<Validated>;
+extern fn handle(p: Packet<Validated>);
+
+fn main() {
+    let p1 = receive_packet();
+    let p2 = decode(p1);
+    let p3 = validate(p2);
+    handle(p3);
+}

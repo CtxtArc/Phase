@@ -1,20 +1,24 @@
-//! PHASE M2: the domain/ownership/borrow analyzer.
+//! PHASE M2/M3: the domain/ownership/borrow analyzer, plus typestate.
 //!
-//! Scope (matches the roadmap in phase_specification.md, M2): straight-line
+//! Scope (matches the roadmap in phase_specification.md): straight-line
 //! function bodies only — the AST has no `if`/`while` yet, so control flow
-//! and `ENTITY_PHI` merging (M4) simply don't arise here. This pass is
-//! responsible for bug-gallery items #1-#4:
+//! and `ENTITY_PHI` merging (M4) simply don't arise here.
 //!
+//! M2 covers bug-gallery items #1-#4:
 //!   1. use of a `@DMA`/`@DEVICE`-domain entity where a different domain
 //!      was required, without an intervening `sync`
 //!   2. `move`/`sync`/`destroy` while a borrow is live
 //!   3. conflicting borrows (two writers, or a writer alongside readers)
 //!   4. use of a destroyed entity
+//! plus the domain-transition-table check from spec §2.4.
 //!
-//! plus the domain-transition-table check from spec §2.4 (illegal `move`/
-//! `sync` pairs).
+//! M3 adds bug-gallery item #5: typestate checking. A `state` declaration
+//! (spec §3.8) defines a named machine and its states; a value's type can
+//! be parameterized by state (`Packet<Received>`), and calling a function
+//! that requires one state with a value proven to be in a different state
+//! is a compile error, the same way a domain mismatch is.
 
-use phase_ast::{BorrowMode, Domain, Expr, FnDecl, Item, Program, Stmt};
+use phase_ast::{BorrowMode, Domain, Expr, FnDecl, Item, Program, Stmt, TypeExpr};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,12 +38,57 @@ fn err(msg: impl Into<String>) -> AnalysisError {
     }
 }
 
+/// `(machine name, state name)`, e.g. `("Packet", "Received")`.
+type Typestate = (String, String);
+
+/// name -> resolved per-parameter domain / typestate requirements, plus
+/// the resolved return typestate (if the return type is stateful).
+#[derive(Debug, Clone)]
+struct FnSig {
+    param_domains: Vec<Option<Domain>>,
+    param_states: Vec<Option<Typestate>>,
+    return_state: Option<Typestate>,
+}
+
+/// Validate a `TypeExpr` that may be a `Name<State>` typestate type against
+/// the program's declared state machines, returning the resolved
+/// `(machine, state)` pair if it's stateful and valid. Returns `None` for
+/// non-stateful types silently; pushes an error and returns `None` for a
+/// stateful type referencing an unknown machine or unknown state.
+fn resolve_stateful(
+    ty: &TypeExpr,
+    machines: &HashMap<&str, HashSet<&str>>,
+    errors: &mut Vec<AnalysisError>,
+) -> Option<Typestate> {
+    let TypeExpr::Stateful { name, state } = ty else {
+        return None;
+    };
+    match machines.get(name.as_str()) {
+        None => {
+            errors.push(err(format!("unknown typestate '{name}'")));
+            None
+        }
+        Some(states) => {
+            if states.contains(state.as_str()) {
+                Some((name.clone(), state.clone()))
+            } else {
+                errors.push(err(format!(
+                    "unknown state '{state}' for typestate '{name}'"
+                )));
+                None
+            }
+        }
+    }
+}
+
 /// Analyze a whole program. Returns `Ok(())` if every function body is
 /// physically consistent, otherwise every violation found (the checker
 /// does not stop at the first error — it keeps going, treating the
 /// erroring statement as a no-op, so one mistake doesn't cascade into a
 /// wall of unrelated-looking follow-on errors).
 pub fn analyze(program: &Program) -> Result<(), Vec<AnalysisError>> {
+    let mut errors = Vec::new();
+
     let entity_domains: HashMap<&str, Option<Domain>> = program
         .items
         .iter()
@@ -49,24 +98,69 @@ pub fn analyze(program: &Program) -> Result<(), Vec<AnalysisError>> {
         })
         .collect();
 
-    // name -> per-parameter declared domain (None = unconstrained)
-    let mut fn_sigs: HashMap<&str, Vec<Option<Domain>>> = HashMap::new();
+    // Build the state-machine table, flagging duplicate machine names and
+    // duplicate state names within one machine as we go.
+    let mut state_machines: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for item in &program.items {
+        if let Item::State(s) = item {
+            if state_machines.contains_key(s.name.as_str()) {
+                errors.push(err(format!(
+                    "typestate '{}' is declared more than once",
+                    s.name
+                )));
+                continue;
+            }
+            let mut states = HashSet::new();
+            for st in &s.states {
+                if !states.insert(st.as_str()) {
+                    errors.push(err(format!(
+                        "typestate '{}' declares state '{}' more than once",
+                        s.name, st
+                    )));
+                }
+            }
+            state_machines.insert(s.name.as_str(), states);
+        }
+    }
+
+    // name -> resolved signature (domains + typestates for params/return).
+    // Signatures are validated exactly once here, at declaration site, not
+    // re-validated at every call site.
+    let mut fn_sigs: HashMap<&str, FnSig> = HashMap::new();
+    let build_sig = |name: &str,
+                          params: &[phase_ast::Param],
+                          return_type: &Option<TypeExpr>,
+                          errors: &mut Vec<AnalysisError>|
+     -> FnSig {
+        let _ = name;
+        FnSig {
+            param_domains: params.iter().map(|p| p.domain).collect(),
+            param_states: params
+                .iter()
+                .map(|p| resolve_stateful(&p.ty, &state_machines, errors))
+                .collect(),
+            return_state: return_type
+                .as_ref()
+                .and_then(|t| resolve_stateful(t, &state_machines, errors)),
+        }
+    };
     for item in &program.items {
         match item {
             Item::Fn(f) => {
-                fn_sigs.insert(f.name.as_str(), f.params.iter().map(|p| p.domain).collect());
+                let sig = build_sig(&f.name, &f.params, &f.return_type, &mut errors);
+                fn_sigs.insert(f.name.as_str(), sig);
             }
             Item::ExternFn(f) => {
-                fn_sigs.insert(f.name.as_str(), f.params.iter().map(|p| p.domain).collect());
+                let sig = build_sig(&f.name, &f.params, &f.return_type, &mut errors);
+                fn_sigs.insert(f.name.as_str(), sig);
             }
             _ => {}
         }
     }
 
-    let mut errors = Vec::new();
     for item in &program.items {
         if let Item::Fn(f) = item {
-            let mut checker = FnChecker::new(&entity_domains, &fn_sigs);
+            let mut checker = FnChecker::new(&entity_domains, &fn_sigs, &state_machines);
             checker.check_fn(f, &mut errors);
         }
     }
@@ -83,6 +177,10 @@ struct VarState {
     /// `None` means this local isn't domain-tracked (e.g. a plain scalar
     /// like `u32`) and is exempt from domain/borrow rules entirely.
     domain: Option<Domain>,
+    /// `None` means this local isn't typestate-tracked (either its type
+    /// isn't stateful, or it came from a call whose return type isn't
+    /// stateful) and is exempt from typestate checks.
+    typestate: Option<Typestate>,
     destroyed: bool,
     /// If this local was introduced via `let v = borrow target mode;`,
     /// the target it borrows from and the mode. `None` for ordinary locals.
@@ -105,7 +203,8 @@ impl BorrowState {
 
 struct FnChecker<'a> {
     entity_domains: &'a HashMap<&'a str, Option<Domain>>,
-    fn_sigs: &'a HashMap<&'a str, Vec<Option<Domain>>>,
+    fn_sigs: &'a HashMap<&'a str, FnSig>,
+    state_machines: &'a HashMap<&'a str, HashSet<&'a str>>,
     locals: HashMap<String, VarState>,
     /// keyed by the *target* entity name being borrowed from
     borrows: HashMap<String, BorrowState>,
@@ -127,19 +226,68 @@ fn legal_sync_source(from: Domain) -> bool {
 impl<'a> FnChecker<'a> {
     fn new(
         entity_domains: &'a HashMap<&'a str, Option<Domain>>,
-        fn_sigs: &'a HashMap<&'a str, Vec<Option<Domain>>>,
+        fn_sigs: &'a HashMap<&'a str, FnSig>,
+        state_machines: &'a HashMap<&'a str, HashSet<&'a str>>,
     ) -> Self {
         FnChecker {
             entity_domains,
             fn_sigs,
+            state_machines,
             locals: HashMap::new(),
             borrows: HashMap::new(),
         }
     }
 
     fn check_fn(&mut self, f: &FnDecl, errors: &mut Vec<AnalysisError>) {
+        // Parameters are locals too: register them up front (using the
+        // domain/typestate already resolved once for this function's
+        // signature) so a body that uses a parameter directly -- not just
+        // ones re-bound through a `let` -- is checked correctly.
+        if let Some(sig) = self.fn_sigs.get(f.name.as_str()) {
+            for (i, p) in f.params.iter().enumerate() {
+                self.locals.insert(
+                    p.name.clone(),
+                    VarState {
+                        domain: sig.param_domains.get(i).copied().flatten(),
+                        typestate: sig.param_states.get(i).cloned().flatten(),
+                        destroyed: false,
+                        borrow_of: None,
+                        released: false,
+                    },
+                );
+            }
+        }
+
         for stmt in &f.body.stmts {
             self.check_stmt(stmt, errors);
+        }
+        for stmt in &f.body.stmts {
+            if let Stmt::Return(Some(Expr::Ident(name))) = stmt {
+                self.check_return_value(name, f, errors);
+            }
+        }
+    }
+
+    fn check_return_value(&self, name: &str, f: &FnDecl, errors: &mut Vec<AnalysisError>) {
+        let Some(sig) = self.fn_sigs.get(f.name.as_str()) else {
+            return;
+        };
+        let Some(var) = self.locals.get(name) else {
+            return; // unknown-ident-in-return is not this pass's job
+        };
+        if let (Some((req_machine, req_state)), Some((have_machine, have_state))) =
+            (&sig.return_state, &var.typestate)
+        {
+            if req_machine != have_machine {
+                errors.push(err(format!(
+                    "entity '{name}' has typestate '{have_machine}' but function '{}' must return typestate '{req_machine}'",
+                    f.name
+                )));
+            } else if req_state != have_state {
+                errors.push(err(format!(
+                    "expected state {req_state}, found {have_state}"
+                )));
+            }
         }
     }
 
@@ -269,7 +417,7 @@ impl<'a> FnChecker<'a> {
     fn check_var_decl(
         &mut self,
         name: &str,
-        ty: Option<&phase_ast::TypeExpr>,
+        ty: Option<&TypeExpr>,
         domain: Option<Domain>,
         init: Option<&Expr>,
         errors: &mut Vec<AnalysisError>,
@@ -283,22 +431,38 @@ impl<'a> FnChecker<'a> {
 
         let resolved_domain = match (domain, ty) {
             (Some(d), _) => Some(d),
-            (None, Some(phase_ast::TypeExpr::Named(n))) => {
-                self.entity_domains.get(n.as_str()).copied().flatten()
-            }
-            (None, Some(phase_ast::TypeExpr::Buffer { .. })) => {
+            (None, Some(TypeExpr::Buffer { .. })) => {
                 errors.push(err(format!(
                     "entity '{name}' has no domain: buffer types require an explicit @domain"
                 )));
                 None
             }
+            (None, Some(t)) => t
+                .base_name()
+                .and_then(|n| self.entity_domains.get(n))
+                .copied()
+                .flatten(),
             (None, None) => None,
+        };
+
+        // Typestate: an explicit `Name<State>` annotation is validated and
+        // resolved directly; otherwise, infer it from a call's declared
+        // return typestate (e.g. `let p2 = decode(p1);`).
+        let resolved_typestate = if let Some(t) = ty {
+            resolve_stateful(t, self.state_machines, errors)
+        } else if let Some(Expr::Call { callee, .. }) = init {
+            self.fn_sigs
+                .get(callee.as_str())
+                .and_then(|sig| sig.return_state.clone())
+        } else {
+            None
         };
 
         self.locals.insert(
             name.to_string(),
             VarState {
                 domain: resolved_domain,
+                typestate: resolved_typestate,
                 destroyed: false,
                 borrow_of: None,
                 released: false,
@@ -359,11 +523,13 @@ impl<'a> FnChecker<'a> {
             }
         };
 
+        let (domain, typestate) = (target_var.domain, target_var.typestate.clone());
         if ok {
             self.locals.insert(
                 name.to_string(),
                 VarState {
-                    domain: target_var.domain,
+                    domain,
+                    typestate,
                     destroyed: false,
                     borrow_of: Some((target.to_string(), mode)),
                     released: false,
@@ -380,7 +546,8 @@ impl<'a> FnChecker<'a> {
             self.locals.insert(
                 name.to_string(),
                 VarState {
-                    domain: target_var.domain,
+                    domain,
+                    typestate,
                     destroyed: false,
                     borrow_of: None,
                     released: false,
@@ -395,7 +562,7 @@ impl<'a> FnChecker<'a> {
             Expr::FieldAccess { base, .. } => self.check_expr(base, errors),
             // Literals, bare idents, struct literals, domain refs, and
             // nested borrow-exprs (not via `let`) carry no further
-            // domain/ownership obligations in M2.
+            // domain/ownership/typestate obligations in M2/M3.
             _ => {}
         }
     }
@@ -404,16 +571,16 @@ impl<'a> FnChecker<'a> {
         // `volatile_read`/`volatile_write` are builtins, not user/extern
         // fns: their MMIO-domain argument is checked syntactically by the
         // parser (it must be a `DomainRef`), so there's nothing more to
-        // verify here in M2.
+        // verify here.
         if callee == "volatile_read" || callee == "volatile_write" {
             return;
         }
 
-        let Some(params) = self.fn_sigs.get(callee) else {
+        let Some(sig) = self.fn_sigs.get(callee) else {
             errors.push(err(format!("call to unknown function '{callee}'")));
             return;
         };
-        let params = params.clone();
+        let sig = sig.clone();
 
         for (i, arg) in args.iter().enumerate() {
             match arg {
@@ -430,13 +597,28 @@ impl<'a> FnChecker<'a> {
                         )));
                         continue;
                     }
-                    if let Some(Some(param_domain)) = params.get(i) {
+
+                    if let Some(Some(param_domain)) = sig.param_domains.get(i) {
                         if let Some(var_domain) = var.domain {
                             if var_domain != *param_domain {
                                 errors.push(err(format!(
                                     "entity '{name}' is in domain @{} but '{callee}' expects @{} for this argument",
                                     var_domain.name(),
                                     param_domain.name()
+                                )));
+                            }
+                        }
+                    }
+
+                    if let Some(Some((req_machine, req_state))) = sig.param_states.get(i) {
+                        if let Some((have_machine, have_state)) = &var.typestate {
+                            if have_machine != req_machine {
+                                errors.push(err(format!(
+                                    "entity '{name}' has typestate '{have_machine}' but '{callee}' expects typestate '{req_machine}'"
+                                )));
+                            } else if have_state != req_state {
+                                errors.push(err(format!(
+                                    "expected state {req_state}, found {have_state}"
                                 )));
                             }
                         }
@@ -699,5 +881,118 @@ mod tests {
         "#;
         let errs = check_src(src).unwrap_err();
         assert_eq!(errs.len(), 1, "expected exactly one error, got {errs:?}");
+    }
+
+    // ---- Bug gallery #5: typestate -----------------------------------------
+
+    const PACKET_MACHINE: &str = r#"
+        state Packet {
+            Received -> Decoded -> Validated
+        }
+        extern fn receive_packet() -> Packet<Received>;
+        extern fn decode(p: Packet<Received>) -> Packet<Decoded>;
+        extern fn validate(p: Packet<Decoded>) -> Packet<Validated>;
+        extern fn handle(p: Packet<Validated>);
+    "#;
+
+    #[test]
+    fn happy_path_typestate_chain_is_accepted() {
+        let src = format!(
+            r#"
+            {PACKET_MACHINE}
+            fn main() {{
+                let p1 = receive_packet();
+                let p2 = decode(p1);
+                let p3 = validate(p2);
+                handle(p3);
+            }}
+        "#
+        );
+        assert_eq!(check_src(&src), Ok(()));
+    }
+
+    #[test]
+    fn bug5_skipped_state_transition_is_rejected() {
+        let src = format!(
+            r#"
+            {PACKET_MACHINE}
+            fn main() {{
+                let p1 = receive_packet();
+                // BUG: skipped decode() -- p1 is still Received, validate() needs Decoded.
+                let p3 = validate(p1);
+            }}
+        "#
+        );
+        assert_single_error_containing(&src, "expected state Decoded, found Received");
+    }
+
+    #[test]
+    fn explicit_stateful_annotation_is_checked_against_the_machine() {
+        let src = format!(
+            r#"
+            {PACKET_MACHINE}
+            fn main() {{
+                let p1: Packet<Received> = receive_packet();
+                let p3 = validate(p1);
+            }}
+        "#
+        );
+        assert_single_error_containing(&src, "expected state Decoded, found Received");
+    }
+
+    #[test]
+    fn unknown_typestate_machine_is_rejected() {
+        let src = r#"
+            fn main() {
+                let p: Ghost<Foo> = receive_packet();
+            }
+        "#;
+        assert_single_error_containing(src, "unknown typestate 'Ghost'");
+    }
+
+    #[test]
+    fn unknown_state_within_known_machine_is_rejected() {
+        let src = r#"
+            state Packet {
+                Received -> Decoded -> Validated
+            }
+            fn main() {
+                let p: Packet<Bogus> = receive_packet();
+            }
+        "#;
+        assert_single_error_containing(src, "unknown state 'Bogus' for typestate 'Packet'");
+    }
+
+    #[test]
+    fn duplicate_typestate_declaration_is_rejected() {
+        let src = r#"
+            state Packet { Received -> Decoded }
+            state Packet { A -> B }
+        "#;
+        assert_single_error_containing(src, "typestate 'Packet' is declared more than once");
+    }
+
+    #[test]
+    fn duplicate_state_within_machine_is_rejected() {
+        let src = r#"
+            state Packet { Received -> Received -> Decoded }
+        "#;
+        assert_single_error_containing(
+            src,
+            "typestate 'Packet' declares state 'Received' more than once",
+        );
+    }
+
+    #[test]
+    fn returning_wrong_state_is_rejected() {
+        let src = format!(
+            r#"
+            {PACKET_MACHINE}
+            fn wrong_decode(p: Packet<Received>) -> Packet<Decoded> {{
+                return p;
+            }}
+        "#
+        );
+        assert_single_error_containing(&src, "expected state Decoded, found Received");
     }
 }
