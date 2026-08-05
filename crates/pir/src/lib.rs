@@ -74,6 +74,11 @@ pub enum PirLiteral {
 pub enum CallArg {
     Entity(String),
     Literal(PirLiteral),
+    /// `REG_NAME @MMIO` — the register argument to `volatile_read`/
+    /// `volatile_write` (M6). Distinct from `Entity` because it doesn't
+    /// refer to a declared local; it names a simulated memory-mapped
+    /// register that codegen materializes as a `volatile` global.
+    MmioRegister(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +149,10 @@ pub struct PirProgram {
     pub entities: Vec<PirEntityDef>,
     pub extern_fns: Vec<PirFnSig>,
     pub fns: Vec<PirFn>,
+    /// Every distinct `@MMIO` register name referenced anywhere in the
+    /// program via `volatile_read`/`volatile_write` (M6), in first-seen
+    /// order. Codegen materializes each of these as a `volatile` global.
+    pub mmio_registers: Vec<String>,
 }
 
 /// Map a PHASE scalar type name to its C representation. Returns `None`
@@ -237,7 +246,37 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
         }
     }
 
+    out.mmio_registers = collect_mmio_registers(&out.fns);
+
     Ok(out)
+}
+
+/// Scan every function body for `MmioRegister` call args, in first-seen
+/// order with duplicates removed -- codegen needs one `volatile` global
+/// per distinct register name, not one per use site.
+fn collect_mmio_registers(fns: &[PirFn]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let note = |args: &[CallArg], seen: &mut std::collections::HashSet<String>, out: &mut Vec<String>| {
+        for a in args {
+            if let CallArg::MmioRegister(name) = a {
+                if seen.insert(name.clone()) {
+                    out.push(name.clone());
+                }
+            }
+        }
+    };
+    for f in fns {
+        for inst in &f.body {
+            match inst {
+                PirInst::CallAssign { args, .. } | PirInst::Call { args, .. } => {
+                    note(args, &mut seen, &mut out)
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 fn lower_fn_sig(
@@ -449,6 +488,10 @@ impl<'a> Lowerer<'a> {
                 Expr::FloatLit(n) => CallArg::Literal(PirLiteral::Float(*n)),
                 Expr::StringLit(s) => CallArg::Literal(PirLiteral::Str(s.clone())),
                 Expr::BoolLit(b) => CallArg::Literal(PirLiteral::Bool(*b)),
+                // M6: the M2 analyzer already guarantees this only appears
+                // as the register argument to volatile_read/volatile_write,
+                // and that its domain is @MMIO.
+                Expr::DomainRef { name, .. } => CallArg::MmioRegister(name.clone()),
                 other => {
                     return Err(PirError::UnsupportedExpr {
                         context: format!("argument to '{context}': {other:?}"),
@@ -662,5 +705,66 @@ mod tests {
             pir.fns[0].body[7],
             PirInst::EntitySync { from: Domain::Device, .. }
         ));
+    }
+
+    // ---- M6: volatile MMIO register access ---------------------------------
+
+    #[test]
+    fn volatile_read_lowers_to_call_assign_with_mmio_register_arg() {
+        let src = r#"
+            fn main() {
+                let status: u32 = volatile_read(UART_STATUS @MMIO);
+            }
+        "#;
+        let pir = build_src(src).unwrap();
+        assert_eq!(
+            pir.fns[0].body[0],
+            PirInst::CallAssign {
+                name: "status".into(),
+                ty: PirType::Scalar("uint32_t".into()),
+                domain: None,
+                callee: "volatile_read".into(),
+                args: vec![CallArg::MmioRegister("UART_STATUS".into())],
+            }
+        );
+    }
+
+    #[test]
+    fn volatile_write_lowers_to_call_with_mmio_register_and_literal_args() {
+        let src = r#"
+            fn main() {
+                volatile_write(UART_CONTROL @MMIO, 1);
+            }
+        "#;
+        let pir = build_src(src).unwrap();
+        assert_eq!(
+            pir.fns[0].body[0],
+            PirInst::Call {
+                callee: "volatile_write".into(),
+                args: vec![
+                    CallArg::MmioRegister("UART_CONTROL".into()),
+                    CallArg::Literal(PirLiteral::Int(1)),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn distinct_mmio_registers_are_collected_once_each_in_first_seen_order() {
+        let src = r#"
+            fn main() {
+                let a: u32 = volatile_read(REG_A @MMIO);
+                let b: u32 = volatile_read(REG_B @MMIO);
+                volatile_write(REG_A @MMIO, a);
+            }
+        "#;
+        let pir = build_src(src).unwrap();
+        assert_eq!(pir.mmio_registers, vec!["REG_A".to_string(), "REG_B".to_string()]);
+    }
+
+    #[test]
+    fn program_with_no_volatile_access_has_no_mmio_registers() {
+        let pir = build_src("fn main() {}").unwrap();
+        assert!(pir.mmio_registers.is_empty());
     }
 }

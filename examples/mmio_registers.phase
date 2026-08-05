@@ -1,0 +1,19 @@
+// Demonstrates volatile MMIO register access (spec §3.7, §6). Two writes
+// to the same register in a row are deliberately included: under normal
+// (non-volatile) optimization a compiler is free to eliminate the first
+// write as a dead store, since it's immediately overwritten. Because
+// UART_CONTROL compiles to a `volatile` global (see codegen_c and
+// runtime/phase_runtime.h), the C standard *forbids* eliminating or
+// reordering either write -- both must actually happen, in order. This
+// isn't a hopeful convention; crates/driver/tests/build_and_run.rs proves
+// it by compiling this exact pattern with `-O2` and inspecting the
+// generated assembly for two distinct stores.
+
+fn main() {
+    let status: u32 = volatile_read(UART_STATUS @MMIO);
+
+    volatile_write(UART_CONTROL @MMIO, 1);
+    volatile_write(UART_CONTROL @MMIO, 2);
+
+    volatile_write(UART_DATA @MMIO, status);
+}

@@ -1,0 +1,9 @@
+// M6: volatile_read/volatile_write require an @MMIO register reference,
+// not an arbitrary domain. Passing a @RAM-tagged name here is meaningless
+// (there's no real MMIO register at that name) and is rejected.
+// Expected: "'volatile_read' requires an @MMIO register reference, but
+// 'FAKE_REG' is tagged @RAM"
+
+fn main() {
+    let status: u32 = volatile_read(FAKE_REG @RAM);
+}

@@ -242,4 +242,18 @@ mod analysis_end_to_end {
             .iter()
             .any(|e| e.message.contains("disagrees on domain across incoming branches")));
     }
+
+    #[test]
+    fn mmio_registers_example_passes_analysis() {
+        let result = analyze_example("mmio_registers.phase");
+        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+    }
+
+    #[test]
+    fn volatile_wrong_domain_is_rejected() {
+        let errs = analyze_example("bug_gallery/volatile_wrong_domain.phase").unwrap_err();
+        assert!(errs.iter().any(|e| e
+            .message
+            .contains("'volatile_read' requires an @MMIO register reference, but 'FAKE_REG' is tagged @RAM")));
+    }
 }

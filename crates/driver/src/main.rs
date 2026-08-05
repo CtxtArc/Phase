@@ -177,8 +177,15 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
+            // runtime/phase_runtime.c is deliberately program-specific demo
+            // glue (spec §5.3): it hardcodes `#include "radio_pipeline.gen.h"`
+            // and implements exactly that program's `extern fn`s. Only link
+            // it when it's actually needed -- a program with no `extern fn`
+            // (like examples/mmio_registers.phase) doesn't reference any of
+            // its symbols and can build standalone.
+            let needs_runtime = !pir.extern_fns.is_empty();
             let runtime_c = "runtime/phase_runtime.c";
-            if !Path::new(runtime_c).exists() {
+            if needs_runtime && !Path::new(runtime_c).exists() {
                 eprintln!(
                     "error: '{runtime_c}' not found -- `phase build` must be run from the phase/ project root, and only links against the demo runtime shipped there"
                 );
@@ -186,21 +193,23 @@ fn main() -> ExitCode {
             }
 
             let binary_path = format!("build/{stem}");
-            let cc_result = Command::new("cc")
-                .args([
-                    "-std=c11",
-                    "-Wall",
-                    "-I",
-                    "build",
-                    "-I",
-                    "runtime",
-                    "-o",
-                    &binary_path,
-                    &source_path,
-                    runtime_c,
-                    "-lm",
-                ])
-                .output();
+            let mut cc_args = vec![
+                "-std=c11".to_string(),
+                "-Wall".to_string(),
+                "-I".to_string(),
+                "build".to_string(),
+                "-I".to_string(),
+                "runtime".to_string(),
+                "-o".to_string(),
+                binary_path.clone(),
+                source_path.clone(),
+            ];
+            if needs_runtime {
+                cc_args.push(runtime_c.to_string());
+            }
+            cc_args.push("-lm".to_string());
+
+            let cc_result = Command::new("cc").args(&cc_args).output();
 
             match cc_result {
                 Ok(output) if output.status.success() => {

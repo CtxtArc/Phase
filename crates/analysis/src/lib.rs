@@ -732,6 +732,45 @@ impl<'a> FnChecker<'a> {
         }
     }
 
+    /// M6: `volatile_read(REG @MMIO)` / `volatile_write(REG @MMIO, value)`
+    /// must have exactly `expected_arity` arguments, the first of which
+    /// must be an `@MMIO` domain reference -- not an arbitrary expression.
+    /// This is what makes "every volatile access targets a real,
+    /// consistently-typed simulated register" a checked property rather
+    /// than a hopeful convention (codegen, in M6, relies on this having
+    /// already been verified).
+    fn check_volatile_register_arg(
+        &mut self,
+        callee: &str,
+        args: &[Expr],
+        expected_arity: usize,
+        errors: &mut Vec<AnalysisError>,
+    ) {
+        if args.len() != expected_arity {
+            errors.push(err(format!(
+                "'{callee}' expects {expected_arity} argument{}, found {}",
+                if expected_arity == 1 { "" } else { "s" },
+                args.len()
+            )));
+            return;
+        }
+        match args.first() {
+            Some(Expr::DomainRef { domain, .. }) if *domain == Domain::Mmio => {}
+            Some(Expr::DomainRef { name, domain }) => {
+                errors.push(err(format!(
+                    "'{callee}' requires an @MMIO register reference, but '{name}' is tagged @{}",
+                    domain.name()
+                )));
+            }
+            Some(_) => {
+                errors.push(err(format!(
+                    "'{callee}' requires an @MMIO register reference (e.g. `REG_NAME @MMIO`) as its first argument"
+                )));
+            }
+            None => unreachable!("arity already checked above"),
+        }
+    }
+
     fn check_expr(&mut self, expr: &Expr, errors: &mut Vec<AnalysisError>) {
         match expr {
             Expr::Call { callee, args } => self.check_call(callee, args, errors),
@@ -745,10 +784,20 @@ impl<'a> FnChecker<'a> {
 
     fn check_call(&mut self, callee: &str, args: &[Expr], errors: &mut Vec<AnalysisError>) {
         // `volatile_read`/`volatile_write` are builtins, not user/extern
-        // fns: their MMIO-domain argument is checked syntactically by the
-        // parser (it must be a `DomainRef`), so there's nothing more to
-        // verify here.
-        if callee == "volatile_read" || callee == "volatile_write" {
+        // fns. M6: their argument shape is validated here -- the parser
+        // accepts any expression in an argument position, it doesn't know
+        // these two callees are special, so nothing before this point has
+        // actually confirmed the register argument is an `@MMIO` domain
+        // reference.
+        if callee == "volatile_read" {
+            self.check_volatile_register_arg(callee, args, 1, errors);
+            return;
+        }
+        if callee == "volatile_write" {
+            self.check_volatile_register_arg(callee, args, 2, errors);
+            if let Some(value) = args.get(1) {
+                self.check_expr(value, errors);
+            }
             return;
         }
 
@@ -1362,5 +1411,78 @@ mod tests {
             }
         "#;
         assert_single_error_containing(src, "no legal transition from @MMIO to @RAM via move");
+    }
+
+    // ---- M6: volatile MMIO register access ---------------------------------
+
+    #[test]
+    fn valid_volatile_round_trip_is_accepted() {
+        let src = r#"
+            fn main() {
+                let status: u32 = volatile_read(UART_STATUS @MMIO);
+                volatile_write(UART_CONTROL @MMIO, status);
+            }
+        "#;
+        assert_eq!(check_src(src), Ok(()));
+    }
+
+    #[test]
+    fn volatile_read_with_non_mmio_domain_ref_is_rejected() {
+        let src = r#"
+            fn main() {
+                let status: u32 = volatile_read(SOME_REG @RAM);
+            }
+        "#;
+        assert_single_error_containing(
+            src,
+            "'volatile_read' requires an @MMIO register reference, but 'SOME_REG' is tagged @RAM",
+        );
+    }
+
+    #[test]
+    fn volatile_read_with_non_domain_ref_argument_is_rejected() {
+        let src = r#"
+            fn main() {
+                let x: u32 = 5;
+                let status: u32 = volatile_read(x);
+            }
+        "#;
+        assert_single_error_containing(
+            src,
+            "'volatile_read' requires an @MMIO register reference",
+        );
+    }
+
+    #[test]
+    fn volatile_read_with_wrong_arity_is_rejected() {
+        let src = r#"
+            fn main() {
+                let status: u32 = volatile_read(A @MMIO, B @MMIO);
+            }
+        "#;
+        assert_single_error_containing(src, "'volatile_read' expects 1 argument, found 2");
+    }
+
+    #[test]
+    fn volatile_write_with_wrong_arity_is_rejected() {
+        let src = r#"
+            fn main() {
+                volatile_write(A @MMIO);
+            }
+        "#;
+        assert_single_error_containing(src, "'volatile_write' expects 2 arguments, found 1");
+    }
+
+    #[test]
+    fn volatile_write_with_non_mmio_first_arg_is_rejected() {
+        let src = r#"
+            fn main() {
+                volatile_write(A @DMA, 1);
+            }
+        "#;
+        assert_single_error_containing(
+            src,
+            "'volatile_write' requires an @MMIO register reference, but 'A' is tagged @DMA",
+        );
     }
 }
