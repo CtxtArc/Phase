@@ -256,4 +256,40 @@ mod analysis_end_to_end {
             .message
             .contains("'volatile_read' requires an @MMIO register reference, but 'FAKE_REG' is tagged @RAM")));
     }
+
+    #[test]
+    fn sdr_session_combined_example_passes_analysis() {
+        // M7: the richer worked example exercising domain safety,
+        // typestate, and MMIO together in one program.
+        let result = analyze_example("sdr_session.phase");
+        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+    }
+
+    #[test]
+    fn every_bug_gallery_file_is_actually_rejected() {
+        // A blanket sweep, independent of the specific-message tests above:
+        // every single file under bug_gallery/ must fail analysis. If a new
+        // bug-gallery file were ever added without actually being broken
+        // (or a fix accidentally over-corrected an old one into passing),
+        // this catches it even without a dedicated test for that file.
+        let dir = super::workspace_root().join("examples/bug_gallery");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("bug_gallery dir must exist") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("phase") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            let program = phase_parser::parse(&src)
+                .unwrap_or_else(|e| panic!("{path:?} failed to parse: {e}"));
+            let result = phase_analysis::analyze(&program);
+            assert!(
+                result.is_err(),
+                "{path:?} is in bug_gallery/ but analysis accepted it -- \
+                 every file there must be a real rejection case"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 7, "expected at least 7 bug-gallery files, found {checked}");
+    }
 }

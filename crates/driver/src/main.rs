@@ -177,17 +177,27 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            // runtime/phase_runtime.c is deliberately program-specific demo
-            // glue (spec §5.3): it hardcodes `#include "radio_pipeline.gen.h"`
-            // and implements exactly that program's `extern fn`s. Only link
-            // it when it's actually needed -- a program with no `extern fn`
-            // (like examples/mmio_registers.phase) doesn't reference any of
-            // its symbols and can build standalone.
-            let needs_runtime = !pir.extern_fns.is_empty();
-            let runtime_c = "runtime/phase_runtime.c";
-            if needs_runtime && !Path::new(runtime_c).exists() {
+            // Two kinds of runtime files (spec §5.3):
+            //   - runtime/phase_runtime.c is generic (sim_dma_wait/
+            //     sim_device_wait only) and never depends on any one
+            //     program's types, so it's always linked when it exists.
+            //   - runtime/<stem>_extern.c is hand-written, program-specific
+            //     glue implementing exactly this program's `extern fn`s
+            //     (the compiler only ever generates prototypes for those,
+            //     never bodies -- spec §3.9). Only linked if the program
+            //     actually declares any `extern fn`, and only if a
+            //     matching file exists.
+            let generic_runtime_c = "runtime/phase_runtime.c";
+            let extern_runtime_c = format!("runtime/{stem}_extern.c");
+            let needs_extern_runtime = !pir.extern_fns.is_empty();
+
+            if needs_extern_runtime && !Path::new(&extern_runtime_c).exists() {
                 eprintln!(
-                    "error: '{runtime_c}' not found -- `phase build` must be run from the phase/ project root, and only links against the demo runtime shipped there"
+                    "error: this program declares {} extern fn(s) but '{extern_runtime_c}' \
+                     was not found -- `phase build` needs a hand-written runtime file \
+                     implementing them (see runtime/radio_pipeline_extern.c for an example), \
+                     and must be run from the phase/ project root",
+                    pir.extern_fns.len()
                 );
                 return ExitCode::FAILURE;
             }
@@ -204,8 +214,11 @@ fn main() -> ExitCode {
                 binary_path.clone(),
                 source_path.clone(),
             ];
-            if needs_runtime {
-                cc_args.push(runtime_c.to_string());
+            if Path::new(generic_runtime_c).exists() {
+                cc_args.push(generic_runtime_c.to_string());
+            }
+            if needs_extern_runtime {
+                cc_args.push(extern_runtime_c);
             }
             cc_args.push("-lm".to_string());
 

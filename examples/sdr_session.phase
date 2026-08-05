@@ -1,0 +1,75 @@
+// M7 worked example: a fuller (illustrative) SDR receiver session that
+// exercises all three of PHASE's safety mechanisms together in one
+// coherent program, rather than in three separate minimal demos:
+//
+//   1. Domain/ownership safety  (@DMA / @DEVICE capture-filter-playback,
+//      same as radio_pipeline.phase)
+//   2. Typestate                (a status packet must go Received ->
+//      Decoded -> Validated before it's trusted, same idea as
+//      packet_pipeline.phase)
+//   3. Volatile MMIO semantics  (bringing the RF front end online via a
+//      control register before touching any buffers, same idea as
+//      mmio_registers.phase)
+//
+// This demonstrates the features compose in one realistic-shaped program
+// rather than only working in isolation. It's check-only (not a `phase
+// build` target) -- see phase_specification.md M5's documented scope cut
+// on which examples are build-verified vs. analysis-verified.
+
+entity Sample : @RAM {
+    value: f32
+}
+
+// Packet needs a real field layout, not just a `state` chain, so codegen
+// has a concrete C struct to back it -- typestate itself is erased at
+// runtime (see phase_pir), but the *value* still has to exist. `sequence`
+// stands in for whatever a real status packet would actually carry.
+entity Packet : @RAM {
+    sequence: u32
+}
+
+state Packet {
+    Received -> Decoded -> Validated
+}
+
+extern fn fir_filter(in_: buffer<Sample, 1024> @RAM,
+                      out: buffer<Sample, 1024> @RAM);
+extern fn device_capture(dst: buffer<Sample, 1024> @DMA);
+extern fn device_playback(src: buffer<Sample, 1024> @DEVICE);
+
+extern fn receive_packet() -> Packet<Received>;
+extern fn decode(p: Packet<Received>) -> Packet<Decoded>;
+extern fn validate(p: Packet<Decoded>) -> Packet<Validated>;
+extern fn handle(p: Packet<Validated>);
+
+fn main() {
+    // Bring the RF front end online via a control register, and read
+    // back its status, before touching any capture buffers.
+    volatile_write(RF_CONTROL @MMIO, 1);
+    let rf_status: u32 = volatile_read(RF_STATUS @MMIO);
+    volatile_write(RF_DIAG @MMIO, rf_status);
+
+    // Capture -> filter -> playback, exactly like radio_pipeline.phase.
+    buffer<Sample, 1024> raw @DMA;
+    device_capture(raw);
+    sync(raw);
+
+    buffer<Sample, 1024> filtered @RAM;
+    fir_filter(raw, filtered);
+
+    move filtered -> @DEVICE;
+    device_playback(filtered);
+    sync(filtered);
+
+    // A status packet describing this capture session must pass through
+    // every typestate stage before anything is allowed to `handle` it --
+    // skipping decode() or validate() here would be a compile error
+    // (see bug_gallery/skipped_state_transition.phase).
+    let p1: Packet<Received> = receive_packet();
+    let p2: Packet<Decoded> = decode(p1);
+    let p3: Packet<Validated> = validate(p2);
+    handle(p3);
+
+    // Take the RF front end back offline.
+    volatile_write(RF_CONTROL @MMIO, 0);
+}

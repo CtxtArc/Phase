@@ -27,7 +27,7 @@ fn radio_pipeline_builds_and_runs_end_to_end() {
     let program = phase_parser::parse(&src).expect("must parse");
     phase_analysis::analyze(&program).expect("must pass analysis");
     let pir = phase_pir::build(&program).expect("must lower to PIR (M5 scope: straight-line only)");
-    // Must match the stem runtime/phase_runtime.c hardcodes in its
+    // Must match the stem runtime/radio_pipeline_extern.c hardcodes in its
     // `#include "radio_pipeline.gen.h"` -- that hardcoded include is a
     // deliberate part of the demo runtime's design (spec §5.3: it's
     // program-specific glue, not a generic runtime), not a detail this
@@ -41,7 +41,8 @@ fn radio_pipeline_builds_and_runs_end_to_end() {
     std::fs::write(&header_path, &generated.header).unwrap();
     std::fs::write(&source_path, &generated.source).unwrap();
 
-    let runtime_c = root.join("runtime/phase_runtime.c");
+    let generic_runtime_c = root.join("runtime/phase_runtime.c");
+    let extern_runtime_c = root.join("runtime/radio_pipeline_extern.c");
     let runtime_dir = root.join("runtime");
     let binary_path = build_dir.join("radio_pipeline_test_bin");
 
@@ -58,7 +59,8 @@ fn radio_pipeline_builds_and_runs_end_to_end() {
         .args(["-o"])
         .arg(&binary_path)
         .arg(&source_path)
-        .arg(&runtime_c)
+        .arg(&generic_runtime_c)
+        .arg(&extern_runtime_c)
         .arg("-lm")
         .output()
         .expect("failed to invoke cc -- is a C compiler installed?");
