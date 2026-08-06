@@ -18,6 +18,12 @@
 //! program. A condition using anything richer is a clear `UnsupportedExpr`
 //! error, not a silent guess.
 //!
+//! M9 adds `PirInst::Assign` (`name = expr;`), lowering the same way --
+//! see `phase_specification.md` §9, Milestone M9. This is the real
+//! prerequisite for a `while` loop that terminates on its own instead of
+//! running zero or infinite times, since M8 alone gave conditions nothing
+//! that could change between iterations.
+//!
 //! PIR generation trusts that the program has already passed
 //! `phase_analysis::analyze` — it does not re-derive domain/borrow/
 //! typestate safety, only enough domain bookkeeping (which domain an
@@ -168,6 +174,9 @@ pub enum PirInst {
     /// the M4 analyzer docs for why this is sound without a fixed-point
     /// loop analysis (bodies are checked as "ran zero or one times").
     While { cond: PirExpr, body: Vec<PirInst> },
+    /// `name = expr;` (M9). The real prerequisite for a `while` loop that
+    /// can terminate on its own -- e.g. a counter incremented each pass.
+    Assign { name: String, value: PirExpr },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -431,7 +440,7 @@ impl<'a> Lowerer<'a> {
                 else_block,
             } => {
                 let context = format!("`if` inside fn '{fn_name}'");
-                let pir_cond = lower_cond_expr(cond, &context)?;
+                let pir_cond = lower_pir_expr(cond, &context)?;
 
                 // Domain bookkeeping (not a safety check -- M4's analyzer
                 // already proved both arms agree wherever it matters) --
@@ -462,7 +471,7 @@ impl<'a> Lowerer<'a> {
 
             Stmt::While { cond, body } => {
                 let context = format!("`while` inside fn '{fn_name}'");
-                let pir_cond = lower_cond_expr(cond, &context)?;
+                let pir_cond = lower_pir_expr(cond, &context)?;
                 // Same "ran zero or one times" model as M4: keep the
                 // post-body view, matching an `if` with an implicit empty
                 // else that merges into the then-arm's state.
@@ -470,6 +479,16 @@ impl<'a> Lowerer<'a> {
                 out.push(PirInst::While {
                     cond: pir_cond,
                     body: lowered_body,
+                });
+                Ok(())
+            }
+
+            Stmt::Assign { name, value } => {
+                let context = format!("assignment to '{name}' inside fn '{fn_name}'");
+                let pir_value = lower_pir_expr(value, &context)?;
+                out.push(PirInst::Assign {
+                    name: name.clone(),
+                    value: pir_value,
                 });
                 Ok(())
             }
@@ -604,10 +623,11 @@ impl<'a> Lowerer<'a> {
     }
 }
 
-/// Lower an `if`/`while` condition to `PirExpr` (M8). Identifiers,
-/// literals, and binary comparisons/arithmetic only -- see the module doc
-/// comment for why anything else is a clear error rather than a guess.
-fn lower_cond_expr(e: &Expr, context: &str) -> Result<PirExpr, PirError> {
+/// Lower an `if`/`while` condition or a `name = expr;` (M9) right-hand
+/// side to `PirExpr`. Identifiers, literals, and binary comparisons/
+/// arithmetic only -- see the module doc comment for why anything else is
+/// a clear error rather than a guess.
+fn lower_pir_expr(e: &Expr, context: &str) -> Result<PirExpr, PirError> {
     match e {
         Expr::Ident(n) => Ok(PirExpr::Ident(n.clone())),
         Expr::IntLit(n) => Ok(PirExpr::IntLit(*n)),
@@ -615,11 +635,11 @@ fn lower_cond_expr(e: &Expr, context: &str) -> Result<PirExpr, PirError> {
         Expr::BoolLit(b) => Ok(PirExpr::BoolLit(*b)),
         Expr::Binary { op, lhs, rhs } => Ok(PirExpr::Binary {
             op: *op,
-            lhs: Box::new(lower_cond_expr(lhs, context)?),
-            rhs: Box::new(lower_cond_expr(rhs, context)?),
+            lhs: Box::new(lower_pir_expr(lhs, context)?),
+            rhs: Box::new(lower_pir_expr(rhs, context)?),
         }),
         other => Err(PirError::UnsupportedExpr {
-            context: format!("condition in {context}: {other:?}"),
+            context: format!("expression in {context}: {other:?}"),
         }),
     }
 }
@@ -863,6 +883,52 @@ mod tests {
             PirInst::While { body, .. } => {
                 assert_eq!(body.len(), 1);
                 assert!(matches!(body[0], PirInst::If { .. }));
+            }
+            other => panic!("expected While, got {other:?}"),
+        }
+    }
+
+    // ---- M9: assignment ----------------------------------------------------
+
+    #[test]
+    fn assignment_lowers_to_pir_assign() {
+        let src = r#"
+            fn main() {
+                let n: i32 = 0;
+                n = n + 1;
+            }
+        "#;
+        let pir = build_src(src).unwrap();
+        assert_eq!(
+            pir.fns[0].body[1],
+            PirInst::Assign {
+                name: "n".into(),
+                value: PirExpr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(PirExpr::Ident("n".into())),
+                    rhs: Box::new(PirExpr::IntLit(1)),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn assignment_inside_while_body_lowers_recursively() {
+        let src = r#"
+            extern fn tick(n: i32);
+            fn main() {
+                let n: i32 = 0;
+                while n < 5 {
+                    tick(n);
+                    n = n + 1;
+                }
+            }
+        "#;
+        let pir = build_src(src).unwrap();
+        match &pir.fns[0].body[1] {
+            PirInst::While { body, .. } => {
+                assert_eq!(body.len(), 2);
+                assert!(matches!(body[1], PirInst::Assign { .. }));
             }
             other => panic!("expected While, got {other:?}"),
         }

@@ -530,14 +530,19 @@ the branching source. Condition expressions are deliberately scoped to
 than the full `Expr` grammar; see the Honest Scope note on assignment
 below for why a loop can't yet mutate its own condition.
 
-**M9 — Assignment + richer expressions** *(not yet started)*
-The language currently has no assignment statement -- a `let`-bound local
-never changes value after it's declared, and `if`/`while` conditions
-can't reference `volatile_read`/other calls. Without these, a `while`
-loop can only be unconditionally-zero or infinite; it can't meaningfully
-terminate on its own. M9 adds `name = expr;`, extends `PirExpr`/call-arg
-lowering to cover calls and richer arithmetic, and is the real
-prerequisite for a genuine polling/counting loop demo.
+**M9 — Assignment + richer expressions**
+The language had no assignment statement -- a `let`-bound local never
+changed value after it was declared, so a `while` loop's condition could
+never change between iterations. M9 adds `name = expr;`
+(`Stmt::Assign`/`PirInst::Assign`), scoped to plain scalar locals only
+(domain-tracked entities/buffers keep using `move`/`sync`/`borrow`/
+`destroy`, not assignment -- reassigning through them would bypass those
+checks). Output: `examples/counting_loop.phase` builds and a driver
+end-to-end test runs a real `while n < 5 { .. n = n + 1; }` loop and
+confirms it prints exactly `n=0` through `n=4`, not zero times, not
+forever. Condition/RHS expressions are still the same `PirExpr` subset
+from M8 (identifiers, literals, binary comparisons/arithmetic) -- no
+calls yet, so a condition can't directly poll `volatile_read(...)`.
 
 **M10 — Real hardware target** *(not yet started)*
 Replace the two simulated wait functions (`sim_dma_wait`/`sim_device_wait`

@@ -193,3 +193,67 @@ fn branching_pipeline_device_path_runs_the_else_branch() {
     assert!(!stdout.contains("if-branch taken"), "stdout: {stdout}");
     assert!(stdout.contains("sim_device_wait"), "stdout: {stdout}");
 }
+
+/// M9 end-to-end test: `examples/counting_loop.phase` builds and actually
+/// runs a `while` loop that terminates on its own via a real `n = n + 1;`
+/// assignment (spec §9, Milestone M9) -- not a loop that's merely
+/// accepted by analysis, an actually-running, actually-bounded one.
+#[test]
+fn counting_loop_builds_and_runs_exactly_five_iterations() {
+    let root = workspace_root();
+    let src_path = root.join("examples/counting_loop.phase");
+    let src = std::fs::read_to_string(&src_path).expect("counting_loop.phase must exist");
+
+    let program = phase_parser::parse(&src).expect("must parse");
+    phase_analysis::analyze(&program).expect("must pass analysis");
+    let pir = phase_pir::build(&program).expect("M9: assignment must now lower to PIR");
+    let generated = phase_codegen_c::generate(&pir, "counting_loop");
+
+    // A distinct subdirectory name (not just the stem) -- `phase build`
+    // itself writes its output binary to `build/counting_loop`, and this
+    // test must not collide with that if someone's run the CLI by hand.
+    let build_dir = root.join("build").join("counting_loop_driver_test");
+    std::fs::create_dir_all(&build_dir).unwrap();
+    let header_path = build_dir.join("counting_loop.gen.h");
+    let source_path = build_dir.join("counting_loop.gen.c");
+    std::fs::write(&header_path, &generated.header).unwrap();
+    std::fs::write(&source_path, &generated.source).unwrap();
+
+    let generic_runtime_c = root.join("runtime/phase_runtime.c");
+    let extern_runtime_c = root.join("runtime/counting_loop_extern.c");
+    let runtime_dir = root.join("runtime");
+    let binary_path = build_dir.join("counting_loop_test_bin");
+
+    let cc_output = Command::new("cc")
+        .args(["-std=c11", "-Wall", "-Werror", "-I"])
+        .arg(&build_dir)
+        .args(["-I"])
+        .arg(&runtime_dir)
+        .args(["-o"])
+        .arg(&binary_path)
+        .arg(&source_path)
+        .arg(&generic_runtime_c)
+        .arg(&extern_runtime_c)
+        .output()
+        .expect("failed to invoke cc -- is a C compiler installed?");
+
+    assert!(
+        cc_output.status.success() && cc_output.stderr.is_empty(),
+        "cc failed (or warned) compiling the generated counting-loop C:\n{}",
+        String::from_utf8_lossy(&cc_output.stderr)
+    );
+
+    let out = Command::new(&binary_path)
+        .output()
+        .expect("failed to run the compiled binary");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Exactly n=0..4 -- proves the loop terminates on its own rather than
+    // running zero times (condition never true) or being cut off by
+    // something external.
+    for n in 0..5 {
+        assert!(stdout.contains(&format!("n={n}")), "stdout: {stdout}");
+    }
+    assert!(!stdout.contains("n=5"), "stdout: {stdout}");
+}

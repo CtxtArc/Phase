@@ -62,6 +62,11 @@ impl Parser {
         self.tokens[self.pos].span
     }
 
+    fn peek_at(&self, offset: usize) -> &TokenKind {
+        let idx = (self.pos + offset).min(self.tokens.len() - 1);
+        &self.tokens[idx].kind
+    }
+
     fn at(&self, kind: &TokenKind) -> bool {
         self.peek() == kind
     }
@@ -299,8 +304,26 @@ impl Parser {
             TokenKind::KwReturn => self.parse_return_stmt(),
             TokenKind::KwIf => self.parse_if_stmt(),
             TokenKind::KwWhile => self.parse_while_stmt(),
+            // `name = expr;` (M9) -- look ahead one token so a bare call
+            // statement (`tick();`) or other expression statement isn't
+            // mistaken for an assignment.
+            TokenKind::Ident(_) if matches!(self.peek_at(1), TokenKind::Eq) => {
+                self.parse_assign_stmt()
+            }
             _ => self.parse_expr_stmt(),
         }
+    }
+
+    /// `name = expr;` (M9) -- reassigns an already-declared scalar local.
+    /// Deliberately just `Ident = Expr`, not general lvalues (no field or
+    /// index targets in v0.1) -- see `phase_specification.md` §9,
+    /// Milestone M9.
+    fn parse_assign_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::Eq)?;
+        let value = self.parse_expr()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(Stmt::Assign { name, value })
     }
 
     /// `if cond { .. } else if cond2 { .. } else { .. }` — the `else if`
@@ -1003,6 +1026,67 @@ mod tests {
             },
             other => panic!("expected fn, got {:?}", other),
         }
+    }
+
+    // ---- M9: assignment -------------------------------------------------
+
+    #[test]
+    fn parses_assignment_statement() {
+        let src = "fn main() { n = n + 1; }";
+        let prog = parse(src).unwrap();
+        match &prog.items[0] {
+            Item::Fn(f) => match &f.body.stmts[0] {
+                Stmt::Assign { name, value } => {
+                    assert_eq!(name, "n");
+                    assert_eq!(
+                        *value,
+                        Expr::Binary {
+                            op: BinOp::Add,
+                            lhs: Box::new(Expr::Ident("n".into())),
+                            rhs: Box::new(Expr::IntLit(1)),
+                        }
+                    );
+                }
+                other => panic!("expected assign, got {:?}", other),
+            },
+            other => panic!("expected fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn assignment_inside_while_body_parses() {
+        let src = "fn main() { while n < 5 { n = n + 1; } }";
+        let prog = parse(src).unwrap();
+        match &prog.items[0] {
+            Item::Fn(f) => match &f.body.stmts[0] {
+                Stmt::While { body, .. } => {
+                    assert_eq!(body.stmts.len(), 1);
+                    assert!(matches!(body.stmts[0], Stmt::Assign { .. }));
+                }
+                other => panic!("expected while, got {:?}", other),
+            },
+            other => panic!("expected fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bare_call_statement_is_not_mistaken_for_an_assignment() {
+        // `tick();` starts with an Ident but the next token is `(`, not
+        // `=` -- must still parse as a plain expression statement.
+        let src = "extern fn tick(); fn main() { tick(); }";
+        let prog = parse(src).unwrap();
+        match &prog.items[1] {
+            Item::Fn(f) => assert!(matches!(f.body.stmts[0], Stmt::Expr(Expr::Call { .. }))),
+            other => panic!("expected fn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn equality_comparison_is_not_mistaken_for_an_assignment() {
+        // `n == 0` inside a condition must still tokenize/parse as EqEq,
+        // not trip the `Ident` + `Eq` assignment lookahead.
+        let src = "fn main() { if n == 0 { tick(); } }";
+        assert!(parse(src).is_ok());
     }
 
     #[test]

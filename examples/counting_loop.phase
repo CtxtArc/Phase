@@ -1,0 +1,17 @@
+// M9 demo: a `while` loop that actually terminates on its own, using a
+// real counter that changes each iteration (`n = n + 1;`). M8 alone
+// could compile `while`/`if` to real C, but with no assignment statement
+// a loop's condition could never change between iterations -- it could
+// only run zero times or forever. M9's `name = expr;` closes that gap.
+//
+// See phase_specification.md §9, Milestone M9.
+
+extern fn tick(n: i32);
+
+fn main() {
+    let n: i32 = 0;
+    while n < 5 {
+        tick(n);
+        n = n + 1;
+    }
+}

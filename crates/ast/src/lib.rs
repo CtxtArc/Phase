@@ -166,6 +166,9 @@ pub enum Stmt {
     },
     /// `while cond { .. }`
     While { cond: Expr, body: Block },
+    /// `name = expr;` (M9) -- reassigns an already-declared scalar local.
+    /// Only a bare identifier target; no field/index lvalues in v0.1.
+    Assign { name: String, value: Expr },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

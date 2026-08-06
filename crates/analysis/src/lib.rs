@@ -419,6 +419,33 @@ impl<'a> FnChecker<'a> {
             } => self.check_if(cond, then_block, else_block.as_ref(), errors),
 
             Stmt::While { cond, body } => self.check_while(cond, body, errors),
+
+            // M9: `name = expr;`. Deliberately scoped to plain scalar
+            // locals -- domain-tracked entities/buffers already have their
+            // own dedicated transitions (`move`/`sync`/`borrow`/`destroy`)
+            // and reassigning through them would bypass those checks, so
+            // it's a clear error rather than a silent domain reset.
+            Stmt::Assign { name, value } => {
+                let Some(var) = self.locals.get(name) else {
+                    errors.push(err(format!("cannot assign to unknown local '{name}'")));
+                    self.check_expr(value, errors);
+                    return;
+                };
+                if var.borrow_of.is_some() {
+                    errors.push(err(format!(
+                        "cannot assign to '{name}': it is a borrow handle"
+                    )));
+                } else if var.domain.is_some() {
+                    errors.push(err(format!(
+                        "cannot assign to '{name}': it is domain-tracked (use move/sync instead)"
+                    )));
+                } else if var.destroyed {
+                    errors.push(err(format!(
+                        "cannot assign to '{name}': it was destroyed"
+                    )));
+                }
+                self.check_expr(value, errors);
+            }
         }
     }
 
@@ -1484,5 +1511,69 @@ mod tests {
             src,
             "'volatile_write' requires an @MMIO register reference, but 'A' is tagged @DMA",
         );
+    }
+
+    // ---- M9: assignment ---------------------------------------------------
+
+    #[test]
+    fn reassigning_a_scalar_local_is_accepted() {
+        let src = r#"
+            fn main() {
+                let n: i32 = 0;
+                n = n + 1;
+            }
+        "#;
+        assert_eq!(check_src(src), Ok(()));
+    }
+
+    #[test]
+    fn counting_while_loop_with_assignment_is_accepted() {
+        let src = r#"
+            extern fn tick(n: i32);
+            fn main() {
+                let n: i32 = 0;
+                while n < 5 {
+                    tick(n);
+                    n = n + 1;
+                }
+            }
+        "#;
+        assert_eq!(check_src(src), Ok(()));
+    }
+
+    #[test]
+    fn assigning_to_an_undeclared_name_is_rejected() {
+        let src = r#"
+            fn main() {
+                n = 1;
+            }
+        "#;
+        assert_single_error_containing(src, "cannot assign to unknown local 'n'");
+    }
+
+    #[test]
+    fn assigning_to_a_domain_tracked_buffer_is_rejected() {
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @RAM;
+                x = 1;
+            }
+        "#;
+        assert_single_error_containing(
+            src,
+            "cannot assign to 'x': it is domain-tracked (use move/sync instead)",
+        );
+    }
+
+    #[test]
+    fn assigning_to_a_borrow_handle_is_rejected() {
+        let src = r#"
+            fn main() {
+                buffer<u8, 16> x @RAM;
+                let v = borrow x read;
+                v = x;
+            }
+        "#;
+        assert_single_error_containing(src, "cannot assign to 'v': it is a borrow handle");
     }
 }

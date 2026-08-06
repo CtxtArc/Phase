@@ -97,6 +97,7 @@ fn radio_pipeline_main_body_statement_sequence() {
             Stmt::Return(_) => "Return",
             Stmt::If { .. } => "If",
             Stmt::While { .. } => "While",
+            Stmt::Assign { .. } => "Assign",
         })
         .collect();
 
@@ -262,6 +263,13 @@ mod analysis_end_to_end {
         // M7: the richer worked example exercising domain safety,
         // typestate, and MMIO together in one program.
         let result = analyze_example("sdr_session.phase");
+        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+    }
+
+    #[test]
+    fn counting_loop_example_passes_analysis() {
+        // M9: a `while` loop with a real, assignment-driven counter.
+        let result = analyze_example("counting_loop.phase");
         assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
     }
 
