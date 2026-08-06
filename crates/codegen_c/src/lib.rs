@@ -13,9 +13,13 @@
 //! guarantee ("never reordered or eliminated") is enforced by the C
 //! standard's own `volatile` semantics, not by anything this crate has to
 //! independently prove.
+//!
+//! M8 adds real control flow: `PirInst::If`/`PirInst::While` lower to
+//! actual C `if`/`while` statements (indentation-tracked, arbitrarily
+//! nested), closing the "straight-line only" scope cut from M5.
 
-use phase_ast::{BorrowMode, Domain};
-use phase_pir::{CallArg, PirEntityDef, PirFn, PirFnSig, PirInst, PirLiteral, PirProgram, PirType};
+use phase_ast::{BinOp, BorrowMode, Domain};
+use phase_pir::{CallArg, PirEntityDef, PirExpr, PirFn, PirFnSig, PirInst, PirLiteral, PirProgram, PirType};
 use std::collections::HashMap;
 
 pub struct Generated {
@@ -195,7 +199,7 @@ fn format_fn(f: &PirFn, sigs: &HashMap<&str, &PirFnSig>) -> String {
         locals.insert(pname.clone(), pty.clone());
     }
     for inst in &f.body {
-        out.push_str(&format_inst(inst, sigs, &mut locals));
+        out.push_str(&format_inst(inst, sigs, &mut locals, 1));
     }
     if is_main {
         out.push_str("    return 0;\n");
@@ -208,11 +212,13 @@ fn format_inst(
     inst: &PirInst,
     sigs: &HashMap<&str, &PirFnSig>,
     locals: &mut HashMap<String, PirType>,
+    indent: usize,
 ) -> String {
+    let pad = "    ".repeat(indent);
     match inst {
         PirInst::EntityCreate { name, ty, .. } => {
             locals.insert(name.clone(), ty.clone());
-            format!("    {};\n", declare(name, ty))
+            format!("{pad}{};\n", declare(name, ty))
         }
 
         PirInst::EntityCreateWithFields {
@@ -223,7 +229,12 @@ fn format_inst(
                 .iter()
                 .map(|(fname, lit)| format!(".{fname} = {}", format_literal(lit)))
                 .collect();
-            format!("    {} = {{ {} }};\n", declare(name, ty), inits.join(", "))
+            format!("{pad}{} = {{ {} }};\n", declare(name, ty), inits.join(", "))
+        }
+
+        PirInst::EntityCreateWithLiteral { name, ty, value, .. } => {
+            locals.insert(name.clone(), ty.clone());
+            format!("{pad}{} = {};\n", declare(name, ty), format_literal(value))
         }
 
         PirInst::CallAssign {
@@ -244,15 +255,15 @@ fn format_inst(
                     Some(CallArg::MmioRegister(r)) => r.clone(),
                     _ => "/* internal error: volatile_read missing MMIO register arg */".to_string(),
                 };
-                return format!("    {} = {reg};\n", declare(name, ty));
+                return format!("{pad}{} = {reg};\n", declare(name, ty));
             }
             let call_sig = sigs.get(callee.as_str()).copied();
             let arg_text = format_args(args, call_sig, locals);
-            format!("    {} = {}({});\n", declare(name, ty), callee, arg_text)
+            format!("{pad}{} = {}({});\n", declare(name, ty), callee, arg_text)
         }
 
         PirInst::EntityMove { name, to } => format!(
-            "    /* move {name} -> @{} (compile-time only; the v0.1 simulation model keeps everything in one address space, so there is nothing to physically move) */\n",
+            "{pad}/* move {name} -> @{} (compile-time only; the v0.1 simulation model keeps everything in one address space, so there is nothing to physically move) */\n",
             to.name()
         ),
 
@@ -265,9 +276,7 @@ fn format_inst(
                 // program that passed analysis, but fall back safely.
                 _ => "sim_device_wait",
             };
-            format!(
-                "    {wait_fn}(\"{name}\", {name}, sizeof({name}));\n"
-            )
+            format!("{pad}{wait_fn}(\"{name}\", {name}, sizeof({name}));\n")
         }
 
         PirInst::EntityBorrow { name, target, mode } => {
@@ -284,18 +293,18 @@ fn format_inst(
             let ptr_ty = format!("{const_kw}{elem_ty}*");
             locals.insert(name.clone(), target_ty.unwrap_or(PirType::Scalar("void".into())));
             if is_buffer {
-                format!("    {ptr_ty} {name} = {target}; /* borrow */\n")
+                format!("{pad}{ptr_ty} {name} = {target}; /* borrow */\n")
             } else {
-                format!("    {ptr_ty} {name} = &{target}; /* borrow */\n")
+                format!("{pad}{ptr_ty} {name} = &{target}; /* borrow */\n")
             }
         }
 
         PirInst::EntityRelease { name } => {
-            format!("    /* release {name} (compile-time only; no separate runtime action) */\n")
+            format!("{pad}/* release {name} (compile-time only; no separate runtime action) */\n")
         }
 
         PirInst::EntityDestroy { name } => format!(
-            "    /* destroy {name} (compile-time only; buffers are stack-allocated in v0.1, so there is no separate deallocation step) */\n"
+            "{pad}/* destroy {name} (compile-time only; buffers are stack-allocated in v0.1, so there is no separate deallocation step) */\n"
         ),
 
         PirInst::Call { callee, args } => {
@@ -312,17 +321,82 @@ fn format_inst(
                     Some(CallArg::MmioRegister(r)) => r.clone(),
                     None => "/* internal error: volatile_write missing value arg */".to_string(),
                 };
-                return format!("    {reg} = {value};\n");
+                return format!("{pad}{reg} = {value};\n");
             }
             let call_sig = sigs.get(callee.as_str()).copied();
             let arg_text = format_args(args, call_sig, locals);
-            format!("    {callee}({arg_text});\n")
+            format!("{pad}{callee}({arg_text});\n")
         }
 
         PirInst::Return { value } => match value {
-            Some(v) => format!("    return {v};\n"),
-            None => "    return;\n".to_string(),
+            Some(v) => format!("{pad}return {v};\n"),
+            None => format!("{pad}return;\n"),
         },
+
+        // ---- M8: real control flow ----------------------------------------
+        PirInst::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            let mut s = format!("{pad}if ({}) {{\n", format_cond_expr(cond));
+            for inst in then_body {
+                s.push_str(&format_inst(inst, sigs, locals, indent + 1));
+            }
+            if else_body.is_empty() {
+                s.push_str(&format!("{pad}}}\n"));
+            } else {
+                s.push_str(&format!("{pad}}} else {{\n"));
+                for inst in else_body {
+                    s.push_str(&format_inst(inst, sigs, locals, indent + 1));
+                }
+                s.push_str(&format!("{pad}}}\n"));
+            }
+            s
+        }
+
+        PirInst::While { cond, body } => {
+            let mut s = format!("{pad}while ({}) {{\n", format_cond_expr(cond));
+            for inst in body {
+                s.push_str(&format_inst(inst, sigs, locals, indent + 1));
+            }
+            s.push_str(&format!("{pad}}}\n"));
+            s
+        }
+    }
+}
+
+/// Format an `if`/`while` condition (`PirExpr`) as a C boolean expression.
+/// Every `Binary` node is fully parenthesized -- simplest way to guarantee
+/// correct precedence without implementing a precedence table, at the
+/// (acceptable, for generated code) cost of some redundant parens.
+fn format_cond_expr(e: &PirExpr) -> String {
+    match e {
+        PirExpr::Ident(n) => n.clone(),
+        PirExpr::IntLit(n) => n.to_string(),
+        PirExpr::FloatLit(n) => format!("{n}f"),
+        PirExpr::BoolLit(b) => b.to_string(),
+        PirExpr::Binary { op, lhs, rhs } => format!(
+            "({} {} {})",
+            format_cond_expr(lhs),
+            format_binop(*op),
+            format_cond_expr(rhs)
+        ),
+    }
+}
+
+fn format_binop(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Eq => "==",
+        BinOp::NotEq => "!=",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::LtEq => "<=",
+        BinOp::GtEq => ">=",
     }
 }
 
@@ -564,5 +638,85 @@ mod tests {
         let g = generate_src("fn main() {}", "t");
         assert!(!g.header.contains("MMIO"));
         assert!(!g.source.contains("volatile uint32_t"));
+    }
+
+    // ---- M8: if/while codegen ------------------------------------------
+
+    #[test]
+    fn if_else_emits_a_real_c_if_else_block() {
+        let src = r#"
+            extern fn tick();
+            extern fn tock();
+            fn main() {
+                let flag: bool = true;
+                if flag {
+                    tick();
+                } else {
+                    tock();
+                }
+            }
+        "#;
+        let g = generate_src(src, "t");
+        assert!(g.source.contains("if (flag) {"));
+        assert!(g.source.contains("        tick();"));
+        assert!(g.source.contains("} else {"));
+        assert!(g.source.contains("        tock();"));
+    }
+
+    #[test]
+    fn if_without_else_emits_bare_if_no_dangling_else() {
+        let src = r#"
+            extern fn tick();
+            fn main() {
+                let flag: bool = true;
+                if flag {
+                    tick();
+                }
+            }
+        "#;
+        let g = generate_src(src, "t");
+        assert!(g.source.contains("if (flag) {"));
+        assert!(!g.source.contains("else"));
+    }
+
+    #[test]
+    fn while_loop_emits_a_real_c_while_with_comparison_condition() {
+        let src = r#"
+            extern fn tick();
+            fn main() {
+                let n: i32 = 0;
+                while n < 3 {
+                    tick();
+                }
+            }
+        "#;
+        let g = generate_src(src, "t");
+        assert!(g.source.contains("int32_t n = 0;"));
+        assert!(g.source.contains("while ((n < 3)) {"));
+        assert!(g.source.contains("        tick();"));
+    }
+
+    #[test]
+    fn nested_if_inside_while_indents_two_levels_deep() {
+        let src = r#"
+            extern fn tick();
+            fn main() {
+                let n: i32 = 0;
+                let flag: bool = true;
+                while n < 3 {
+                    if flag {
+                        tick();
+                    }
+                }
+            }
+        "#;
+        let g = generate_src(src, "t");
+        assert!(g.source.contains("            tick();"));
+    }
+
+    #[test]
+    fn scalar_literal_var_decl_lowers_to_plain_c_initializer() {
+        let g = generate_src("fn main() { let n: i32 = 0; }", "t");
+        assert!(g.source.contains("int32_t n = 0;"));
     }
 }

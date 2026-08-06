@@ -3,8 +3,8 @@
 **A compiler that statically proves memory safety for hardware pipelines — DMA, MMIO, and zero-copy devices — before the code ever runs.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Status-M7_Complete-success" alt="Status">
-  <img src="https://img.shields.io/badge/Tests-135_passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/Status-M8_Complete-success" alt="Status">
+  <img src="https://img.shields.io/badge/Tests-143_passing-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
 </p>
@@ -180,16 +180,27 @@ capture-filter-playback, a status packet that must pass through a full
 `Received -> Decoded -> Validated` typestate chain, and MMIO register
 control, composed in one program that actually builds and runs.
 
+`examples/branching_pipeline.phase` is the M8 demo: a real `if`/`else`
+that compiles to real C control flow and actually takes either branch at
+runtime, picked by an extern call (`PHASE_DEMO_USE_DMA=0 ./build/branching_pipeline`
+forces the `@DEVICE` path; unset or non-zero takes `@DMA`).
+
 ## Honest scope
 
 This is a v0.1 research/portfolio compiler, not a production toolchain.
 Limitations below are documented on purpose rather than left as silent
 gaps someone has to discover the hard way:
 
-- **`phase build` only supports straight-line function bodies.** A body
-  containing `if`/`while` is fully *checked* — the branch-merge analyzer
-  proves it's safe — but not yet *compiled*; `phase_pir::build` rejects it
-  with a clear error instead of silently mis-compiling it.
+- **No assignment statement.** A `let`-bound local never changes value
+  after it's declared, so while M8 compiles real `if`/`while` to real C
+  control flow, a `while` loop can't yet mutate its own condition —
+  meaningful loop termination (e.g. a polling loop) needs `name = expr;`,
+  which is scoped as M9.
+- **`if`/`while` conditions are a deliberately small subset of
+  expressions** (`PirExpr`: identifiers, literals, binary comparisons/
+  arithmetic) — not the full `Expr` grammar. A condition using a call
+  (e.g. `volatile_read(...)`) is a clear `UnsupportedExpr` error, not a
+  silent guess; extending this is bundled into M9 alongside assignment.
 - **Every program with an `extern fn` needs a matching hand-written
   runtime file**, `runtime/<stem>_extern.c` (e.g. `sdr_session.phase` →
   `runtime/sdr_session_extern.c`). The compiler only ever generates a
@@ -212,12 +223,16 @@ Full rationale for all of these is in
 
 ## What's next
 
-The roadmap's core milestones (M1-M7) are complete. Natural next
-directions, not yet scoped as formal milestones:
+The roadmap's core milestones (M1–M8) are complete — `phase build` now
+compiles real branching and looping control flow to C, not just
+straight-line pipelines. Formal next milestones, in
+[`phase_specification.md`](phase_specification.md) §9:
 
-- Lowering `if`/`while` to real C branches, closing the scope cut above.
-- Supporting real hardware targets instead of the simulated runtime.
-- An LLVM backend (spec §6.2's documented non-goal for v0.1).
+- **M9 — Assignment + richer expressions.** The real prerequisite for a
+  loop that can terminate on its own (e.g. a genuine MMIO polling loop).
+- **M10 — Real hardware target,** replacing the two simulated wait
+  functions with an actual wait-for-completion on real silicon.
+- **M11 — An LLVM backend** (§10's documented non-goal for v0.1).
 
 For the complete language specification, domain model, type system, and
 full milestone roadmap this was built against, see

@@ -114,17 +114,82 @@ fn radio_pipeline_builds_and_runs_end_to_end() {
     assert!(rms > 0.01, "expected a real nonzero RMS from actual filtered signal data, got {rms}");
 }
 
-#[test]
-fn control_flow_body_is_rejected_by_pir_with_a_clear_scope_error() {
-    // M5's documented scope cut: `phase build` on a program using
-    // if/while fails with a clear "not yet supported" error rather than
-    // silently mis-compiling or panicking.
+/// M8 end-to-end test: `examples/branching_pipeline.phase` builds with
+/// real C `if`/`else` (closing M5's straight-line-only scope cut) and both
+/// branches actually run, selected by an environment variable at runtime
+/// -- not just that the M4 analyzer accepts the branching source.
+///
+/// `variant` picks a distinct build subdirectory per caller (e.g. "dma",
+/// "device") -- `cargo test` runs tests in parallel by default, and the
+/// generated source's `#include "branching_pipeline.gen.h"` is a fixed
+/// name (it has to match the stem passed to `codegen_c::generate`), so
+/// two tests sharing one `build/` directory would race on the same
+/// `.gen.h`/`.gen.c`/binary files and could non-deterministically compile
+/// or run the wrong content.
+fn build_branching_pipeline(variant: &str, use_dma_env: Option<&str>) -> std::process::Output {
     let root = workspace_root();
     let src_path = root.join("examples/branching_pipeline.phase");
     let src = std::fs::read_to_string(&src_path).expect("branching_pipeline.phase must exist");
 
     let program = phase_parser::parse(&src).expect("must parse");
-    phase_analysis::analyze(&program).expect("must pass analysis (M4 already proves it's safe)");
-    let err = phase_pir::build(&program).expect_err("PIR generation should reject control flow in M5");
-    assert!(matches!(err, phase_pir::PirError::UnsupportedControlFlow { .. }));
+    phase_analysis::analyze(&program).expect("must pass analysis");
+    let pir = phase_pir::build(&program).expect("M8: control flow must now lower to PIR");
+    let generated = phase_codegen_c::generate(&pir, "branching_pipeline");
+
+    let build_dir = root.join("build").join(format!("branching_pipeline_{variant}"));
+    std::fs::create_dir_all(&build_dir).unwrap();
+    let header_path = build_dir.join("branching_pipeline.gen.h");
+    let source_path = build_dir.join("branching_pipeline.gen.c");
+    std::fs::write(&header_path, &generated.header).unwrap();
+    std::fs::write(&source_path, &generated.source).unwrap();
+
+    let generic_runtime_c = root.join("runtime/phase_runtime.c");
+    let extern_runtime_c = root.join("runtime/branching_pipeline_extern.c");
+    let runtime_dir = root.join("runtime");
+    let binary_path = build_dir.join("branching_pipeline_test_bin");
+
+    let cc_output = Command::new("cc")
+        .args(["-std=c11", "-Wall", "-Werror", "-I"])
+        .arg(&build_dir)
+        .args(["-I"])
+        .arg(&runtime_dir)
+        .args(["-o"])
+        .arg(&binary_path)
+        .arg(&source_path)
+        .arg(&generic_runtime_c)
+        .arg(&extern_runtime_c)
+        .output()
+        .expect("failed to invoke cc -- is a C compiler installed?");
+
+    assert!(
+        cc_output.status.success() && cc_output.stderr.is_empty(),
+        "cc failed (or warned) compiling the generated branching C:\n{}",
+        String::from_utf8_lossy(&cc_output.stderr)
+    );
+
+    let mut cmd = Command::new(&binary_path);
+    if let Some(v) = use_dma_env {
+        cmd.env("PHASE_DEMO_USE_DMA", v);
+    }
+    cmd.output().expect("failed to run the compiled binary")
+}
+
+#[test]
+fn branching_pipeline_dma_path_runs_the_if_branch() {
+    let out = build_branching_pipeline("dma", Some("1"));
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("if-branch taken"), "stdout: {stdout}");
+    assert!(!stdout.contains("else-branch taken"), "stdout: {stdout}");
+    assert!(stdout.contains("sim_dma_wait"), "stdout: {stdout}");
+}
+
+#[test]
+fn branching_pipeline_device_path_runs_the_else_branch() {
+    let out = build_branching_pipeline("device", Some("0"));
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("else-branch taken"), "stdout: {stdout}");
+    assert!(!stdout.contains("if-branch taken"), "stdout: {stdout}");
+    assert!(stdout.contains("sim_device_wait"), "stdout: {stdout}");
 }

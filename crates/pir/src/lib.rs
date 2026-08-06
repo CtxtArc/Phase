@@ -4,21 +4,26 @@
 //! each function into an ordered list of instructions and resolves every
 //! type down to something codegen can turn directly into C.
 //!
-//! Scope (documented, not silent): M5 targets the straight-line subset --
-//! a body containing `if`/`while` is rejected here with a clear
-//! `UnsupportedControlFlow` error rather than silently mis-compiled.
-//! Lowering control flow to PIR (real branches / phi-materialization in C)
-//! is future work; M4's branch-merge analyzer already proves such bodies
-//! are *safe*, this crate just doesn't yet know how to generate code for
-//! them. `phase build` is only guaranteed to work on straight-line
-//! programs like `examples/radio_pipeline.phase`.
+//! M5 targeted the straight-line subset only; M8 adds real `if`/`while`
+//! lowering (`PirInst::If`/`PirInst::While`), so a body containing control
+//! flow now compiles instead of being rejected. `UnsupportedControlFlow`
+//! is kept as a variant (unused by this crate today) rather than deleted,
+//! since removing an error variant is itself a breaking API change for
+//! anything matching on `PirError` -- see also `phase_specification.md`
+//! §9, Milestone M8.
+//!
+//! Condition expressions in `if`/`while` lower to `PirExpr`, a small
+//! subset of `phase_ast::Expr` (identifiers, literals, and binary
+//! comparisons/arithmetic) -- enough for every bug-gallery and demo
+//! program. A condition using anything richer is a clear `UnsupportedExpr`
+//! error, not a silent guess.
 //!
 //! PIR generation trusts that the program has already passed
 //! `phase_analysis::analyze` — it does not re-derive domain/borrow/
 //! typestate safety, only enough domain bookkeeping (which domain an
 //! entity is in right now) to pick the correct runtime call for `sync`.
 
-use phase_ast::{BorrowMode, Domain, Expr, Item, Program, Stmt, TypeExpr};
+use phase_ast::{BinOp, BorrowMode, Domain, Expr, Item, Program, Stmt, TypeExpr};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +75,23 @@ pub enum PirLiteral {
     Bool(bool),
 }
 
+/// A condition expression, as it appears in `if`/`while`. Deliberately a
+/// small subset of `phase_ast::Expr` -- just enough to lower the
+/// comparisons and boolean locals the M4 branch-merge analyzer already
+/// proved safe. Anything richer is a clear `UnsupportedExpr`, not a guess.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PirExpr {
+    Ident(String),
+    IntLit(i64),
+    FloatLit(f64),
+    BoolLit(bool),
+    Binary {
+        op: BinOp,
+        lhs: Box<PirExpr>,
+        rhs: Box<PirExpr>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallArg {
     Entity(String),
@@ -95,6 +117,17 @@ pub enum PirInst {
         ty: PirType,
         domain: Option<Domain>,
         fields: Vec<(String, PirLiteral)>,
+    },
+    /// `let n: i32 = 0;` — a fresh scalar local initialized from a bare
+    /// literal. Split out from `EntityCreateWithFields` (struct literals)
+    /// because it declares with `= <value>;`, not a designated
+    /// initializer -- added in M8 so `while` loop counters/flags have
+    /// somewhere to come from.
+    EntityCreateWithLiteral {
+        name: String,
+        ty: PirType,
+        domain: Option<Domain>,
+        value: PirLiteral,
     },
     /// `let p2 = decode(p1);` — a fresh local initialized from a call's
     /// return value.
@@ -123,6 +156,18 @@ pub enum PirInst {
     EntityDestroy { name: String },
     Call { callee: String, args: Vec<CallArg> },
     Return { value: Option<String> },
+    /// `if cond { .. } else { .. }` (M8). `else_body` is empty, not
+    /// absent, when there's no `else` clause -- codegen just emits a bare
+    /// `if` block in that case.
+    If {
+        cond: PirExpr,
+        then_body: Vec<PirInst>,
+        else_body: Vec<PirInst>,
+    },
+    /// `while cond { .. }` (M8). Lowers to a real C `while`; see spec §10 /
+    /// the M4 analyzer docs for why this is sound without a fixed-point
+    /// loop analysis (bodies are checked as "ran zero or one times").
+    While { cond: PirExpr, body: Vec<PirInst> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -380,12 +425,54 @@ impl<'a> Lowerer<'a> {
                 Ok(())
             }
 
-            Stmt::If { .. } => Err(PirError::UnsupportedControlFlow {
-                context: format!("`if` inside fn '{fn_name}'"),
-            }),
-            Stmt::While { .. } => Err(PirError::UnsupportedControlFlow {
-                context: format!("`while` inside fn '{fn_name}'"),
-            }),
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let context = format!("`if` inside fn '{fn_name}'");
+                let pir_cond = lower_cond_expr(cond, &context)?;
+
+                // Domain bookkeeping (not a safety check -- M4's analyzer
+                // already proved both arms agree wherever it matters) --
+                // lower each arm from the same starting snapshot so one
+                // arm's moves/syncs don't leak into the other, then keep
+                // the then-arm's resulting view (or the before-snapshot,
+                // for an absent else, since that's the "didn't run" path).
+                let domains_before = self.domains.clone();
+                let then_body = self.lower_block(then_block, fn_name)?;
+                let domains_after_then = std::mem::replace(&mut self.domains, domains_before.clone());
+                let else_body = match else_block {
+                    Some(b) => self.lower_block(b, fn_name)?,
+                    None => {
+                        self.domains = domains_before;
+                        Vec::new()
+                    }
+                };
+                if else_block.is_some() {
+                    self.domains = domains_after_then;
+                }
+                out.push(PirInst::If {
+                    cond: pir_cond,
+                    then_body,
+                    else_body,
+                });
+                Ok(())
+            }
+
+            Stmt::While { cond, body } => {
+                let context = format!("`while` inside fn '{fn_name}'");
+                let pir_cond = lower_cond_expr(cond, &context)?;
+                // Same "ran zero or one times" model as M4: keep the
+                // post-body view, matching an `if` with an implicit empty
+                // else that merges into the then-arm's state.
+                let lowered_body = self.lower_block(body, fn_name)?;
+                out.push(PirInst::While {
+                    cond: pir_cond,
+                    body: lowered_body,
+                });
+                Ok(())
+            }
         }
     }
 
@@ -445,6 +532,20 @@ impl<'a> Lowerer<'a> {
                 });
                 Ok(())
             }
+            Some(lit @ (Expr::IntLit(_) | Expr::FloatLit(_) | Expr::BoolLit(_) | Expr::StringLit(_))) => {
+                let ty = ty.ok_or_else(|| PirError::MissingType {
+                    context: format!("'{name}'"),
+                })?;
+                let resolved_ty = self.resolve(ty)?;
+                let value = lower_literal(lit, name)?;
+                out.push(PirInst::EntityCreateWithLiteral {
+                    name: name.to_string(),
+                    ty: resolved_ty,
+                    domain,
+                    value,
+                });
+                Ok(())
+            }
             Some(other) => Err(PirError::UnsupportedExpr {
                 context: format!("initializer for '{name}': {other:?}"),
             }),
@@ -500,6 +601,26 @@ impl<'a> Lowerer<'a> {
             });
         }
         Ok(out)
+    }
+}
+
+/// Lower an `if`/`while` condition to `PirExpr` (M8). Identifiers,
+/// literals, and binary comparisons/arithmetic only -- see the module doc
+/// comment for why anything else is a clear error rather than a guess.
+fn lower_cond_expr(e: &Expr, context: &str) -> Result<PirExpr, PirError> {
+    match e {
+        Expr::Ident(n) => Ok(PirExpr::Ident(n.clone())),
+        Expr::IntLit(n) => Ok(PirExpr::IntLit(*n)),
+        Expr::FloatLit(n) => Ok(PirExpr::FloatLit(*n)),
+        Expr::BoolLit(b) => Ok(PirExpr::BoolLit(*b)),
+        Expr::Binary { op, lhs, rhs } => Ok(PirExpr::Binary {
+            op: *op,
+            lhs: Box::new(lower_cond_expr(lhs, context)?),
+            rhs: Box::new(lower_cond_expr(rhs, context)?),
+        }),
+        other => Err(PirError::UnsupportedExpr {
+            context: format!("condition in {context}: {other:?}"),
+        }),
     }
 }
 
@@ -637,34 +758,114 @@ mod tests {
         assert!(matches!(err, PirError::MissingType { .. }));
     }
 
+    // ---- M8: if/while lowering ---------------------------------------------
+
     #[test]
-    fn if_is_rejected_with_a_clear_unsupported_error() {
+    fn if_else_lowers_to_pir_if_with_both_arms() {
         let src = r#"
+            extern fn tick();
+            extern fn tock();
             fn main() {
-                buffer<u8, 4> x @RAM;
                 if flag {
-                    move x -> @DMA;
+                    tick();
                 } else {
-                    move x -> @DMA;
+                    tock();
                 }
             }
         "#;
-        let err = build_src(src).unwrap_err();
-        assert!(matches!(err, PirError::UnsupportedControlFlow { .. }));
+        let pir = build_src(src).unwrap();
+        assert_eq!(
+            pir.fns[0].body[0],
+            PirInst::If {
+                cond: PirExpr::Ident("flag".into()),
+                then_body: vec![PirInst::Call {
+                    callee: "tick".into(),
+                    args: vec![],
+                }],
+                else_body: vec![PirInst::Call {
+                    callee: "tock".into(),
+                    args: vec![],
+                }],
+            }
+        );
     }
 
     #[test]
-    fn while_is_rejected_with_a_clear_unsupported_error() {
+    fn if_without_else_lowers_with_an_empty_else_body() {
         let src = r#"
             extern fn tick();
             fn main() {
-                while flag {
+                if flag {
                     tick();
                 }
             }
         "#;
-        let err = build_src(src).unwrap_err();
-        assert!(matches!(err, PirError::UnsupportedControlFlow { .. }));
+        let pir = build_src(src).unwrap();
+        assert_eq!(
+            pir.fns[0].body[0],
+            PirInst::If {
+                cond: PirExpr::Ident("flag".into()),
+                then_body: vec![PirInst::Call {
+                    callee: "tick".into(),
+                    args: vec![],
+                }],
+                else_body: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn while_lowers_to_pir_while_with_a_comparison_condition() {
+        let src = r#"
+            extern fn tick();
+            fn main() {
+                let n: i32 = 0;
+                while n < 3 {
+                    tick();
+                }
+            }
+        "#;
+        let pir = build_src(src).unwrap();
+        assert_eq!(
+            pir.fns[0].body[1],
+            PirInst::While {
+                cond: PirExpr::Binary {
+                    op: BinOp::Lt,
+                    lhs: Box::new(PirExpr::Ident("n".into())),
+                    rhs: Box::new(PirExpr::IntLit(3)),
+                },
+                body: vec![PirInst::Call {
+                    callee: "tick".into(),
+                    args: vec![],
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn nested_if_inside_while_lowers_recursively() {
+        let src = r#"
+            extern fn tick();
+            extern fn tock();
+            fn main() {
+                let n: i32 = 0;
+                while n < 3 {
+                    if n == 0 {
+                        tick();
+                    } else {
+                        tock();
+                    }
+                }
+            }
+        "#;
+        let pir = build_src(src).unwrap();
+        match &pir.fns[0].body[1] {
+            PirInst::While { body, .. } => {
+                assert_eq!(body.len(), 1);
+                assert!(matches!(body[0], PirInst::If { .. }));
+            }
+            other => panic!("expected While, got {other:?}"),
+        }
     }
 
     #[test]

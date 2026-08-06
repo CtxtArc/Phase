@@ -517,9 +517,43 @@ Full `radio_pipeline.phase` demo (synthetic signal in, FIR filter via
 compiler error output captured, plus a short doc mapping each caught bug
 class to a real-world CVE/incident category.
 
+**M8 — Real control-flow codegen**
+Closes M5's documented scope cut: `PirInst::If`/`PirInst::While` lower
+`if`/`while` to real, correctly-indented, arbitrarily-nested C `if`/
+`while` statements (`phase_pir`/`phase_codegen_c`), instead of
+`phase build` rejecting any body that uses them. Output:
+`examples/branching_pipeline.phase` builds with `cc` and a driver
+end-to-end test runs *both* branches of a real conditional, selected at
+runtime (`PHASE_DEMO_USE_DMA`) -- not just that the M4 analyzer accepts
+the branching source. Condition expressions are deliberately scoped to
+`PirExpr` (identifiers, literals, binary comparisons/arithmetic) rather
+than the full `Expr` grammar; see the Honest Scope note on assignment
+below for why a loop can't yet mutate its own condition.
+
+**M9 — Assignment + richer expressions** *(not yet started)*
+The language currently has no assignment statement -- a `let`-bound local
+never changes value after it's declared, and `if`/`while` conditions
+can't reference `volatile_read`/other calls. Without these, a `while`
+loop can only be unconditionally-zero or infinite; it can't meaningfully
+terminate on its own. M9 adds `name = expr;`, extends `PirExpr`/call-arg
+lowering to cover calls and richer arithmetic, and is the real
+prerequisite for a genuine polling/counting loop demo.
+
+**M10 — Real hardware target** *(not yet started)*
+Replace the two simulated wait functions (`sim_dma_wait`/`sim_device_wait`
+in `runtime/phase_runtime.c`) with an actual wait-for-completion against
+real silicon (e.g. polling a DMA controller register or an interrupt
+flag). By design this only touches the runtime, not the compiler or the
+PHASE source -- see spec §5.3.
+
+**M11 — LLVM backend** *(not yet started, documented non-goal for v0.1)*
+An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead
+of C, avoiding a dependency on an external `cc`. See §10 for why this was
+deliberately deferred rather than attempted first.
+
 **Suggested testing approach throughout:** every milestone gets a
 `tests/` directory of `.phase` files with an expected-output (`.stdout`/
-`.stderr`) golden file, run via `cargo test` — both accept-cases and the
+`.stderr`) golden file, run via `cargo test` -- both accept-cases and the
 bug-gallery reject-cases, so regressions in the analyzer are caught
 immediately as the language grows.
 

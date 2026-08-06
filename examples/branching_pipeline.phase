@@ -1,12 +1,19 @@
 // Demonstrates a branch where both paths independently return the buffer
 // to @RAM before the branches join -- the merge point agrees, so this is
 // accepted even though the two paths take different routes to get there.
+//
+// M8: `if`/`while` now lower to real C control flow (see
+// phase_specification.md §9, Milestone M8), so this is also the driver
+// crate's end-to-end proof that a *branching* program builds with `cc`
+// and actually runs both paths, not just that the analyzer accepts it.
 
+extern fn should_use_dma() -> bool;
 extern fn device_capture(dst: buffer<u8, 16> @DMA);
 extern fn device_stream(dst: buffer<u8, 16> @DEVICE);
 
 fn main() {
     buffer<u8, 16> x @RAM;
+    let use_dma: bool = should_use_dma();
 
     if use_dma {
         move x -> @DMA;
