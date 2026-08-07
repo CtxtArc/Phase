@@ -570,7 +570,35 @@ peripheral this board exposes (the UART) -- a target with an actual DMA
 controller would poll that controller's own completion register the
 same way, same pattern, different register.
 
-**M11 — LLVM backend** *(not yet started, documented non-goal for v0.1)*
+**M11 — `volatile_read` in conditions/assignment RHS (real MMIO polling loops)**
+Closes the gap directly: `PirExpr` gains a `VolatileRead` variant, so
+`volatile_read(REG @MMIO)` can now appear inside an `if`/`while`
+condition or an assignment right-hand side -- e.g.
+`while volatile_read(READY @MMIO) == 0 { .. }`, a real hardware polling
+loop expressed entirely in PHASE source instead of requiring the poll
+itself to be hand-written in the runtime. Deliberately restricted to this
+one builtin, not general `extern fn` calls in a condition -- see the
+`PirExpr::VolatileRead` doc comment for why. Output:
+`examples/mmio_poll.phase` builds and runs, polling a simulated-hardware
+register across exactly 3 iterations before terminating, with the loop
+condition itself 100% compiler-generated code; a companion driver test
+recompiles the generated C at `-O2` and inspects the assembly to confirm
+the register read genuinely survives optimization (two separate reads,
+not one hoisted out of the loop) rather than trusting `volatile`
+by convention alone.
+
+Building this milestone surfaced and fixed two real latent bugs from
+earlier milestones, both now covered by regression tests: (1) PIR's
+`collect_mmio_registers` only scanned top-level instructions, never
+recursing into `if`/`while` bodies -- a gap since M8 that nothing had
+exercised until a register was referenced only from inside a loop
+condition; (2) the M2/M6 analyzer's `check_expr` never recursed into
+`Expr::Binary`, so `volatile_read(...) == 0` (a comparison, not a bare
+call) never actually got its domain/arity validation run -- confirmed via
+`docs/bug_gallery_transcript.md` regeneration that this fix doesn't
+change any existing accept/reject outcome.
+
+**M12 — LLVM backend** *(not yet started, documented non-goal for v0.1)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead
 of C, avoiding a dependency on an external `cc`. See §10 for why this was
 deliberately deferred rather than attempted first.

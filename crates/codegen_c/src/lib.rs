@@ -17,6 +17,12 @@
 //! M8 adds real control flow: `PirInst::If`/`PirInst::While` lower to
 //! actual C `if`/`while` statements (indentation-tracked, arbitrarily
 //! nested), closing the "straight-line only" scope cut from M5.
+//!
+//! M11 lets `volatile_read(REG @MMIO)` appear directly in a condition/
+//! assignment RHS (`PirExpr::VolatileRead`): it compiles to a bare read
+//! of the same `volatile` global CallAssign's volatile_read case already
+//! uses, so a real polling loop's condition is re-read the C standard's
+//! own `volatile` semantics every iteration, not memoized by mistake.
 
 use phase_ast::{BinOp, BorrowMode, Domain};
 use phase_pir::{CallArg, PirEntityDef, PirExpr, PirFn, PirFnSig, PirInst, PirLiteral, PirProgram, PirType};
@@ -387,6 +393,12 @@ fn format_pir_expr(e: &PirExpr) -> String {
             format_binop(*op),
             format_pir_expr(rhs)
         ),
+        // M11: not a function call -- a direct read of the `volatile`
+        // global, same reasoning as CallAssign's volatile_read special
+        // case (see format_inst below). This is what makes it safe to
+        // read the same register on every loop iteration: the C standard
+        // itself forbids hoisting a `volatile` read out of a loop.
+        PirExpr::VolatileRead { register } => register.clone(),
     }
 }
 
@@ -750,5 +762,44 @@ mod tests {
         assert!(g.source.contains("while ((n < 5)) {"));
         assert!(g.source.contains("        tick(n);"));
         assert!(g.source.contains("        n = (n + 1);"));
+    }
+
+    // ---- M11: volatile_read in conditions ---------------------------------
+
+    #[test]
+    fn volatile_read_in_while_condition_emits_a_bare_global_read() {
+        let src = r#"
+            extern fn arm_if_ready();
+            fn main() {
+                while volatile_read(READY @MMIO) == 0 {
+                    arm_if_ready();
+                }
+            }
+        "#;
+        let g = generate_src(src, "t");
+        // Not a function call -- a direct read of the volatile global,
+        // same as CallAssign's volatile_read special case, so the C
+        // standard's own semantics forbid caching it across iterations.
+        assert!(g.source.contains("while ((READY == 0)) {"));
+        assert!(!g.source.contains("volatile_read("));
+        assert!(g.header.contains("extern volatile uint32_t READY;"));
+        assert!(g.source.contains("volatile uint32_t READY;"));
+    }
+
+    #[test]
+    fn volatile_read_only_inside_while_condition_is_still_declared() {
+        // Regression test for the collect_mmio_registers gap this
+        // milestone found: a register referenced *only* from inside a
+        // `while` condition (not as a plain CallAssign/Call arg) must
+        // still get a `volatile uint32_t` declaration, or the generated
+        // C wouldn't even compile.
+        let src = r#"
+            fn main() {
+                while volatile_read(READY @MMIO) == 0 {
+                }
+            }
+        "#;
+        let g = generate_src(src, "t");
+        assert!(g.source.contains("volatile uint32_t READY;"));
     }
 }

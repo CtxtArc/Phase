@@ -3,8 +3,8 @@
 **A compiler that statically proves memory safety for hardware pipelines — DMA, MMIO, and zero-copy devices — before the code ever runs.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Status-M10_Complete-success" alt="Status">
-  <img src="https://img.shields.io/badge/Tests-160_passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/Status-M11_Complete-success" alt="Status">
+  <img src="https://img.shields.io/badge/Tests-196_passing-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
 </p>
@@ -156,11 +156,12 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-160 tests, plain `cargo test`, no custom runner — including end-to-end
+196 tests, plain `cargo test`, no custom runner — including end-to-end
 tests that invoke a real C compiler, run the resulting binaries, and
-inspect real `-O2` assembly output; a real cross-compile to ARM Cortex-M3
-run under QEMU; plus a blanket sweep asserting every bug-gallery file is
-actually rejected.
+inspect real `-O2` assembly output (including proving a `volatile_read`
+inside a `while` condition survives optimization); a real cross-compile
+to ARM Cortex-M3 run under QEMU; plus a blanket sweep asserting every
+bug-gallery file is actually rejected.
 
 **`phase build` and any test invoking `cc` must be run from this
 directory** — it resolves `runtime/*.c` and writes to `build/`, both
@@ -203,6 +204,12 @@ and run on QEMU's model of the real MPS2 AN385 board
 (`./scripts/build_hw_demo.sh`) — its `sync()` is a real register poll on
 real (emulated) hardware, not the host's simulated address space.
 
+`examples/mmio_poll.phase` is the M11 demo: a real
+`while volatile_read(READY @MMIO) == 0 { .. }` polling loop, with the
+poll itself expressed in PHASE source rather than hand-written in the
+runtime — it polls simulated hardware state across exactly 3 iterations
+before terminating.
+
 ## Honest scope
 
 This is a v0.1 research/portfolio compiler, not a production toolchain.
@@ -216,10 +223,13 @@ gaps someone has to discover the hard way:
   there's still no way to reassign through an entity.
 - **`if`/`while` conditions and assignment right-hand sides are a
   deliberately small subset of expressions** (`PirExpr`: identifiers,
-  literals, binary comparisons/arithmetic) — not the full `Expr` grammar.
-  A condition using a call (e.g. `volatile_read(...)`) is a clear
-  `UnsupportedExpr` error, not a silent guess — so a genuine MMIO polling
-  loop isn't expressible yet.
+  literals, binary comparisons/arithmetic, and — M11 — a direct
+  `volatile_read(REG @MMIO)`) — not the full `Expr` grammar. A condition
+  using any other call is a clear `UnsupportedExpr` error, not a silent
+  guess: general `extern fn` calls inside a condition would be
+  re-invoked every loop iteration with much less clear ordering/purity
+  guarantees than a register read, and that's a separate design question
+  this milestone doesn't attempt to answer.
 - **Every program with an `extern fn` needs a matching hand-written
   runtime file**, `runtime/<stem>_extern.c` (e.g. `sdr_session.phase` →
   `runtime/sdr_session_extern.c`). The compiler only ever generates a
@@ -245,12 +255,13 @@ Full rationale for all of these is in
 
 ## What's next
 
-The roadmap's core milestones (M1–M10) are complete — `phase build`
-compiles real branching, looping, and self-terminating control flow to C,
-and the runtime layer has a proven path to a real ARM target. Formal next
-milestone, in [`phase_specification.md`](phase_specification.md) §9:
+The roadmap's core milestones (M1–M11) are complete — `phase build`
+compiles real branching, looping, self-terminating, and MMIO-polling
+control flow to C, and the runtime layer has a proven path to a real ARM
+target. Formal next milestone, in
+[`phase_specification.md`](phase_specification.md) §9:
 
-- **M11 — An LLVM backend** (§10's documented non-goal for v0.1).
+- **M12 — An LLVM backend** (§10's documented non-goal for v0.1).
 
 For the complete language specification, domain model, type system, and
 full milestone roadmap this was built against, see

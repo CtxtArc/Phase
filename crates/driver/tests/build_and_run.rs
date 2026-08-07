@@ -353,3 +353,121 @@ fn hw_uart_echo_runs_on_a_real_arm_cortex_m3_target_under_qemu() {
         String::from_utf8_lossy(&qemu_output.stderr)
     );
 }
+
+/// M11 end-to-end test: `examples/mmio_poll.phase` builds and actually
+/// runs a `while volatile_read(READY @MMIO) == 0 { .. }` loop that polls
+/// real (simulated) hardware state across multiple iterations -- the
+/// polling loop itself is 100% compiler-generated code (see
+/// phase_pir::PirExpr::VolatileRead), not something hand-written in the
+/// runtime. See phase_specification.md §9, Milestone M11.
+#[test]
+fn mmio_poll_polls_exactly_three_times_before_terminating() {
+    let root = workspace_root();
+    let src_path = root.join("examples/mmio_poll.phase");
+    let src = std::fs::read_to_string(&src_path).expect("mmio_poll.phase must exist");
+
+    let program = phase_parser::parse(&src).expect("must parse");
+    phase_analysis::analyze(&program).expect("must pass analysis");
+    let pir = phase_pir::build(&program).expect("M11: volatile_read in a condition must lower");
+    let generated = phase_codegen_c::generate(&pir, "mmio_poll");
+
+    let build_dir = root.join("build").join("mmio_poll_driver_test");
+    std::fs::create_dir_all(&build_dir).unwrap();
+    let header_path = build_dir.join("mmio_poll.gen.h");
+    let source_path = build_dir.join("mmio_poll.gen.c");
+    std::fs::write(&header_path, &generated.header).unwrap();
+    std::fs::write(&source_path, &generated.source).unwrap();
+
+    let generic_runtime_c = root.join("runtime/phase_runtime.c");
+    let extern_runtime_c = root.join("runtime/mmio_poll_extern.c");
+    let runtime_dir = root.join("runtime");
+    let binary_path = build_dir.join("mmio_poll_test_bin");
+
+    let cc_output = Command::new("cc")
+        .args(["-std=c11", "-Wall", "-Werror", "-I"])
+        .arg(&build_dir)
+        .args(["-I"])
+        .arg(&runtime_dir)
+        .args(["-o"])
+        .arg(&binary_path)
+        .arg(&source_path)
+        .arg(&generic_runtime_c)
+        .arg(&extern_runtime_c)
+        .output()
+        .expect("failed to invoke cc -- is a C compiler installed?");
+
+    assert!(
+        cc_output.status.success() && cc_output.stderr.is_empty(),
+        "cc failed (or warned) compiling the generated mmio_poll C:\n{}",
+        String::from_utf8_lossy(&cc_output.stderr)
+    );
+
+    let out = Command::new(&binary_path)
+        .output()
+        .expect("failed to run the compiled binary");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Exactly 3 -- proves the loop polled multiple times (not zero, the
+    // condition was genuinely false on entry) and terminated on its own
+    // (not stuck forever) once the simulated hardware became ready.
+    for call in 1..=3 {
+        assert!(stdout.contains(&format!("call #{call}")), "stdout: {stdout}");
+    }
+    assert!(!stdout.contains("call #4"), "stdout: {stdout}");
+}
+
+/// Compiles the same generated C at `-O2` and inspects the assembly to
+/// confirm `volatile_read` inside a `while` condition (M11) really does
+/// produce two separate reads of the register -- the C standard's
+/// `volatile` semantics forbidding the compiler from hoisting or caching
+/// the read across loop iterations, not just a hopeful convention. Same
+/// proof technique as the M6 volatile_proof demo, applied to the new
+/// condition-position case specifically.
+#[test]
+fn volatile_read_in_while_condition_survives_o2_optimization() {
+    let root = workspace_root();
+    let src_path = root.join("examples/mmio_poll.phase");
+    let src = std::fs::read_to_string(&src_path).expect("mmio_poll.phase must exist");
+
+    let program = phase_parser::parse(&src).expect("must parse");
+    phase_analysis::analyze(&program).expect("must pass analysis");
+    let pir = phase_pir::build(&program).expect("must lower to PIR");
+    let generated = phase_codegen_c::generate(&pir, "mmio_poll");
+
+    let build_dir = root.join("build").join("mmio_poll_o2_driver_test");
+    std::fs::create_dir_all(&build_dir).unwrap();
+    let header_path = build_dir.join("mmio_poll.gen.h");
+    let source_path = build_dir.join("mmio_poll.gen.c");
+    std::fs::write(&header_path, &generated.header).unwrap();
+    std::fs::write(&source_path, &generated.source).unwrap();
+
+    let asm_path = build_dir.join("mmio_poll.s");
+    let cc_output = Command::new("cc")
+        .args(["-std=c11", "-O2", "-Wall", "-I"])
+        .arg(&build_dir)
+        .args(["-I"])
+        .arg(root.join("runtime"))
+        .args(["-S", "-o"])
+        .arg(&asm_path)
+        .arg(&source_path)
+        .output()
+        .expect("failed to invoke cc -- is a C compiler installed?");
+    assert!(
+        cc_output.status.success(),
+        "cc -O2 -S failed:\n{}",
+        String::from_utf8_lossy(&cc_output.stderr)
+    );
+
+    let asm = std::fs::read_to_string(&asm_path).unwrap();
+    let ready_refs = asm.matches("READY").count();
+    // At least two references to READY at -O2 (one in the loop entry
+    // check, one in the loop-back check) is what a genuinely re-read
+    // volatile access looks like in assembly, vs. one load hoisted before
+    // the loop if `volatile` weren't actually preventing that.
+    assert!(
+        ready_refs >= 2,
+        "expected at least 2 references to READY in -O2 assembly (proving it wasn't hoisted \
+         out of the loop), found {ready_refs}:\n{asm}"
+    );
+}

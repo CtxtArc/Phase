@@ -802,6 +802,19 @@ impl<'a> FnChecker<'a> {
         match expr {
             Expr::Call { callee, args } => self.check_call(callee, args, errors),
             Expr::FieldAccess { base, .. } => self.check_expr(base, errors),
+            // M11: a condition like `volatile_read(READY @MMIO) == 0`
+            // parses as `Binary { lhs: Call(..), rhs: IntLit(0) }`, not a
+            // bare `Call` -- without recursing here, the M6 domain/arity
+            // checks in check_call would silently never run on a
+            // volatile_read wrapped in a comparison. Doesn't add any new
+            // checking for the operands themselves beyond what already
+            // happens for Ident/literals (they still fall through to the
+            // no-op case below), so this can't newly flag e.g. a bare
+            // condition identifier that was previously accepted.
+            Expr::Binary { lhs, rhs, .. } => {
+                self.check_expr(lhs, errors);
+                self.check_expr(rhs, errors);
+            }
             // Literals, bare idents, struct literals, domain refs, and
             // nested borrow-exprs (not via `let`) carry no further
             // domain/ownership/typestate obligations in M2/M3.
@@ -1575,5 +1588,37 @@ mod tests {
             }
         "#;
         assert_single_error_containing(src, "cannot assign to 'v': it is a borrow handle");
+    }
+
+    // ---- M11: volatile_read in conditions ----------------------------------
+
+    #[test]
+    fn volatile_read_inside_while_condition_is_accepted() {
+        let src = r#"
+            extern fn arm_if_ready();
+            fn main() {
+                while volatile_read(READY @MMIO) == 0 {
+                    arm_if_ready();
+                }
+            }
+        "#;
+        assert_eq!(check_src(src), Ok(()));
+    }
+
+    #[test]
+    fn volatile_read_inside_while_condition_still_checks_mmio_domain() {
+        // M11 doesn't bypass the existing M6 validation -- volatile_read's
+        // argument shape/domain checks (check_call, via check_expr) still
+        // run on a condition exactly like anywhere else.
+        let src = r#"
+            fn main() {
+                while volatile_read(READY @RAM) == 0 {
+                }
+            }
+        "#;
+        assert_single_error_containing(
+            src,
+            "'volatile_read' requires an @MMIO register reference, but 'READY' is tagged @RAM",
+        );
     }
 }

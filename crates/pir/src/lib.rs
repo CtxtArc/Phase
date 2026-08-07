@@ -24,6 +24,12 @@
 //! running zero or infinite times, since M8 alone gave conditions nothing
 //! that could change between iterations.
 //!
+//! M11 extends `PirExpr` with `VolatileRead` so `volatile_read(REG @MMIO)`
+//! can appear directly inside a condition or assignment RHS -- e.g.
+//! `while volatile_read(STATUS @MMIO) == 0 { .. }`, a real hardware
+//! polling loop expressed in PHASE source rather than requiring
+//! hand-written C. See `phase_specification.md` §9, Milestone M11.
+//!
 //! PIR generation trusts that the program has already passed
 //! `phase_analysis::analyze` — it does not re-derive domain/borrow/
 //! typestate safety, only enough domain bookkeeping (which domain an
@@ -96,6 +102,16 @@ pub enum PirExpr {
         lhs: Box<PirExpr>,
         rhs: Box<PirExpr>,
     },
+    /// `volatile_read(REG @MMIO)` used directly inside a condition or
+    /// assignment right-hand side (M11) -- e.g.
+    /// `while volatile_read(STATUS @MMIO) == 0 { .. }`, a real hardware
+    /// polling loop expressed in PHASE source instead of requiring
+    /// hand-written C. Deliberately restricted to this one builtin:
+    /// general `extern fn` calls inside a condition would be re-invoked
+    /// every loop iteration with much less clear ordering/purity
+    /// guarantees than a register read, which is a separate design
+    /// question this milestone doesn't attempt to answer.
+    VolatileRead { register: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -305,13 +321,21 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
     Ok(out)
 }
 
-/// Scan every function body for `MmioRegister` call args, in first-seen
-/// order with duplicates removed -- codegen needs one `volatile` global
-/// per distinct register name, not one per use site.
+/// Scan every function body -- recursively through `if`/`while` bodies,
+/// and through condition/assignment `PirExpr`s (M11's `VolatileRead`) --
+/// for every distinct MMIO register name, in first-seen order with
+/// duplicates removed. Codegen needs one `volatile` global per distinct
+/// register name, not one per use site.
+///
+/// Recursing into `If`/`While` was a latent gap from M8: nothing
+/// previously exercised a `volatile_read`/`volatile_write` inside a
+/// branch or loop body, so a top-level-only scan happened to be enough
+/// until M11 needed `VolatileRead` in a `while` condition to surface it.
 fn collect_mmio_registers(fns: &[PirFn]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    let note = |args: &[CallArg], seen: &mut std::collections::HashSet<String>, out: &mut Vec<String>| {
+
+    fn note_args(args: &[CallArg], seen: &mut std::collections::HashSet<String>, out: &mut Vec<String>) {
         for a in args {
             if let CallArg::MmioRegister(name) = a {
                 if seen.insert(name.clone()) {
@@ -319,16 +343,50 @@ fn collect_mmio_registers(fns: &[PirFn]) -> Vec<String> {
                 }
             }
         }
-    };
-    for f in fns {
-        for inst in &f.body {
+    }
+
+    fn note_expr(e: &PirExpr, seen: &mut std::collections::HashSet<String>, out: &mut Vec<String>) {
+        match e {
+            PirExpr::VolatileRead { register } => {
+                if seen.insert(register.clone()) {
+                    out.push(register.clone());
+                }
+            }
+            PirExpr::Binary { lhs, rhs, .. } => {
+                note_expr(lhs, seen, out);
+                note_expr(rhs, seen, out);
+            }
+            PirExpr::Ident(_) | PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => {}
+        }
+    }
+
+    fn walk(body: &[PirInst], seen: &mut std::collections::HashSet<String>, out: &mut Vec<String>) {
+        for inst in body {
             match inst {
                 PirInst::CallAssign { args, .. } | PirInst::Call { args, .. } => {
-                    note(args, &mut seen, &mut out)
+                    note_args(args, seen, out)
                 }
+                PirInst::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    note_expr(cond, seen, out);
+                    walk(then_body, seen, out);
+                    walk(else_body, seen, out);
+                }
+                PirInst::While { cond, body } => {
+                    note_expr(cond, seen, out);
+                    walk(body, seen, out);
+                }
+                PirInst::Assign { value, .. } => note_expr(value, seen, out),
                 _ => {}
             }
         }
+    }
+
+    for f in fns {
+        walk(&f.body, &mut seen, &mut out);
     }
     out
 }
@@ -624,9 +682,9 @@ impl<'a> Lowerer<'a> {
 }
 
 /// Lower an `if`/`while` condition or a `name = expr;` (M9) right-hand
-/// side to `PirExpr`. Identifiers, literals, and binary comparisons/
-/// arithmetic only -- see the module doc comment for why anything else is
-/// a clear error rather than a guess.
+/// side to `PirExpr`. Identifiers, literals, binary comparisons/
+/// arithmetic, and (M11) `volatile_read(REG @MMIO)` -- see the module doc
+/// comment for why anything else is a clear error rather than a guess.
 fn lower_pir_expr(e: &Expr, context: &str) -> Result<PirExpr, PirError> {
     match e {
         Expr::Ident(n) => Ok(PirExpr::Ident(n.clone())),
@@ -638,6 +696,19 @@ fn lower_pir_expr(e: &Expr, context: &str) -> Result<PirExpr, PirError> {
             lhs: Box::new(lower_pir_expr(lhs, context)?),
             rhs: Box::new(lower_pir_expr(rhs, context)?),
         }),
+        // M11: the M6 analyzer (`check_call`, invoked via `check_expr` on
+        // every `if`/`while` condition and assignment RHS) already
+        // guarantees a `volatile_read` call here has exactly one
+        // @MMIO-tagged register argument -- same trust relationship PIR
+        // already has with `lower_call_args`'s volatile_read handling.
+        Expr::Call { callee, args } if callee == "volatile_read" => match args.as_slice() {
+            [Expr::DomainRef { name, .. }] => Ok(PirExpr::VolatileRead {
+                register: name.clone(),
+            }),
+            _ => Err(PirError::UnsupportedExpr {
+                context: format!("malformed volatile_read in {context}"),
+            }),
+        },
         other => Err(PirError::UnsupportedExpr {
             context: format!("expression in {context}: {other:?}"),
         }),
@@ -932,6 +1003,110 @@ mod tests {
             }
             other => panic!("expected While, got {other:?}"),
         }
+    }
+
+    // ---- M11: volatile_read in conditions -----------------------------------
+
+    #[test]
+    fn volatile_read_in_while_condition_lowers_to_volatile_read_expr() {
+        let src = r#"
+            extern fn arm_if_ready();
+            fn main() {
+                while volatile_read(READY @MMIO) == 0 {
+                    arm_if_ready();
+                }
+            }
+        "#;
+        let pir = build_src(src).unwrap();
+        assert_eq!(
+            pir.fns[0].body[0],
+            PirInst::While {
+                cond: PirExpr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(PirExpr::VolatileRead {
+                        register: "READY".into(),
+                    }),
+                    rhs: Box::new(PirExpr::IntLit(0)),
+                },
+                body: vec![PirInst::Call {
+                    callee: "arm_if_ready".into(),
+                    args: vec![],
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn volatile_read_in_while_condition_is_collected_as_an_mmio_register() {
+        // The bug this test guards against: `collect_mmio_registers` only
+        // scanning top-level CallAssign/Call args (pre-M11) would miss a
+        // register that's only ever referenced from inside a `while`
+        // condition, and codegen would emit `while (READY == 0)` with no
+        // matching `volatile uint32_t READY;` declaration anywhere.
+        let src = r#"
+            fn main() {
+                while volatile_read(READY @MMIO) == 0 {
+                }
+            }
+        "#;
+        let pir = build_src(src).unwrap();
+        assert_eq!(pir.mmio_registers, vec!["READY".to_string()]);
+    }
+
+    #[test]
+    fn volatile_read_in_if_condition_inside_while_body_is_still_collected() {
+        // Nested: an MMIO register referenced only inside an `if` that's
+        // itself inside a `while` body -- exercises the recursive walk,
+        // not just one level of nesting.
+        let src = r#"
+            extern fn tick();
+            fn main() {
+                let n: i32 = 0;
+                while n < 3 {
+                    if volatile_read(FLAG @MMIO) == 1 {
+                        tick();
+                    }
+                    n = n + 1;
+                }
+            }
+        "#;
+        let pir = build_src(src).unwrap();
+        assert_eq!(pir.mmio_registers, vec!["FLAG".to_string()]);
+    }
+
+    #[test]
+    fn volatile_read_as_assignment_rhs_lowers_correctly() {
+        let src = r#"
+            fn main() {
+                let status: u32 = 0;
+                status = volatile_read(STATUS @MMIO);
+            }
+        "#;
+        let pir = build_src(src).unwrap();
+        assert_eq!(
+            pir.fns[0].body[1],
+            PirInst::Assign {
+                name: "status".into(),
+                value: PirExpr::VolatileRead {
+                    register: "STATUS".into(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn general_extern_fn_call_in_a_condition_is_still_a_clear_error() {
+        // M11 deliberately only allows volatile_read, not arbitrary calls,
+        // inside a condition -- see the PirExpr::VolatileRead doc comment.
+        let src = r#"
+            extern fn is_ready() -> bool;
+            fn main() {
+                while is_ready() {
+                }
+            }
+        "#;
+        let err = build_src(src).unwrap_err();
+        assert!(matches!(err, PirError::UnsupportedExpr { .. }));
     }
 
     #[test]

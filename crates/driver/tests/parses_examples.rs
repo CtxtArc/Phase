@@ -284,6 +284,13 @@ mod analysis_end_to_end {
     }
 
     #[test]
+    fn mmio_poll_example_passes_analysis() {
+        // M11: `volatile_read` used directly inside a `while` condition.
+        let result = analyze_example("mmio_poll.phase");
+        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+    }
+
+    #[test]
     fn every_bug_gallery_file_is_actually_rejected() {
         // A blanket sweep, independent of the specific-message tests above:
         // every single file under bug_gallery/ must fail analysis. If a new

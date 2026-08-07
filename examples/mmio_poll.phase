@@ -1,0 +1,22 @@
+// M11 demo: `volatile_read` can now appear directly inside a `while`
+// condition (`PirExpr::VolatileRead`), so the actual poll-until-ready
+// loop below is real generated code -- not something that had to be
+// hand-written in the runtime, unlike every MMIO example before this
+// milestone. See phase_specification.md §9, Milestone M11.
+//
+// `arm_if_ready` stands in for real hardware eventually setting the
+// READY register (e.g. once a capture finishes) -- the same trusted,
+// opaque `extern fn` boundary every other demo uses to simulate a device
+// (see radio_pipeline_extern.c's device_capture, for instance). Only the
+// *simulated hardware becoming ready* is hand-written; the polling loop
+// that waits for it is not.
+
+extern fn arm_if_ready();
+
+fn main() {
+    while volatile_read(READY @MMIO) == 0 {
+        arm_if_ready();
+    }
+
+    volatile_write(DONE @MMIO, 1);
+}
