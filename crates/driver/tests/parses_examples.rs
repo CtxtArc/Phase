@@ -274,6 +274,16 @@ mod analysis_end_to_end {
     }
 
     #[test]
+    fn hw_uart_echo_example_passes_analysis() {
+        // M10: same analyzer, same PIR/codegen -- just cross-compiled for
+        // a real ARM target instead of the host. See
+        // crates/driver/tests/build_and_run.rs for the actual
+        // cross-compile-and-run-under-QEMU end-to-end test.
+        let result = analyze_example("hw_uart_echo.phase");
+        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+    }
+
+    #[test]
     fn every_bug_gallery_file_is_actually_rejected() {
         // A blanket sweep, independent of the specific-message tests above:
         // every single file under bug_gallery/ must fail analysis. If a new

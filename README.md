@@ -3,8 +3,8 @@
 **A compiler that statically proves memory safety for hardware pipelines — DMA, MMIO, and zero-copy devices — before the code ever runs.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Status-M9_Complete-success" alt="Status">
-  <img src="https://img.shields.io/badge/Tests-158_passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/Status-M10_Complete-success" alt="Status">
+  <img src="https://img.shields.io/badge/Tests-160_passing-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
 </p>
@@ -123,6 +123,8 @@ crates/
 runtime/
   phase_runtime.h/.c   generic sim_dma_wait/sim_device_wait, always linked
   *_extern.c           one per demo program, implementing that program's extern fns
+  hw/                  M10: real ARM Cortex-M3 backend (startup, linker script,
+                       real MMIO register map, real sim_dma_wait/sim_device_wait)
 
 examples/
   sdr_session.phase    full demo: MMIO setup + DMA capture + typestate + real DSP math
@@ -137,21 +139,28 @@ docs/
 
 scripts/
   capture_bug_gallery.sh      regenerates the transcript from real compiler output
+  build_hw_demo.sh            M10: cross-compile + run the real-hardware demo under QEMU
 ```
 
 ## Building and testing
 
-**Requirements:** `cargo` (Rust) and a C compiler (`cc`).
+**Requirements:** `cargo` (Rust) and a C compiler (`cc`). The M10 hardware
+demo additionally needs `arm-none-eabi-gcc` and `qemu-system-arm`
+(`sudo apt-get install --no-install-recommends gcc-arm-none-eabi
+qemu-system-arm`) — everything else works without them, and the one test
+that needs them (`hw_uart_echo_runs_on_a_real_arm_cortex_m3_target_under_qemu`)
+skips itself with a clear message if they're missing rather than failing.
 
 ```bash
 cargo build --workspace
 cargo test --workspace
 ```
 
-135 tests, plain `cargo test`, no custom runner — including end-to-end
+160 tests, plain `cargo test`, no custom runner — including end-to-end
 tests that invoke a real C compiler, run the resulting binaries, and
-inspect real `-O2` assembly output, plus a blanket sweep asserting every
-bug-gallery file is actually rejected.
+inspect real `-O2` assembly output; a real cross-compile to ARM Cortex-M3
+run under QEMU; plus a blanket sweep asserting every bug-gallery file is
+actually rejected.
 
 **`phase build` and any test invoking `cc` must be run from this
 directory** — it resolves `runtime/*.c` and writes to `build/`, both
@@ -188,6 +197,12 @@ forces the `@DEVICE` path; unset or non-zero takes `@DMA`).
 `examples/counting_loop.phase` is the M9 demo: a `while` loop with a real
 `n = n + 1;` counter that runs exactly 5 iterations and stops on its own.
 
+`examples/hw_uart_echo.phase` is the M10 demo: the exact same compiler
+and PHASE source shape, cross-compiled for a real ARM Cortex-M3 target
+and run on QEMU's model of the real MPS2 AN385 board
+(`./scripts/build_hw_demo.sh`) — its `sync()` is a real register poll on
+real (emulated) hardware, not the host's simulated address space.
+
 ## Honest scope
 
 This is a v0.1 research/portfolio compiler, not a production toolchain.
@@ -212,9 +227,12 @@ gaps someone has to discover the hard way:
   — see spec §3.9), never a body. `phase build` fails early with a clear
   message naming the missing file if one isn't found; it doesn't attempt
   a doomed link.
-- **No real hardware target.** Everything runs in one simulated address
-  space on the host; porting to real hardware means replacing two runtime
-  functions (`sim_dma_wait`/`sim_device_wait`), not touching the compiler.
+- **No real hardware target *by default*.** `phase build` still links
+  the simulated runtime; `examples/hw_uart_echo.phase` (M10) proves the
+  swap to a real ARM Cortex-M3 target works (`./scripts/build_hw_demo.sh`,
+  validated on QEMU's model of the real MPS2 AN385 board), but it's a
+  separate, manual cross-compile step, not something `phase build`
+  switches to automatically.
 - **No LLVM backend.** Compiling to readable C was a deliberate choice so
   the engineering effort goes into the analysis passes, not backend
   plumbing.
@@ -227,13 +245,11 @@ Full rationale for all of these is in
 
 ## What's next
 
-The roadmap's core milestones (M1–M9) are complete — `phase build` now
-compiles real branching, looping, and self-terminating control flow to C.
-Formal next milestones, in
-[`phase_specification.md`](phase_specification.md) §9:
+The roadmap's core milestones (M1–M10) are complete — `phase build`
+compiles real branching, looping, and self-terminating control flow to C,
+and the runtime layer has a proven path to a real ARM target. Formal next
+milestone, in [`phase_specification.md`](phase_specification.md) §9:
 
-- **M10 — Real hardware target,** replacing the two simulated wait
-  functions with an actual wait-for-completion on real silicon.
 - **M11 — An LLVM backend** (§10's documented non-goal for v0.1).
 
 For the complete language specification, domain model, type system, and

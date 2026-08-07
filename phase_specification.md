@@ -544,12 +544,31 @@ forever. Condition/RHS expressions are still the same `PirExpr` subset
 from M8 (identifiers, literals, binary comparisons/arithmetic) -- no
 calls yet, so a condition can't directly poll `volatile_read(...)`.
 
-**M10 — Real hardware target** *(not yet started)*
-Replace the two simulated wait functions (`sim_dma_wait`/`sim_device_wait`
-in `runtime/phase_runtime.c`) with an actual wait-for-completion against
-real silicon (e.g. polling a DMA controller register or an interrupt
-flag). By design this only touches the runtime, not the compiler or the
-PHASE source -- see spec §5.3.
+**M10 — Real hardware target**
+Replaces `runtime/phase_runtime.c`'s two simulated wait functions
+(`sim_dma_wait`/`sim_device_wait`) with `runtime/hw/phase_runtime_hw.c`,
+a real busy-poll of a real, documented hardware register -- on a real
+ARM Cortex-M3 target (the MPS2 AN385 board), not the host's simulated
+address space. By design this only touches the runtime layer: the
+compiler, `phase_codegen_c`'s output, and the PHASE source
+(`examples/hw_uart_echo.phase`) are all byte-for-byte the same as every
+other example. Output: `./scripts/build_hw_demo.sh` cross-compiles with
+`arm-none-eabi-gcc` (`-mcpu=cortex-m3 -mthumb -ffreestanding -nostdlib`)
+against a real linker script/vector table (`runtime/hw/`) and runs the
+resulting ARM binary under `qemu-system-arm -M mps2-an385` -- QEMU's
+cycle-accurate model of that real board, the standard way embedded
+engineers validate firmware without physical silicon on the bench.
+Verified three ways: (1) a driver end-to-end test cross-compiles and
+actually runs the binary under QEMU, asserting on its real UART0 output;
+(2) `arm-none-eabi-objdump` disassembly confirms `sim_device_wait` really
+compiles to `mov r2, #0x40004000` / `ldr`/`tst`/`bne` -- an actual
+register poll, not a stand-in; (3) the CMSDK UART register map
+(`runtime/hw/mps2an385.h`) is cross-checked against QEMU's own board
+model source, not guessed. Honest limit: the MPS2 AN385 QEMU model has
+no real DMA controller, so both wait functions poll the one real
+peripheral this board exposes (the UART) -- a target with an actual DMA
+controller would poll that controller's own completion register the
+same way, same pattern, different register.
 
 **M11 — LLVM backend** *(not yet started, documented non-goal for v0.1)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead

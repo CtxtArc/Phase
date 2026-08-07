@@ -1,0 +1,22 @@
+// M10 demo: the exact same compiler, exact same PHASE source shape as
+// every other example -- move/sync, domain safety, all of it -- but this
+// one is cross-compiled for a real ARM Cortex-M3 target (the MPS2 AN385
+// board) and its `sync(msg)` really does wait on real hardware, not a
+// simulated delay. See runtime/hw/phase_runtime_hw.c and
+// phase_specification.md §9, Milestone M10.
+//
+// `hw_fill` stands in for a real capture device filling the buffer (the
+// same role device_capture() plays in radio_pipeline.phase); `uart_send`
+// writes each byte to a real, documented hardware register.
+
+extern fn hw_fill(dst: buffer<u8, 5> @RAM);
+extern fn uart_send(src: buffer<u8, 5> @DEVICE);
+
+fn main() {
+    buffer<u8, 5> msg @RAM;
+    hw_fill(msg);
+
+    move msg -> @DEVICE;
+    uart_send(msg);
+    sync(msg);
+}

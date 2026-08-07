@@ -257,3 +257,99 @@ fn counting_loop_builds_and_runs_exactly_five_iterations() {
     }
     assert!(!stdout.contains("n=5"), "stdout: {stdout}");
 }
+
+/// M10 end-to-end test: `examples/hw_uart_echo.phase` cross-compiles for
+/// a real ARM Cortex-M3 target (the MPS2 AN385 board) and its `sync(msg)`
+/// runs as a real register poll on QEMU's model of that real hardware --
+/// not the host's simulated address space. See runtime/hw/ and
+/// phase_specification.md §9, Milestone M10.
+///
+/// This needs `arm-none-eabi-gcc` and `qemu-system-arm`, which aren't
+/// reasonable to require for every contributor's plain `cargo test` --
+/// unlike every other test here, a missing tool here means "skip with a
+/// clear message," not "fail." `./scripts/build_hw_demo.sh` runs the same
+/// thing standalone with installation instructions if it's missing.
+#[test]
+fn hw_uart_echo_runs_on_a_real_arm_cortex_m3_target_under_qemu() {
+    if Command::new("arm-none-eabi-gcc").arg("--version").output().is_err()
+        || Command::new("qemu-system-arm").arg("--version").output().is_err()
+    {
+        eprintln!(
+            "skipping hw_uart_echo_runs_on_a_real_arm_cortex_m3_target_under_qemu: \
+             arm-none-eabi-gcc and/or qemu-system-arm not installed \
+             (see scripts/build_hw_demo.sh for what this test needs)"
+        );
+        return;
+    }
+
+    let root = workspace_root();
+    let src_path = root.join("examples/hw_uart_echo.phase");
+    let src = std::fs::read_to_string(&src_path).expect("hw_uart_echo.phase must exist");
+
+    let program = phase_parser::parse(&src).expect("must parse");
+    phase_analysis::analyze(&program).expect("must pass analysis");
+    let pir = phase_pir::build(&program).expect("must lower to PIR");
+    // Same compiler, same codegen crate, same PIR -- M10 doesn't touch any
+    // of this. Only the runtime backend and target flags differ below.
+    let generated = phase_codegen_c::generate(&pir, "hw_uart_echo");
+
+    let build_dir = root.join("build").join("hw_uart_echo_driver_test");
+    std::fs::create_dir_all(&build_dir).unwrap();
+    let header_path = build_dir.join("hw_uart_echo.gen.h");
+    let source_path = build_dir.join("hw_uart_echo.gen.c");
+    std::fs::write(&header_path, &generated.header).unwrap();
+    std::fs::write(&source_path, &generated.source).unwrap();
+
+    let elf_path = build_dir.join("hw_uart_echo.elf");
+    let cc_output = Command::new("arm-none-eabi-gcc")
+        .args([
+            "-mcpu=cortex-m3",
+            "-mthumb",
+            "-ffreestanding",
+            "-nostdlib",
+            "-nostartfiles",
+            "-O1",
+            "-std=c11",
+            "-Wall",
+            "-Werror",
+            "-T",
+        ])
+        .arg(root.join("runtime/hw/mps2an385.ld"))
+        .args(["-I"])
+        .arg(&build_dir)
+        .args(["-I"])
+        .arg(root.join("runtime"))
+        .args(["-I"])
+        .arg(root.join("runtime/hw"))
+        .args(["-o"])
+        .arg(&elf_path)
+        .arg(root.join("runtime/hw/startup.c"))
+        .arg(root.join("runtime/hw/phase_runtime_hw.c"))
+        .arg(&source_path)
+        .arg(root.join("runtime/hw_uart_echo_extern.c"))
+        .output()
+        .expect("failed to invoke arm-none-eabi-gcc");
+
+    assert!(
+        cc_output.status.success() && cc_output.stderr.is_empty(),
+        "arm-none-eabi-gcc failed (or warned) cross-compiling for Cortex-M3:\n{}",
+        String::from_utf8_lossy(&cc_output.stderr)
+    );
+
+    let qemu_output = Command::new("timeout")
+        .args(["3", "qemu-system-arm", "-M", "mps2-an385", "-nographic", "-kernel"])
+        .arg(&elf_path)
+        .output()
+        .expect("failed to invoke qemu-system-arm");
+
+    // QEMU is killed by `timeout` (this demo never exits on its own --
+    // see startup.c's infinite loop after main() returns), so exit status
+    // is expected to reflect that; only stdout matters.
+    let stdout = String::from_utf8_lossy(&qemu_output.stdout);
+    assert!(
+        stdout.contains("PHASE"),
+        "expected real UART0 output containing \"PHASE\" from the QEMU-emulated \
+         MPS2 AN385 board, got: {stdout:?}\nstderr: {}",
+        String::from_utf8_lossy(&qemu_output.stderr)
+    );
+}
