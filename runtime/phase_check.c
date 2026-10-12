@@ -1,19 +1,29 @@
 /* Runtime ownership checking for `phase build --checked`. See
  * phase_check.h for what this is and why it is independent of the static
  * analyzer.
+ *
+ * Buffers are identified by their storage address, converted to an
+ * integer key (`Key`) as soon as it enters the checker: the checker never
+ * touches buffer memory, and keeping raw pointers out of its internals
+ * also keeps compilers from assuming it might read that memory.
  */
 
 #include "phase_check.h"
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #define MAX_STORAGES 1024
 #define MAX_HANDLES 4096
 
+typedef uintptr_t Key;
+
+#define KEY(p) ((Key)(p))
+
 typedef struct {
-    const void *p;
+    Key key;
     const char *name;
     int domain;
     int destroyed;
@@ -21,7 +31,7 @@ typedef struct {
 } Storage;
 
 typedef struct {
-    const void *p;
+    Key key;
     const char *name;
     int write;
     int released;
@@ -41,22 +51,6 @@ static int depth = 0;
 
 void phase_chk_enter(void) { depth++; }
 void phase_chk_leave(void) { depth--; }
-
-/* Live borrows of storage `p`: in the current frame only, or in any. */
-static void borrows_of(const void *p, int any_frame, int *readers, int *writer) {
-    *readers = 0;
-    *writer = 0;
-    for (int i = 0; i < MAX_HANDLES; i++) {
-        const Handle *h = &handles[i];
-        if (h->in_use && !h->released && h->p == p && (any_frame || h->depth == depth)) {
-            if (h->write) {
-                (*writer)++;
-            } else {
-                (*readers)++;
-            }
-        }
-    }
-}
 
 static const char *dom_name(int d) {
     switch (d) {
@@ -82,9 +76,25 @@ static void fail(const char *fmt, ...) {
 
 static int device_owned(int d) { return d == PHASE_DOM_DMA || d == PHASE_DOM_DEVICE; }
 
-static Storage *find(const void *p, const char *name) {
+/* Live borrows of storage `key`: in the current frame only, or in any. */
+static void borrows_of(Key key, int any_frame, int *readers, int *writer) {
+    *readers = 0;
+    *writer = 0;
+    for (int i = 0; i < MAX_HANDLES; i++) {
+        const Handle *h = &handles[i];
+        if (h->in_use && !h->released && h->key == key && (any_frame || h->depth == depth)) {
+            if (h->write) {
+                (*writer)++;
+            } else {
+                (*readers)++;
+            }
+        }
+    }
+}
+
+static Storage *find(Key key, const char *name) {
     for (int i = 0; i < MAX_STORAGES; i++) {
-        if (storages[i].in_use && storages[i].p == p) {
+        if (storages[i].in_use && storages[i].key == key) {
             return &storages[i];
         }
     }
@@ -92,8 +102,8 @@ static Storage *find(const void *p, const char *name) {
     return NULL;
 }
 
-static Storage *live(const void *p, const char *name, const char *what) {
-    Storage *s = find(p, name);
+static Storage *live(Key key, const char *name, const char *what) {
+    Storage *s = find(key, name);
     if (s->destroyed) {
         fail("'%s' was destroyed; cannot %s", name, what);
     }
@@ -102,21 +112,22 @@ static Storage *live(const void *p, const char *name, const char *what) {
 
 static void no_borrows(const Storage *s, const char *name, const char *what) {
     int readers, writer;
-    borrows_of(s->p, 0, &readers, &writer);
+    borrows_of(s->key, 0, &readers, &writer);
     if (readers || writer) {
         fail("'%s' has a live borrow; cannot %s", name, what);
     }
 }
 
 void phase_chk_create(const void *storage, int domain, const char *name) {
+    Key key = KEY(storage);
     for (int i = 0; i < MAX_STORAGES; i++) {
-        if (storages[i].in_use && storages[i].p == storage) {
+        if (storages[i].in_use && storages[i].key == key) {
             fail("buffer '%s' created over live storage of '%s'", name, storages[i].name);
         }
     }
     for (int i = 0; i < MAX_STORAGES; i++) {
         if (!storages[i].in_use) {
-            storages[i] = (Storage){storage, name, domain, 0, 1};
+            storages[i] = (Storage){key, name, domain, 0, 1};
             return;
         }
     }
@@ -124,12 +135,13 @@ void phase_chk_create(const void *storage, int domain, const char *name) {
 }
 
 void phase_chk_scope_end(const void *storage, const char *name) {
-    Storage *s = find(storage, name);
+    Key key = KEY(storage);
+    Storage *s = find(key, name);
     if (!s->destroyed && device_owned(s->domain)) {
         fail("'%s' goes out of scope while owned by %s", name, dom_name(s->domain));
     }
     int readers, writer;
-    borrows_of(storage, 1, &readers, &writer);
+    borrows_of(key, 1, &readers, &writer);
     if (readers || writer) {
         fail("'%s' goes out of scope with a live borrow", name);
     }
@@ -137,7 +149,7 @@ void phase_chk_scope_end(const void *storage, const char *name) {
 }
 
 void phase_chk_move(const void *p, int to, const char *name) {
-    Storage *s = live(p, name, "move it");
+    Storage *s = live(KEY(p), name, "move it");
     no_borrows(s, name, "move it");
     int from = s->domain;
     int legal = (from == PHASE_DOM_STACK && to == PHASE_DOM_RAM) ||
@@ -149,7 +161,7 @@ void phase_chk_move(const void *p, int to, const char *name) {
 }
 
 void phase_chk_sync(const void *p, const char *name) {
-    Storage *s = live(p, name, "sync it");
+    Storage *s = live(KEY(p), name, "sync it");
     no_borrows(s, name, "sync it");
     if (!device_owned(s->domain)) {
         fail("'%s': sync from %s, which no hardware owns", name, dom_name(s->domain));
@@ -158,7 +170,7 @@ void phase_chk_sync(const void *p, const char *name) {
 }
 
 void phase_chk_destroy(const void *p, const char *name) {
-    Storage *s = live(p, name, "destroy it");
+    Storage *s = live(KEY(p), name, "destroy it");
     no_borrows(s, name, "destroy it");
     if (device_owned(s->domain)) {
         fail("'%s' destroyed while owned by %s", name, dom_name(s->domain));
@@ -167,25 +179,26 @@ void phase_chk_destroy(const void *p, const char *name) {
 }
 
 void phase_chk_swap(const void *a, const void *b, const char *a_name, const char *b_name) {
-    Storage *sa = live(a, a_name, "swap it");
-    Storage *sb = live(b, b_name, "swap it");
+    Storage *sa = live(KEY(a), a_name, "swap it");
+    Storage *sb = live(KEY(b), b_name, "swap it");
     no_borrows(sa, a_name, "swap it");
     no_borrows(sb, b_name, "swap it");
 }
 
 int phase_chk_borrow(const void *p, int write, const char *name) {
-    Storage *s = live(p, name, "borrow it");
+    Key key = KEY(p);
+    Storage *s = live(key, name, "borrow it");
     if (device_owned(s->domain)) {
         fail("borrow '%s' of a buffer owned by %s", name, dom_name(s->domain));
     }
     int readers, writer;
-    borrows_of(p, 0, &readers, &writer);
+    borrows_of(key, 0, &readers, &writer);
     if (writer || (write && readers)) {
         fail("borrow '%s' conflicts with a live borrow of the same buffer", name);
     }
     for (int i = 0; i < MAX_HANDLES; i++) {
         if (!handles[i].in_use) {
-            handles[i] = (Handle){p, name, write, 0, 1, depth};
+            handles[i] = (Handle){key, name, write, 0, 1, depth};
             return i;
         }
     }
@@ -224,13 +237,14 @@ void phase_chk_handle_end(int h, const char *name) {
 
 void phase_chk_arg(const void *p, int via, int param_domain, int access,
                    const char *callee, const char *name) {
-    Storage *s = live(p, name, "pass it to a function");
+    Key key = KEY(p);
+    Storage *s = live(key, name, "pass it to a function");
     if (param_domain >= 0 && s->domain != param_domain) {
         fail("'%s' is in %s but '%s' expects %s", name, dom_name(s->domain), callee,
              dom_name(param_domain));
     }
     int readers, writer;
-    borrows_of(p, 0, &readers, &writer);
+    borrows_of(key, 0, &readers, &writer);
     switch (via) {
     case PHASE_VIA_OWNER:
         if (writer || (access != PHASE_ACC_READ && readers)) {
@@ -250,7 +264,7 @@ void phase_chk_arg(const void *p, int via, int param_domain, int access,
 void phase_chk_alias(const char *callee, int n, const void *const *ptrs, const int *read_only) {
     for (int i = 0; i < n; i++) {
         for (int j = i + 1; j < n; j++) {
-            if (ptrs[i] == ptrs[j] && !(read_only[i] && read_only[j])) {
+            if (KEY(ptrs[i]) == KEY(ptrs[j]) && !(read_only[i] && read_only[j])) {
                 fail("the same buffer is passed to '%s' twice, and not read-only both times",
                      callee);
             }
@@ -259,7 +273,7 @@ void phase_chk_alias(const char *callee, int n, const void *const *ptrs, const i
 }
 
 void phase_chk_transfer(const void *p, int to, const char *callee, const char *name) {
-    Storage *s = live(p, name, "hand it to hardware");
+    Storage *s = live(KEY(p), name, "hand it to hardware");
     no_borrows(s, name, "hand it to hardware");
     int from = s->domain;
     int legal = (from == PHASE_DOM_STACK && to == PHASE_DOM_RAM) ||
@@ -273,7 +287,7 @@ void phase_chk_transfer(const void *p, int to, const char *callee, const char *n
 }
 
 void phase_chk_param_exit(const void *p, int domain, const char *fn, const char *name) {
-    Storage *s = find(p, name);
+    Storage *s = find(KEY(p), name);
     if (!s->destroyed && s->domain != domain) {
         fail("parameter '%s' leaves '%s' in %s, but its signature says %s", name, fn,
              dom_name(s->domain), dom_name(domain));

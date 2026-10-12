@@ -23,6 +23,15 @@
 
 #define PHASE_CHECK_EXIT_CODE 70
 
+/* The checker only compares buffer *addresses*; it never reads or writes
+ * the memory. Saying so stops GCC from warning that a not-yet-written
+ * buffer is "used uninitialized" when its address is passed here. */
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 10
+#define PHASE_ADDR_ONLY(...) __attribute__((access(none, __VA_ARGS__)))
+#else
+#define PHASE_ADDR_ONLY(...)
+#endif
+
 enum { PHASE_DOM_RAM, PHASE_DOM_STACK, PHASE_DOM_DMA, PHASE_DOM_MMIO, PHASE_DOM_DEVICE };
 enum { PHASE_ACC_NONE, PHASE_ACC_READ, PHASE_ACC_WRITE };
 enum { PHASE_VIA_OWNER, PHASE_VIA_READ_BORROW, PHASE_VIA_WRITE_BORROW };
@@ -32,26 +41,28 @@ void phase_chk_enter(void);
 void phase_chk_leave(void);
 
 /* storage lifetime */
-void phase_chk_create(const void *storage, int domain, const char *name);
-void phase_chk_scope_end(const void *storage, const char *name);
+PHASE_ADDR_ONLY(1) void phase_chk_create(const void *storage, int domain, const char *name);
+PHASE_ADDR_ONLY(1) void phase_chk_scope_end(const void *storage, const char *name);
 
 /* domain transitions */
-void phase_chk_move(const void *p, int to, const char *name);
-void phase_chk_sync(const void *p, const char *name);
-void phase_chk_destroy(const void *p, const char *name);
+PHASE_ADDR_ONLY(1) void phase_chk_move(const void *p, int to, const char *name);
+PHASE_ADDR_ONLY(1) void phase_chk_sync(const void *p, const char *name);
+PHASE_ADDR_ONLY(1) void phase_chk_destroy(const void *p, const char *name);
+PHASE_ADDR_ONLY(1) PHASE_ADDR_ONLY(2)
 void phase_chk_swap(const void *a, const void *b, const char *a_name, const char *b_name);
 
 /* borrows: phase_chk_borrow returns a handle id */
-int phase_chk_borrow(const void *p, int write, const char *name);
+PHASE_ADDR_ONLY(1) int phase_chk_borrow(const void *p, int write, const char *name);
 void phase_chk_release(int handle, const char *name);
 void phase_chk_handle_use(int handle, const char *name);
 void phase_chk_handle_end(int handle, const char *name);
 
 /* calls */
+PHASE_ADDR_ONLY(1)
 void phase_chk_arg(const void *p, int via, int param_domain, int access,
                    const char *callee, const char *name);
 void phase_chk_alias(const char *callee, int n, const void *const *ptrs, const int *read_only);
-void phase_chk_transfer(const void *p, int to, const char *callee, const char *name);
-void phase_chk_param_exit(const void *p, int domain, const char *fn, const char *name);
+PHASE_ADDR_ONLY(1) void phase_chk_transfer(const void *p, int to, const char *callee, const char *name);
+PHASE_ADDR_ONLY(1) void phase_chk_param_exit(const void *p, int domain, const char *fn, const char *name);
 
 #endif /* PHASE_CHECK_H */
