@@ -323,6 +323,66 @@ function, and entities cannot be copied with `let`.
 
 ---
 
+## v1.1 additions
+
+v1.1 lets a function signature declare a domain change on a parameter
+(`@RAM -> @DMA`, `@DMA -> @RAM`; spec §3.11), so a transfer can be started
+by one call and finished by another. That opens the same bug classes as
+before across function boundaries; each entry below is how PHASE closes
+them.
+
+## #17 — A "wait" helper that doesn't wait
+
+**`examples/bug_gallery/broken_sync_promise.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html),
+[CWE-367](https://cwe.mitre.org/data/definitions/367.html).
+
+**Real-world precedent:** the cross-function form of #1. Driver code
+commonly wraps DMA completion in a helper; if the helper returns before
+the transfer is synchronized, every caller that trusts it reads memory
+the engine still owns — and none of them looks wrong in review.
+
+**What PHASE does:** a PHASE function declared `@DMA -> @RAM` is checked to
+leave the parameter in `@RAM` on every path, explicit `return`s included.
+
+---
+
+## #18 — A signature promising an impossible hand-off
+
+**`examples/bug_gallery/illegal_signature_transition.phase`**
+
+**Category:** [CWE-696](https://cwe.mitre.org/data/definitions/696.html) —
+Incorrect Behavior Order.
+
+**Real-world precedent:** skipping a required step in a hardware
+ownership protocol — here, handing a DMA-owned buffer straight to another
+device without the CPU-side synchronization in between.
+
+**What PHASE does:** a declared change must be a legal transition in the
+domain table (spec §2.4), the same rule `move` and `sync` obey, so even a
+trusted `extern fn` can't claim one the model forbids.
+
+---
+
+## #19 — Reading between "start transfer" and "wait"
+
+**`examples/bug_gallery/read_while_capture_in_flight.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html),
+[CWE-367](https://cwe.mitre.org/data/definitions/367.html).
+
+**Real-world precedent:** exactly #1 (Linux DMA-buffer sync discipline,
+CVE-2025-38095), in the split-call form real drivers use: one function
+programs the engine and returns, another waits for completion.
+
+**What PHASE does:** after a call to a parameter declared `@RAM -> @DMA`,
+the argument is `@DMA` in the caller, so any CPU use before the matching
+wait is rejected — and the diagnostic points at the call that handed it
+over.
+
+---
+
 ## Summary table
 
 | # | Bug-gallery file | CWE | Named real-world precedent |
@@ -343,3 +403,6 @@ function, and entities cannot be copied with `let`.
 | 14 | `aliased_arguments.phase` | CWE-758 | in-place call of a non-aliasing (`restrict`) kernel |
 | 15 | `borrow_unsynced_dma.phase` | CWE-362, CWE-367 | same as #1 |
 | 16 | `shadowed_dma_buffer.phase` | CWE-416 | lost tracking of an in-flight buffer |
+| 17 | `broken_sync_promise.phase` | CWE-362, CWE-367 | cross-function form of #1 |
+| 18 | `illegal_signature_transition.phase` | CWE-696 | skipped step in a hardware hand-off |
+| 19 | `read_while_capture_in_flight.phase` | CWE-362, CWE-367 | same as #1, split across calls |

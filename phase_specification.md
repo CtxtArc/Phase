@@ -2,7 +2,7 @@
 
 **A physical-domain safety language for signal, RF, and embedded pipelines**
 
-Version 1.0
+Version 1.1
 
 ---
 
@@ -143,7 +143,7 @@ Destroyed      -- lifetime ended; any further access is an error
 
 Everything not in this table is a compile error: **"no legal transition from
 X to Y."** This table is intentionally a flat, hardcoded structure in v1
-(see §6.5) — not a plugin system yet. Making it pluggable is future work.
+(see §6.6) — not a plugin system yet. Making it pluggable is future work.
 
 ### 2.5 Costs and observability
 
@@ -255,6 +255,10 @@ that PHASE does not analyze internally — it only checks that the domains of
 the arguments match the declared signature at the call site. This is how DSP
 math re-enters the pipeline without PHASE needing to understand it.
 
+A parameter's domain is what the argument must be in when the function is
+called; unless the parameter declares a change (§3.11), the function hands
+it back in that same domain.
+
 ### 3.10 Example — a minimal end-to-end pipeline
 
 ```phase
@@ -274,6 +278,45 @@ fn main() {
     sync(filtered);
 }
 ```
+
+### 3.11 Domain changes in signatures
+
+```phase
+extern fn start_capture(dst: buffer<Sample, 256> @RAM -> @DMA);
+
+fn wait_capture(b: buffer<Sample, 256> @DMA -> @RAM) {
+    sync(b);
+}
+
+fn main() {
+    buffer<Sample, 256> frame @RAM;
+    start_capture(frame);   // frame is now @DMA
+    make_window(window);    // CPU work while the transfer runs
+    wait_capture(frame);    // frame is @RAM again
+}
+```
+
+A parameter written `name: T @FROM -> @TO` declares that the function
+changes the argument's domain:
+
+- **Signature.** `FROM -> TO` must be a legal transition (§2.4): a `move`
+  (`@STACK -> @RAM`, `@RAM -> @DMA`, `@RAM -> @DEVICE`) or a `sync`
+  (`@DMA -> @RAM`, `@DEVICE -> @RAM`). A change that changes nothing
+  (`@RAM -> @RAM`) is rejected.
+- **Call site.** The argument must be in `FROM` and must be an owner, not
+  a borrow (a borrow cannot hand the storage it views to hardware). After
+  the call the argument is in `TO`, exactly as if the caller had written the
+  `move`/`sync` itself.
+- **Body** (for a PHASE `fn`). The parameter starts in `FROM` and must be
+  in `TO` at every `return`, explicit or falling off the end.
+- **`extern fn`.** The change is part of the trusted contract (§4.4): an
+  extern declared `@RAM -> @DMA` is trusted to have started a transfer, one
+  declared `@DMA -> @RAM` to have waited for it.
+
+This is what lets a pipeline split "start the transfer" and "wait for it"
+into separate functions with CPU work in between — the overlap DMA exists
+for — while the checker still tracks the buffer through both calls. See
+`examples/overlapped_capture.phase`.
 
 ---
 
@@ -329,8 +372,9 @@ For every program `phase check` accepts, within a function body:
   has two independently tracked names.
 - **Lifetimes.** No access after `destroy`. At every `return` (explicit or
   falling off the end): no local is still `@DMA`/`@DEVICE`-owned, no borrow
-  is live, and every parameter is in the domain it arrived in. Parameters
-  cannot be destroyed (the caller owns them).
+  is live, and every parameter is in the domain its signature promises —
+  the one it arrived in, or the `@TO` of a declared change (§3.11).
+  Parameters cannot be destroyed (the caller owns them).
 - **Typestate.** A value's state is established only by a function's
   declared return state, or — for a newly constructed value — the
   machine's initial state; a type annotation is checked against that and
@@ -440,12 +484,17 @@ analyzer already builds.
 ### 6.4 CLI
 
 ```
-phase check <file>        -- run all analysis passes, report errors, no codegen
-phase build <file>        -- full pipeline, emits a native binary
-phase --dump-tokens <file>
-phase --dump-ast <file>
-phase --dump-pir <file>
+phase [options] check <file>   -- run all analysis passes, report errors, no codegen
+phase [options] build <file>   -- full pipeline, emits a native binary
+phase [options] --dump-tokens <file>
+phase [options] --dump-ast <file>
+phase [options] --dump-pir <file>
 phase --version | --help
+
+options:
+  --error-format=human|short   (default: human, see §6.5)
+  --color=auto|always|never    (default: auto -- respects NO_COLOR, and
+                                only colors a terminal)
 ```
 
 `build` locates the runtime by walking up from the source file to the
@@ -453,7 +502,41 @@ nearest `runtime/` directory (override: `PHASE_RUNTIME_DIR`) and writes
 into a `build/` directory beside it. Exit status is 0 on success and 1 on
 any error.
 
-### 6.5 Transition table representation
+### 6.5 Diagnostics
+
+Every token carries a source span (start and end, line and column). The
+parser attaches spans to every statement, function name, and parameter,
+and the analyzer reports each violation with:
+
+- a **primary location** — the statement that breaks the rule (an error
+  inside a branch keeps the inner statement; a disagreement at a join
+  points at the `if`/`while`; falling off the end of a function points at
+  its closing `}`), narrowed to the entity's name where it appears there;
+- **notes** at the locations that explain it — where the entity was
+  declared, moved, synced, borrowed, released, destroyed, or consumed;
+  where each branch left it; where a typestate value got its state; which
+  call changed its domain.
+
+`human` format renders each as a source snippet:
+
+```
+error: entity 'frame' is in domain @DMA but 'report' expects @RAM for this argument
+  --> examples/bug_gallery/read_while_capture_in_flight.phase:19:12
+   |
+19 |     report(frame);
+   |            ^^^^^
+note: 'frame' is moved to @DMA by 'start_capture' here
+  --> examples/bug_gallery/read_while_capture_in_flight.phase:16:5
+   |
+16 |     start_capture(frame);
+   |     ---------------------
+```
+
+`short` format prints one `file:line:col: error|note: message` line per
+error and note, for editors and scripts. Parse errors use the same
+renderer.
+
+### 6.6 Transition table representation
 
 v1 keeps the domain-transition table (§2.4) as a hardcoded Rust `match` /
 static table inside `analysis`, not a plugin/config file. This is a
@@ -504,9 +587,9 @@ ENTITY_PHI      id, [ (block, domain, state) ... ]   -- merge point
 
 ### 7.5 Debug output
 
-`--dump-pir` prints each entity's full instruction history — the direct
-analogue of KAIROS's entity history tracking, and the main artifact used in
-the bug-gallery demos (§8) to show *why* something was rejected.
+`--dump-pir` prints the lowered PIR for a program that passed analysis.
+*Why* a program was rejected is shown by the diagnostics themselves
+(§6.5), whose notes trace the entity's history up to the violation.
 
 ---
 
@@ -535,6 +618,9 @@ for the analyzer and as the security narrative for the portfolio write-up.
 | 14 | Same buffer passed twice to one call | In-place call of a non-aliasing kernel | "entity `X` is passed to `f` more than once" |
 | 15 | Borrowing a `@DMA`-owned buffer | CPU access before transfer completion | "entity `X` is owned by @DMA; sync(X) before borrowing it" |
 | 16 | Redeclaring a name over a live entity | Losing track of an in-flight buffer | "`X` is already declared in fn `f`" |
+| 17 | A helper declared `@DMA -> @RAM` that never syncs | A "wait" function that doesn't wait | "parameter `b` must be in @RAM when `f` returns (its signature says @DMA -> @RAM)" |
+| 18 | A signature claiming an illegal domain change | A trusted kernel promising an impossible hand-off | "no legal transition from @DMA to @DEVICE in the signature of `f`" |
+| 19 | Using a buffer between start-transfer and wait calls | Use-before-sync spread across functions | "entity `X` is in domain @DMA but `f` expects @RAM" (note: moved to @DMA by `start`) |
 
 Every file in `examples/bug_gallery/` carries its expected error in an
 `// Expected: "..."` header, and a test asserts the analyzer produces it.
@@ -671,6 +757,16 @@ resulting guarantees), adds bug-gallery entries #8–#16, and pins each
 gallery file to its documented error in the test suite. It also makes
 `phase build` independent of the working directory and adds CI.
 
+**v1.1 — Diagnostics and domain changes in signatures**
+Errors now carry source locations: spans on every token, statement,
+function name, and parameter; analyzer errors with a primary location and
+notes that trace the cause; rustc-style rendering with a `short` format for
+tools (§6.5). And a parameter may declare `@FROM -> @TO` (§3.11), so
+starting and finishing a transfer can live in separate functions with CPU
+work in between, checked across both calls. Output:
+`examples/overlapped_capture.phase` builds and runs with a window computed
+while the capture is in flight; bug-gallery entries #17–#19.
+
 **M12 — LLVM backend** *(not yet started)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead
 of C, avoiding a dependency on an external `cc`. See §10 for why this was
@@ -691,13 +787,14 @@ immediately as the language grows.
 - No LLVM backend (documented future work, M12).
 - `phase build` targets the host simulation; the real-hardware runtime
   (§5.3) is a separate build step, not a CLI target switch.
-- No interprocedural analysis: each function is checked against the
-  signatures of the functions it calls, and `extern fn` bodies are trusted
+- No interprocedural analysis beyond signatures: each function is checked
+  against the signatures of the functions it calls — including any
+  declared domain changes (§3.11) — and `extern fn` bodies are trusted
   (§4.4).
 - No GPU kernel compilation — accelerators are just another `@DEVICE`.
 - No garbage collector; no automatic parallelism; no distributed/NUMA
   domains.
 - No plugin/config-file-driven hardware description in v1 — the
-  transition table is fixed and hardcoded (§6.5), matching v1 scope.
+  transition table is fixed and hardcoded (§6.6), matching v1 scope.
 - Not attempting to be a general-purpose language: `if`/`while`/functions
   exist only to the extent the pipeline-safety demos need them.

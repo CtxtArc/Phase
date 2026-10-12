@@ -4,6 +4,78 @@ All notable changes to PHASE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-10-12
+
+Errors now show where they happen and why, and function signatures can
+declare that a call moves a buffer to or from hardware — so starting a DMA
+transfer and waiting for it can live in separate functions, with CPU work
+in between, and still be checked end to end.
+
+Every program 1.0 accepted is still accepted.
+
+### Added
+
+- **Source-located diagnostics.** Every error has a location — the
+  statement that breaks the rule, with the entity's name underlined — and
+  notes pointing at the cause: where the entity was declared, moved,
+  synced, borrowed, released, destroyed, or consumed; where each branch of
+  an `if` left it; which call changed its domain. Rendered rustc-style:
+
+  ```
+  error: entity 'frame' is in domain @DMA but 'report' expects @RAM for this argument
+    --> examples/bug_gallery/read_while_capture_in_flight.phase:19:12
+     |
+  19 |     report(frame);
+     |            ^^^^^
+  note: 'frame' is moved to @DMA by 'start_capture' here
+    --> examples/bug_gallery/read_while_capture_in_flight.phase:16:5
+     |
+  16 |     start_capture(frame);
+     |     ---------------------
+  ```
+
+  Parse errors use the same renderer.
+- `--error-format=short` prints one `file:line:col: error|note: message`
+  line per error and note, for editors and scripts.
+- `--color=auto|always|never`; `auto` (the default) colors only a
+  terminal and respects `NO_COLOR`.
+- **Domain changes in signatures** (spec §3.11). A parameter may be
+  declared `name: T @FROM -> @TO`:
+  - the signature's change must be a legal transition (§2.4);
+  - at a call the argument must be in `@FROM` and owned (not a borrow),
+    and is in `@TO` afterwards;
+  - a PHASE function's body must leave the parameter in `@TO` at every
+    `return`.
+- `examples/overlapped_capture.phase` (+ runtime): a capture started by
+  `start_capture(dst: .. @RAM -> @DMA)`, a window computed while it runs,
+  and a PHASE `wait_capture(b: .. @DMA -> @RAM)` helper. Builds and runs.
+- Bug gallery #17 `broken_sync_promise`, #18
+  `illegal_signature_transition`, #19 `read_while_capture_in_flight`, with
+  CWE mappings.
+- Tests: renderer unit tests, analyzer location and domain-change tests,
+  parser and PIR tests, and CLI tests for both error formats, color, flag
+  validation, parse-error rendering, and building and running the new
+  example.
+
+### Fixed
+
+- Inside a helper function, `sync` of a buffer parameter passed the C
+  pointer's size (8 bytes) to the runtime wait instead of the buffer's
+  size. Only the simulated wait's reported byte count was affected.
+
+### Changed
+
+- The default (human) error output is multi-line. Scripts that parsed the
+  old one-line `path: error: message` form should use
+  `--error-format=short` (whose lines are now `path:line:col: error: ...`).
+  The final `<path>: N errors found` line is unchanged.
+- Internal crate APIs: `phase_ast::Span` (now with an end position)
+  replaces `phase_lexer::Span` (re-exported); block statements are
+  `Spanned<Stmt>`; `FnDecl`/`ExternFnDecl` gain `name_span`, `Param` gains
+  `span` and `domain_after`; `AnalysisError` gains `span`, `subject`, and
+  `notes`.
+- The bug-gallery transcript script passes `--color=never`.
+
 ## [1.0.0] — 2026-10-12
 
 The first stable release. An audit of the v0.1 analyzer found programs

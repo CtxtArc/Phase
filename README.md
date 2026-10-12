@@ -3,7 +3,7 @@
 **A compiler that statically checks memory safety for hardware pipelines — DMA, MMIO, and zero-copy devices — before the code ever runs.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.0-success" alt="Version 1.0.0">
+  <img src="https://img.shields.io/badge/version-1.1.0-success" alt="Version 1.1.0">
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
 </p>
@@ -41,8 +41,9 @@ compiler guarantees:
    borrows are dead; one buffer is never passed twice to a call unless
    every use is read-only.
 3. **Lifetime safety** — nothing is used after `destroy`, and no function
-   returns while hardware still owns one of its buffers or a borrow is
-   still live.
+   returns while hardware still owns one of its buffers, a borrow is still
+   live, or a parameter is in a different domain than its signature
+   promises.
 4. **Typestate enforcement** — data never skips a required step in a
    protocol/validation chain. A state comes only from a function that
    returns it — an annotation can't fake one — and each state value is
@@ -65,18 +66,31 @@ transfer timing — see [Honest scope](#honest-scope) below.)
 ## See it catch a real bug, right now
 
 ```
-$ cargo run --bin phase -- check examples/bug_gallery/use_before_sync.phase
-error: entity 'raw' is in domain @DMA but 'fir_filter' expects @RAM for this argument
-error: entity 'raw' is still owned by @DMA when 'main' returns; sync(raw) before it goes out of scope
+$ phase check examples/bug_gallery/read_while_capture_in_flight.phase
+error: entity 'frame' is in domain @DMA but 'report' expects @RAM for this argument
+  --> examples/bug_gallery/read_while_capture_in_flight.phase:19:12
+   |
+19 |     report(frame);
+   |            ^^^^^
+note: 'frame' is moved to @DMA by 'start_capture' here
+  --> examples/bug_gallery/read_while_capture_in_flight.phase:16:5
+   |
+16 |     start_capture(frame);
+   |     ---------------------
 ```
 
-That's a real DMA buffer read before its transfer completed — and then
-abandoned while the engine still owns it — rejected before the program
-ever runs. Annotations can't talk their way past the checker either:
+That's a buffer read while a DMA transfer is still writing into it —
+started by one function call, meant to be finished by another — rejected
+before the program ever runs, with the call that handed it to the hardware
+pointed out. Annotations can't talk their way past the checker either:
 
 ```
-$ cargo run --bin phase -- check examples/bug_gallery/forged_typestate.phase
+$ phase check examples/bug_gallery/forged_typestate.phase
 error: 'p' is declared as Packet<Validated> but 'receive_packet' returns Packet<Received>
+  --> examples/bug_gallery/forged_typestate.phase:16:9
+   |
+16 |     let p: Packet<Validated> = receive_packet();
+   |         ^
 ```
 
 And the compiler doesn't just *claim* its volatile guarantee holds —
@@ -96,6 +110,7 @@ Every rule PHASE enforces maps to a real, recurring bug class. The
 deliberately broken program per rule, each rejected at compile time:
 
 - **[CWE-362/367] The DMA race condition** — [`use_before_sync.phase`](examples/bug_gallery/use_before_sync.phase), [`borrow_unsynced_dma.phase`](examples/bug_gallery/borrow_unsynced_dma.phase): touching a `@DMA` buffer (directly or through a borrow) before `sync()`. This exact discipline is why Linux's `dma-buf` subsystem requires explicit sync ioctls (a 2025 kernel fix, CVE-2025-38095, was needed when that sync could still race).
+- **[CWE-362/367] The same race across function calls** — [`read_while_capture_in_flight.phase`](examples/bug_gallery/read_while_capture_in_flight.phase), [`broken_sync_promise.phase`](examples/bug_gallery/broken_sync_promise.phase), [`illegal_signature_transition.phase`](examples/bug_gallery/illegal_signature_transition.phase): using a buffer between "start transfer" and "wait" calls, a wait helper that never waits, or a signature promising a hand-off the hardware can't do.
 - **[CWE-416] Use-after-free, including by the device** — [`destroy_while_dma.phase`](examples/bug_gallery/destroy_while_dma.phase), [`dma_escapes_function.phase`](examples/bug_gallery/dma_escapes_function.phase), [`move_while_borrowed.phase`](examples/bug_gallery/move_while_borrowed.phase), [`use_after_destroy.phase`](examples/bug_gallery/use_after_destroy.phase), [`shadowed_dma_buffer.phase`](examples/bug_gallery/shadowed_dma_buffer.phase): freeing or abandoning a buffer while a DMA engine or a borrow still uses it — the same shape as CVE-2024-43856, a 2024 Linux kernel race in `dmam_free_coherent()`.
 - **[CWE-362/672] Broken exclusivity** — [`write_borrow_conflict.phase`](examples/bug_gallery/write_borrow_conflict.phase), [`use_owner_while_borrowed.phase`](examples/bug_gallery/use_owner_while_borrowed.phase), [`use_after_release.phase`](examples/bug_gallery/use_after_release.phase): two writers at once, writing behind a borrow's back, or using a borrow after giving it up.
 - **[CWE-696/672] Typestate skipping and replay** — [`skipped_state_transition.phase`](examples/bug_gallery/skipped_state_transition.phase), [`forged_typestate.phase`](examples/bug_gallery/forged_typestate.phase), [`stale_typestate_reuse.phase`](examples/bug_gallery/stale_typestate_reuse.phase): a packet reaching a "validated" stage without being validated, or being processed twice — the same bug shape as Apple's 2014 "goto fail" (CVE-2014-1266), where a required verification step was silently skipped.
@@ -198,6 +213,9 @@ and a staleness check on the transcript.
 # Check a file for safety without generating C (exit code 0 = safe, 1 = rejected)
 phase check examples/sdr_session.phase
 
+# One `file:line:col: error: ...` line per problem, for editors and scripts
+phase --error-format=short check examples/bug_gallery/destroy_while_dma.phase
+
 # Build & run — translates to C, links the runtime, compiles with cc
 phase build examples/sdr_session.phase
 ./build/sdr_session
@@ -224,6 +242,11 @@ capture-filter-playback, a status packet that must pass through a full
 `Received -> Decoded -> Validated` typestate chain, and MMIO register
 control, composed in one program that actually builds and runs.
 
+`examples/overlapped_capture.phase`: one call starts a DMA capture
+(`start_capture(dst: buffer<..> @RAM -> @DMA)`), the CPU computes a window
+while it runs, and a PHASE helper declared `@DMA -> @RAM` waits for it —
+the overlap DMA exists for, with the buffer tracked across both calls.
+
 `examples/branching_pipeline.phase`: a real `if`/`else` that compiles to
 real C control flow and actually takes either branch at runtime, picked by
 an extern call (`PHASE_DEMO_USE_DMA=0 ./build/branching_pipeline` forces
@@ -246,7 +269,7 @@ before terminating.
 
 ## Honest scope
 
-PHASE 1.0 is a focused, research-grade compiler: its guarantees are
+PHASE 1.x is a focused, research-grade compiler: its guarantees are
 precise and tested, but its language is deliberately small. Limitations
 below are documented on purpose rather than left as silent gaps someone
 has to discover the hard way:
@@ -258,9 +281,9 @@ has to discover the hard way:
   what makes `validate()` mean *validated*). A buggy extern can break any
   guarantee — the same contract as Rust's `unsafe` FFI.
 - **Analysis is per-function.** Each body is checked against the
-  signatures it calls. Signatures can't express "this function moves its
-  argument to `@DMA`", so a parameter must be returned in the domain it
-  arrived in.
+  signatures it calls. A signature can declare that a function moves an
+  argument to another domain (`@RAM -> @DMA`); anything it doesn't
+  declare, it must undo before returning.
 - **Assignment is scoped to plain scalar locals.** `name = expr;`
   reassigns a `let`-bound scalar; entities and buffers go through
   `move`/`sync`/`borrow`/`destroy` on purpose, and can't be copied with
@@ -296,11 +319,18 @@ Full rationale for all of these is in
 
 ## What's next
 
-1.0 closes the soundness gaps found in an audit of the v0.1 analyzer (see
-[`CHANGELOG.md`](CHANGELOG.md)) on top of milestones M1–M11. The next
-formal milestone, in [`phase_specification.md`](phase_specification.md) §9:
+1.1 adds source-located diagnostics and domain changes in signatures on
+top of 1.0's soundness work (see [`CHANGELOG.md`](CHANGELOG.md)). Likely
+next steps:
 
-- **M12 — An LLVM backend**, removing the dependency on an external `cc`.
+- **Read/write modes on `extern fn` parameters**, so aliasing and
+  owner-access rules can distinguish kernels that only read a buffer.
+- **Ping-pong double buffering** — two buffers swapping between the DMA
+  engine and the CPU each loop iteration, checked as one invariant.
+- **A runtime-checking build mode plus fuzzing**, as empirical evidence
+  that every program `check` accepts really keeps its guarantees.
+- **M12 — An LLVM backend**, removing the dependency on an external `cc`
+  ([`phase_specification.md`](phase_specification.md) §9).
 
 For the complete language specification, domain model, type system, and
 full milestone roadmap, see
