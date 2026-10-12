@@ -34,7 +34,7 @@ BIN="target/debug/phase"
     echo "### \`$f\`"
     echo
     echo '```'
-    "$BIN" check "$f" 2>&1 || true
+    "$BIN" --color=never check "$f" 2>&1 || true
     echo '```'
     echo
   done
@@ -50,7 +50,7 @@ BIN="target/debug/phase"
     echo "$desc"
     echo
     echo '```'
-    "$BIN" check "$f" 2>&1 || true
+    "$BIN" --color=never check "$f" 2>&1 || true
     echo '```'
     echo
   done

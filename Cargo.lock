@@ -39,6 +39,9 @@ dependencies = [
 [[package]]
 name = "phase_lexer"
 version = "1.0.0"
+dependencies = [
+ "phase_ast",
+]
 
 [[package]]
 name = "phase_parser"

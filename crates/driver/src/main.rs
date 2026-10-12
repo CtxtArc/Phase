@@ -1,15 +1,19 @@
 //! `phase` -- the PHASE compiler driver.
 //!
 //! Usage:
-//!   phase check <file>          parse + run every safety analysis
-//!   phase build <file>          check, lower to C, compile with `cc`
-//!   phase --dump-tokens <file>  lex and print the token stream
-//!   phase --dump-ast <file>     parse and pretty-print the AST
-//!   phase --dump-pir <file>     check and pretty-print the PIR
+//!   phase [options] check <file>          parse + run every safety analysis
+//!   phase [options] build <file>          check, lower to C, compile with `cc`
+//!   phase [options] --dump-tokens <file>  lex and print the token stream
+//!   phase [options] --dump-ast <file>     parse and pretty-print the AST
+//!   phase [options] --dump-pir <file>     check and pretty-print the PIR
 //!   phase --version | --help
 
+mod diagnostics;
+
+use diagnostics::{Diagnostic, ErrorFormat};
 use std::env;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -20,13 +24,19 @@ fn usage() -> String {
         "phase {VERSION} -- physical-domain safety compiler
 
 usage:
-  phase check <file>          parse and run every safety analysis
-  phase build <file>          check, lower to C, and compile with `cc`
-  phase --dump-tokens <file>  print the token stream
-  phase --dump-ast <file>     print the parsed AST
-  phase --dump-pir <file>     check, then print the lowered PIR
-  phase --version             print the version
-  phase --help                print this message
+  phase [options] check <file>          parse and run every safety analysis
+  phase [options] build <file>          check, lower to C, and compile with `cc`
+  phase [options] --dump-tokens <file>  print the token stream
+  phase [options] --dump-ast <file>     print the parsed AST
+  phase [options] --dump-pir <file>     check, then print the lowered PIR
+  phase --version                       print the version
+  phase --help                          print this message
+
+options:
+  --error-format=human|short   rustc-style snippets (default), or one
+                               `file:line:col: error: message` line each
+  --color=auto|always|never    color for human errors (default: auto, which
+                               respects NO_COLOR and only colors a terminal)
 
 `build` writes <project>/build/<stem>.gen.{{c,h}} and <project>/build/<stem>,
 where <project> is the nearest directory at or above <file> that contains a
@@ -36,6 +46,47 @@ where <project> is the nearest directory at or above <file> that contains a
 
 fn print_usage() {
     eprintln!("{}", usage());
+}
+
+/// How diagnostics are printed.
+struct Reporter {
+    format: ErrorFormat,
+    color: bool,
+}
+
+impl Reporter {
+    fn emit(&self, diag: &Diagnostic, path: &str, src: &str) {
+        eprint!(
+            "{}",
+            diagnostics::render(diag, path, src, self.format, self.color)
+        );
+    }
+
+    /// Print every analysis error plus a count. Returns the exit code.
+    fn analysis_errors(
+        &self,
+        errors: &[phase_analysis::AnalysisError],
+        path: &str,
+        src: &str,
+    ) -> ExitCode {
+        for e in errors {
+            self.emit(&Diagnostic::from(e), path, src);
+            if self.format == ErrorFormat::Human {
+                eprintln!();
+            }
+        }
+        eprintln!(
+            "{path}: {} error{} found",
+            errors.len(),
+            if errors.len() == 1 { "" } else { "s" }
+        );
+        ExitCode::FAILURE
+    }
+
+    fn parse_error(&self, e: &phase_parser::ParseError, path: &str, src: &str) -> ExitCode {
+        self.emit(&Diagnostic::from(e), path, src);
+        ExitCode::FAILURE
+    }
 }
 
 /// Locate the runtime directory for `source`: `$PHASE_RUNTIME_DIR` if set,
@@ -59,53 +110,76 @@ fn find_runtime_dir(source: &Path) -> Option<PathBuf> {
         .or_else(|| env::current_dir().ok().and_then(search_from))
 }
 
-/// Parse and analyze `src`, printing errors to stderr (prefixed with
-/// `path`) and returning `None` on any failure. Shared by every command
-/// past `check` that needs a program known to be safe before proceeding.
-fn parse_and_analyze(path: &str, src: &str) -> Option<phase_ast::Program> {
+/// Parse and analyze `src`, reporting any errors, and returning `None` on
+/// failure. Shared by every command past `check` that needs a program
+/// known to be safe before proceeding.
+fn parse_and_analyze(path: &str, src: &str, rep: &Reporter) -> Option<phase_ast::Program> {
     let program = match phase_parser::parse(src) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("{path}: {e}");
+            rep.parse_error(&e, path, src);
             return None;
         }
     };
     match phase_analysis::analyze(&program) {
         Ok(()) => Some(program),
         Err(errors) => {
-            for e in &errors {
-                eprintln!("{path}: error: {e}");
-            }
-            eprintln!(
-                "{path}: {} error{} found",
-                errors.len(),
-                if errors.len() == 1 { "" } else { "s" }
-            );
+            rep.analysis_errors(&errors, path, src);
             None
         }
     }
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("--version" | "-V") if args.len() == 2 => {
+    let mut format = ErrorFormat::Human;
+    let mut color_mode = "auto".to_string();
+    let mut positional: Vec<String> = Vec::new();
+    for arg in env::args().skip(1) {
+        if let Some(v) = arg.strip_prefix("--error-format=") {
+            format = match v {
+                "human" => ErrorFormat::Human,
+                "short" => ErrorFormat::Short,
+                other => {
+                    eprintln!("error: unknown --error-format '{other}' (expected human or short)");
+                    return ExitCode::FAILURE;
+                }
+            };
+        } else if let Some(v) = arg.strip_prefix("--color=") {
+            if !matches!(v, "auto" | "always" | "never") {
+                eprintln!("error: unknown --color '{v}' (expected auto, always, or never)");
+                return ExitCode::FAILURE;
+            }
+            color_mode = v.to_string();
+        } else {
+            positional.push(arg);
+        }
+    }
+
+    match positional.first().map(String::as_str) {
+        Some("--version" | "-V") if positional.len() == 1 => {
             println!("phase {VERSION}");
             return ExitCode::SUCCESS;
         }
-        Some("--help" | "-h" | "help") if args.len() == 2 => {
+        Some("--help" | "-h" | "help") if positional.len() == 1 => {
             println!("{}", usage());
             return ExitCode::SUCCESS;
         }
         _ => {}
     }
-    if args.len() != 3 {
+    if positional.len() != 2 {
         print_usage();
         return ExitCode::FAILURE;
     }
 
-    let command = args[1].as_str();
-    let path = &args[2];
+    let color = match color_mode.as_str() {
+        "always" => true,
+        "never" => false,
+        _ => env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal(),
+    };
+    let rep = Reporter { format, color };
+
+    let command = positional[0].as_str();
+    let path = &positional[1];
 
     let src = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -123,20 +197,14 @@ fn main() -> ExitCode {
                 }
                 ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("{e}");
-                ExitCode::FAILURE
-            }
+            Err(e) => rep.parse_error(&e.into(), path, &src),
         },
         "--dump-ast" => match phase_parser::parse(&src) {
             Ok(program) => {
                 println!("{:#?}", program);
                 ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("{e}");
-                ExitCode::FAILURE
-            }
+            Err(e) => rep.parse_error(&e, path, &src),
         },
         "check" => match phase_parser::parse(&src) {
             Ok(program) => {
@@ -160,26 +228,13 @@ fn main() -> ExitCode {
                         );
                         ExitCode::SUCCESS
                     }
-                    Err(errors) => {
-                        for e in &errors {
-                            eprintln!("{path}: error: {e}");
-                        }
-                        eprintln!(
-                            "{path}: {} error{} found",
-                            errors.len(),
-                            if errors.len() == 1 { "" } else { "s" }
-                        );
-                        ExitCode::FAILURE
-                    }
+                    Err(errors) => rep.analysis_errors(&errors, path, &src),
                 }
             }
-            Err(e) => {
-                eprintln!("{path}: {e}");
-                ExitCode::FAILURE
-            }
+            Err(e) => rep.parse_error(&e, path, &src),
         },
         "--dump-pir" => {
-            let Some(program) = parse_and_analyze(path, &src) else {
+            let Some(program) = parse_and_analyze(path, &src, &rep) else {
                 return ExitCode::FAILURE;
             };
             match phase_pir::build(&program) {
@@ -194,7 +249,7 @@ fn main() -> ExitCode {
             }
         }
         "build" => {
-            let Some(program) = parse_and_analyze(path, &src) else {
+            let Some(program) = parse_and_analyze(path, &src, &rep) else {
                 return ExitCode::FAILURE;
             };
             let pir = match phase_pir::build(&program) {

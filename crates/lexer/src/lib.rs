@@ -4,11 +4,7 @@
 //! external crates: this is intentionally simple (single pass over chars)
 //! since the token set is small.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Span {
-    pub line: u32,
-    pub col: u32,
-}
+pub use phase_ast::Span;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
@@ -157,6 +153,8 @@ impl<'a> Lexer<'a> {
         Span {
             line: self.line,
             col: self.col,
+            end_line: self.line,
+            end_col: self.col,
         }
     }
 
@@ -219,7 +217,12 @@ impl<'a> Lexer<'a> {
                 self.lex_punct(start)?
             };
 
-            tokens.push(Token { kind, span: start });
+            let span = Span {
+                end_line: self.line,
+                end_col: self.col,
+                ..start
+            };
+            tokens.push(Token { kind, span });
         }
         Ok(tokens)
     }
@@ -489,6 +492,8 @@ mod tests {
     fn span_tracks_line_and_col() {
         let toks = tokenize("let\nx").unwrap();
         // 'x' is on line 2, col 1
-        assert_eq!(toks[1].span, Span { line: 2, col: 1 });
+        assert_eq!((toks[1].span.line, toks[1].span.col), (2, 1));
+        // and is one char wide
+        assert_eq!((toks[1].span.end_line, toks[1].span.end_col), (2, 2));
     }
 }

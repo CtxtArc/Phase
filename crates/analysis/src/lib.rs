@@ -30,12 +30,55 @@
 //! * **MMIO** -- `volatile_read`/`volatile_write` take an `@MMIO` register
 //!   reference as their first argument.
 
-use phase_ast::{BorrowMode, Domain, Expr, FnDecl, Item, Program, Stmt, TypeExpr};
+use phase_ast::{BorrowMode, Domain, Expr, FnDecl, Item, Program, Span, Stmt, TypeExpr};
 use std::collections::{HashMap, HashSet};
 
+/// One safety violation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalysisError {
     pub message: String,
+    /// Where the violation happens: the statement (or declaration) that
+    /// breaks the rule. `None` only for errors with no single location.
+    pub span: Option<Span>,
+    /// The entity the error is about, if any -- lets a renderer narrow its
+    /// underline from the whole statement to that name.
+    pub subject: Option<String>,
+    /// Related locations that explain the error ("moved to @DMA here").
+    pub notes: Vec<Note>,
+}
+
+/// A secondary location attached to an [`AnalysisError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    pub span: Span,
+    pub message: String,
+}
+
+impl AnalysisError {
+    fn about(mut self, name: &str) -> Self {
+        self.subject = Some(name.to_string());
+        self
+    }
+
+    fn note(mut self, span: Span, message: impl Into<String>) -> Self {
+        self.notes.push(Note {
+            span,
+            message: message.into(),
+        });
+        self
+    }
+
+    fn note_opt(self, n: Option<&(Span, String)>) -> Self {
+        match n {
+            Some((span, msg)) => self.note(*span, msg.clone()),
+            None => self,
+        }
+    }
+
+    fn at(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
+    }
 }
 
 impl std::fmt::Display for AnalysisError {
@@ -47,6 +90,9 @@ impl std::fmt::Display for AnalysisError {
 fn err(msg: impl Into<String>) -> AnalysisError {
     AnalysisError {
         message: msg.into(),
+        span: None,
+        subject: None,
+        notes: Vec::new(),
     }
 }
 
@@ -176,15 +222,22 @@ pub fn analyze(program: &Program) -> Result<(), Vec<AnalysisError>> {
         }
     }
 
-    let mut seen_fns = HashSet::new();
+    let mut seen_fns: HashMap<&str, Span> = HashMap::new();
     for item in &program.items {
-        let name = match item {
-            Item::Fn(f) => &f.name,
-            Item::ExternFn(f) => &f.name,
+        let (name, span) = match item {
+            Item::Fn(f) => (&f.name, f.name_span),
+            Item::ExternFn(f) => (&f.name, f.name_span),
             _ => continue,
         };
-        if !seen_fns.insert(name.as_str()) {
-            errors.push(err(format!("function '{name}' is declared more than once")));
+        if let Some(first) = seen_fns.get(name.as_str()) {
+            errors.push(
+                err(format!("function '{name}' is declared more than once"))
+                    .at(span)
+                    .about(name)
+                    .note(*first, format!("'{name}' is first declared here")),
+            );
+        } else {
+            seen_fns.insert(name.as_str(), span);
         }
     }
 
@@ -240,11 +293,25 @@ struct VarState {
     /// Kept as a name so later lines get no "unknown entity" noise, and its
     /// `release` is accepted silently.
     rejected_borrow: bool,
+
+    // ---- where things happened, for diagnostics ----------------------
+    /// Where this name was declared (for a borrow handle: the borrow).
+    origin: Span,
+    /// Where the entity entered its current domain, with a description.
+    domain_since: Option<(Span, String)>,
+    destroyed_at: Option<Span>,
+    consumed_at: Option<Span>,
+    released_at: Option<Span>,
 }
 
 impl VarState {
-    fn local(domain: Option<Domain>, typestate: Option<Typestate>) -> Self {
+    fn local(domain: Option<Domain>, typestate: Option<Typestate>, origin: Span) -> Self {
         VarState {
+            origin,
+            domain_since: None,
+            destroyed_at: None,
+            consumed_at: None,
+            released_at: None,
             domain,
             typestate,
             destroyed: false,
@@ -298,6 +365,8 @@ struct FnChecker<'a> {
     locals: HashMap<String, VarState>,
     /// keyed by the *target* entity name being borrowed from
     borrows: HashMap<String, BorrowState>,
+    /// Span of the statement currently being checked.
+    cur_span: Span,
     /// Set once every path through the statements checked so far has hit a
     /// `return`. Code after that point is unreachable, and the state at that
     /// point must not be merged into the fall-through state of a branch.
@@ -353,6 +422,7 @@ impl<'a> FnChecker<'a> {
             initial_states,
             locals: HashMap::new(),
             borrows: HashMap::new(),
+            cur_span: Span::default(),
             diverged: false,
         }
     }
@@ -364,25 +434,42 @@ impl<'a> FnChecker<'a> {
         // ones re-bound through a `let` -- is checked correctly.
         if let Some(sig) = self.fn_sigs.get(f.name.as_str()) {
             for (i, p) in f.params.iter().enumerate() {
-                if self.locals.contains_key(&p.name) {
-                    errors.push(err(format!(
-                        "parameter '{}' is declared more than once in fn '{}'",
-                        p.name, f.name
-                    )));
+                if let Some(first) = self.locals.get(&p.name) {
+                    errors.push(
+                        err(format!(
+                            "parameter '{}' is declared more than once in fn '{}'",
+                            p.name, f.name
+                        ))
+                        .at(p.span)
+                        .about(&p.name)
+                        .note(first.origin, "first declared here"),
+                    );
                     continue;
                 }
                 let domain = sig.param_domains.get(i).copied().flatten();
-                let mut var = VarState::local(domain, sig.param_states.get(i).cloned().flatten());
+                let mut var =
+                    VarState::local(domain, sig.param_states.get(i).cloned().flatten(), p.span);
                 var.param_entry_domain = Some(domain);
+                if let Some(d) = domain {
+                    var.domain_since = Some((
+                        p.span,
+                        format!("'{}' arrives in @{} here", p.name, d.name()),
+                    ));
+                }
                 self.locals.insert(p.name.clone(), var);
             }
         }
 
         self.check_block(&f.body, errors);
 
-        // Falling off the end of the body is an implicit `return;`.
+        // Falling off the end of the body is an implicit `return;`,
+        // reported at the closing brace.
         if !self.diverged {
+            let before = errors.len();
             self.check_exit_obligations(errors);
+            for e in &mut errors[before..] {
+                e.span.get_or_insert(f.body.close);
+            }
         }
     }
 
@@ -399,9 +486,12 @@ impl<'a> FnChecker<'a> {
             let var = &self.locals[name];
             if let Some((target, _)) = &var.borrow_of {
                 if !var.released {
-                    errors.push(err(format!(
-                        "borrow '{name}' of '{target}' is still live when '{fn_name}' returns; release it first"
-                    )));
+                    errors.push(
+                        err(format!(
+                            "borrow '{name}' of '{target}' is still live when '{fn_name}' returns; release it first"
+                        ))
+                        .note(var.origin, format!("'{name}' borrows '{target}' here")),
+                    );
                 }
                 continue;
             }
@@ -410,18 +500,25 @@ impl<'a> FnChecker<'a> {
             }
             match (var.param_entry_domain, var.domain) {
                 (Some(Some(entry)), Some(now)) if entry != now => {
-                    errors.push(err(format!(
-                        "parameter '{name}' must be back in @{} when '{fn_name}' returns, but it is in @{}",
-                        entry.name(),
-                        now.name()
-                    )));
+                    errors.push(
+                        err(format!(
+                            "parameter '{name}' must be back in @{} when '{fn_name}' returns, but it is in @{}",
+                            entry.name(),
+                            now.name()
+                        ))
+                        .note_opt(var.domain_since.as_ref()),
+                    );
                 }
                 (Some(_), _) => {}
                 (None, Some(now)) if is_device_owned(now) => {
-                    errors.push(err(format!(
-                        "entity '{name}' is still owned by @{} when '{fn_name}' returns; sync({name}) before it goes out of scope",
-                        now.name()
-                    )));
+                    errors.push(
+                        err(format!(
+                            "entity '{name}' is still owned by @{} when '{fn_name}' returns; sync({name}) before it goes out of scope",
+                            now.name()
+                        ))
+                        .about(name)
+                        .note_opt(var.domain_since.as_ref()),
+                    );
                 }
                 (None, _) => {}
             }
@@ -429,6 +526,16 @@ impl<'a> FnChecker<'a> {
     }
 
     fn check_return_value(&mut self, name: &str, errors: &mut Vec<AnalysisError>) {
+        let before = errors.len();
+        self.check_return_value_inner(name, errors);
+        for e in &mut errors[before..] {
+            if e.subject.is_none() {
+                e.subject = Some(name.to_string());
+            }
+        }
+    }
+
+    fn check_return_value_inner(&mut self, name: &str, errors: &mut Vec<AnalysisError>) {
         let fn_name = self.fn_name.clone();
         let required = self
             .fn_sigs
@@ -441,15 +548,19 @@ impl<'a> FnChecker<'a> {
             return;
         };
         if var.destroyed {
-            errors.push(err(format!(
-                "entity '{name}' was destroyed; cannot return it"
-            )));
+            errors.push(
+                err(format!("entity '{name}' was destroyed; cannot return it"))
+                    .note_opt(Self::lifetime_note(var, name).as_ref()),
+            );
             return;
         }
         if let Some(how) = &var.consumed {
-            errors.push(err(format!(
-                "value '{name}' was already consumed ({how}); cannot return it"
-            )));
+            errors.push(
+                err(format!(
+                    "value '{name}' was already consumed ({how}); cannot return it"
+                ))
+                .note_opt(Self::lifetime_note(var, name).as_ref()),
+            );
             return;
         }
         if var.borrow_of.is_some() {
@@ -465,9 +576,12 @@ impl<'a> FnChecker<'a> {
                         "entity '{name}' has typestate '{have_machine}' but function '{fn_name}' must return typestate '{req_machine}'"
                     )));
                 } else if req_state != have_state {
-                    errors.push(err(format!(
-                        "expected state {req_state}, found {have_state}"
-                    )));
+                    errors.push(
+                        err(format!("expected state {req_state}, found {have_state}")).note(
+                            var.origin,
+                            format!("'{name}' is {have_machine}<{have_state}> from here"),
+                        ),
+                    );
                 }
             }
             (Some(req), None) => {
@@ -481,8 +595,10 @@ impl<'a> FnChecker<'a> {
         // Returning a tracked value hands it to the caller: it leaves this
         // function's scope, so it no longer counts against exit obligations.
         if var.is_tracked() {
-            self.locals.get_mut(name).unwrap().consumed =
-                Some(format!("returned from '{fn_name}'"));
+            let span = self.cur_span;
+            let v = self.locals.get_mut(name).unwrap();
+            v.consumed = Some(format!("returned from '{fn_name}'"));
+            v.consumed_at = Some(span);
         }
     }
 
@@ -496,6 +612,28 @@ impl<'a> FnChecker<'a> {
     /// Shared preconditions for `move` / `sync` / `destroy`: the name must be
     /// a live, owned entity (not a borrow handle, not destroyed, not
     /// consumed) with no outstanding borrow. Returns its state on success.
+    /// A note pointing at a live borrow of `target`, if there is one.
+    fn borrow_note(&self, target: &str) -> Option<(Span, String)> {
+        let holder = self.borrows.get(target)?.any_holder()?;
+        let origin = self.locals.get(&holder)?.origin;
+        Some((origin, format!("'{target}' is borrowed by '{holder}' here")))
+    }
+
+    /// Notes explaining why `var` is no longer usable (destroyed, consumed,
+    /// released), if any.
+    fn lifetime_note(var: &VarState, name: &str) -> Option<(Span, String)> {
+        if let Some(at) = var.destroyed_at {
+            return Some((at, format!("'{name}' is destroyed here")));
+        }
+        if let Some(at) = var.consumed_at {
+            return Some((at, format!("'{name}' is consumed here")));
+        }
+        if let Some(at) = var.released_at {
+            return Some((at, format!("'{name}' is released here")));
+        }
+        None
+    }
+
     fn owned_target(
         &self,
         name: &str,
@@ -503,13 +641,17 @@ impl<'a> FnChecker<'a> {
         errors: &mut Vec<AnalysisError>,
     ) -> Option<VarState> {
         let Some(var) = self.locals.get(name) else {
-            errors.push(err(format!("unknown entity '{name}'")));
+            errors.push(err(format!("unknown entity '{name}'")).about(name));
             return None;
         };
         if let Some((target, _)) = &var.borrow_of {
-            errors.push(err(format!(
-                "'{name}' is a borrow of '{target}'; cannot {verb} a borrow handle (release it, then {verb} '{target}')"
-            )));
+            errors.push(
+                err(format!(
+                    "'{name}' is a borrow of '{target}'; cannot {verb} a borrow handle (release it, then {verb} '{target}')"
+                ))
+                .about(name)
+                .note(var.origin, format!("'{name}' borrows '{target}' here")),
+            );
             return None;
         }
         if var.destroyed {
@@ -518,19 +660,29 @@ impl<'a> FnChecker<'a> {
             } else {
                 format!("entity '{name}' was destroyed; cannot {verb}")
             };
-            errors.push(err(msg));
+            errors.push(
+                err(msg)
+                    .about(name)
+                    .note_opt(Self::lifetime_note(var, name).as_ref()),
+            );
             return None;
         }
         if let Some(how) = &var.consumed {
-            errors.push(err(format!(
-                "value '{name}' was already consumed ({how}); cannot {verb}"
-            )));
+            errors.push(
+                err(format!(
+                    "value '{name}' was already consumed ({how}); cannot {verb}"
+                ))
+                .about(name)
+                .note_opt(Self::lifetime_note(var, name).as_ref()),
+            );
             return None;
         }
         if self.has_live_borrow(name) {
-            errors.push(err(format!(
-                "entity '{name}' has a live borrow; cannot {verb}"
-            )));
+            errors.push(
+                err(format!("entity '{name}' has a live borrow; cannot {verb}"))
+                    .about(name)
+                    .note_opt(self.borrow_note(name).as_ref()),
+            );
             return None;
         }
         Some(var.clone())
@@ -558,7 +710,10 @@ impl<'a> FnChecker<'a> {
                     )));
                     return;
                 }
-                self.locals.get_mut(name).unwrap().domain = Some(*to);
+                let span = self.cur_span;
+                let v = self.locals.get_mut(name).unwrap();
+                v.domain = Some(*to);
+                v.domain_since = Some((span, format!("'{name}' is moved to @{} here", to.name())));
             }
 
             Stmt::Sync { name } => {
@@ -567,13 +722,19 @@ impl<'a> FnChecker<'a> {
                 };
                 let Some(from) = var.domain else { return };
                 if !legal_sync_source(from) {
-                    errors.push(err(format!(
-                        "cannot sync entity '{name}': no legal sync transition from @{}",
-                        from.name()
-                    )));
+                    errors.push(
+                        err(format!(
+                            "cannot sync entity '{name}': no legal sync transition from @{}",
+                            from.name()
+                        ))
+                        .about(name),
+                    );
                     return;
                 }
-                self.locals.get_mut(name).unwrap().domain = Some(Domain::Ram);
+                let span = self.cur_span;
+                let v = self.locals.get_mut(name).unwrap();
+                v.domain = Some(Domain::Ram);
+                v.domain_since = Some((span, format!("'{name}' is synced back to @RAM here")));
             }
 
             Stmt::Release { name } => {
@@ -589,7 +750,11 @@ impl<'a> FnChecker<'a> {
                     return;
                 };
                 if var.released {
-                    errors.push(err(format!("borrow '{name}' was already released")));
+                    errors.push(
+                        err(format!("borrow '{name}' was already released"))
+                            .about(name)
+                            .note_opt(Self::lifetime_note(var, name).as_ref()),
+                    );
                     return;
                 }
                 if let Some(bs) = self.borrows.get_mut(&target) {
@@ -604,7 +769,10 @@ impl<'a> FnChecker<'a> {
                         }
                     }
                 }
-                self.locals.get_mut(name).unwrap().released = true;
+                let span = self.cur_span;
+                let v = self.locals.get_mut(name).unwrap();
+                v.released = true;
+                v.released_at = Some(span);
             }
 
             Stmt::Destroy { name } => {
@@ -612,19 +780,33 @@ impl<'a> FnChecker<'a> {
                     return;
                 };
                 if var.is_param() {
-                    errors.push(err(format!(
-                        "cannot destroy parameter '{name}': the caller still owns it"
-                    )));
+                    errors.push(
+                        err(format!(
+                            "cannot destroy parameter '{name}': the caller still owns it"
+                        ))
+                        .about(name)
+                        .note(
+                            var.origin,
+                            format!("'{name}' is a parameter of '{}'", self.fn_name),
+                        ),
+                    );
                     return;
                 }
                 if let Some(d) = var.domain.filter(|d| is_device_owned(*d)) {
-                    errors.push(err(format!(
-                        "entity '{name}' is still owned by @{}; sync({name}) before destroying it",
-                        d.name()
-                    )));
+                    errors.push(
+                        err(format!(
+                            "entity '{name}' is still owned by @{}; sync({name}) before destroying it",
+                            d.name()
+                        ))
+                        .about(name)
+                        .note_opt(var.domain_since.as_ref()),
+                    );
                     return;
                 }
-                self.locals.get_mut(name).unwrap().destroyed = true;
+                let span = self.cur_span;
+                let v = self.locals.get_mut(name).unwrap();
+                v.destroyed = true;
+                v.destroyed_at = Some(span);
             }
 
             Stmt::Expr(e) => self.check_expr(e, errors),
@@ -690,13 +872,23 @@ impl<'a> FnChecker<'a> {
     fn check_block(&mut self, block: &phase_ast::Block, errors: &mut Vec<AnalysisError>) {
         for stmt in &block.stmts {
             if self.diverged {
-                errors.push(err(format!(
-                    "unreachable statement after `return` in fn '{}'",
-                    self.fn_name
-                )));
+                errors.push(
+                    err(format!(
+                        "unreachable statement after `return` in fn '{}'",
+                        self.fn_name
+                    ))
+                    .at(stmt.span),
+                );
                 return;
             }
+            let before = errors.len();
+            self.cur_span = stmt.span;
             self.check_stmt(stmt, errors);
+            // Errors raised while checking this statement (and not already
+            // pinned to a nested statement) point at it.
+            for e in &mut errors[before..] {
+                e.span.get_or_insert(stmt.span);
+            }
         }
     }
 
@@ -906,11 +1098,17 @@ impl<'a> FnChecker<'a> {
             } else if a.domain.is_none() || b.domain.is_none() {
                 None
             } else {
-                errors.push(err(format!(
+                let mut e = err(format!(
                     "entity '{name}' disagrees on domain across incoming branches (@{} vs @{}){loop_note}",
                     a.domain.map(|d| d.name()).unwrap_or("?"),
                     b.domain.map(|d| d.name()).unwrap_or("?"),
-                )));
+                ))
+                .about(name)
+                .note_opt(a.domain_since.as_ref());
+                if b.domain_since.as_ref().map(|n| n.0) != a.domain_since.as_ref().map(|n| n.0) {
+                    e = e.note_opt(b.domain_since.as_ref());
+                }
+                errors.push(e);
                 None
             };
 
@@ -962,6 +1160,11 @@ impl<'a> FnChecker<'a> {
                     consumed,
                     param_entry_domain: base_var.param_entry_domain,
                     rejected_borrow: base_var.rejected_borrow,
+                    origin: base_var.origin,
+                    domain_since: a.domain_since.clone().or_else(|| b.domain_since.clone()),
+                    destroyed_at: a.destroyed_at.or(b.destroyed_at),
+                    consumed_at: a.consumed_at.or(b.consumed_at),
+                    released_at: a.released_at.or(b.released_at),
                 },
             );
         }
@@ -996,11 +1199,15 @@ impl<'a> FnChecker<'a> {
     }
 
     fn check_no_shadowing(&self, name: &str, errors: &mut Vec<AnalysisError>) -> bool {
-        if self.locals.contains_key(name) {
-            errors.push(err(format!(
-                "'{name}' is already declared in fn '{}'; PHASE does not allow shadowing or redeclaration",
-                self.fn_name
-            )));
+        if let Some(existing) = self.locals.get(name) {
+            errors.push(
+                err(format!(
+                    "'{name}' is already declared in fn '{}'; PHASE does not allow shadowing or redeclaration",
+                    self.fn_name
+                ))
+                .about(name)
+                .note(existing.origin, format!("'{name}' is first declared here")),
+            );
             return false;
         }
         true
@@ -1040,9 +1247,12 @@ impl<'a> FnChecker<'a> {
         if let Some(Expr::Ident(src)) = init {
             if let Some(src_var) = self.locals.get(src) {
                 if src_var.is_tracked() {
-                    errors.push(err(format!(
-                        "cannot bind '{name}' to entity '{src}': entities are not copyable (use `borrow {src} read|write` for a second name)"
-                    )));
+                    errors.push(
+                        err(format!(
+                            "cannot bind '{name}' to entity '{src}': entities are not copyable (use `borrow {src} read|write` for a second name)"
+                        ))
+                        .about(src),
+                    );
                     return;
                 }
             }
@@ -1092,11 +1302,14 @@ impl<'a> FnChecker<'a> {
                         Some(Expr::Call { callee, .. }) => callee.as_str(),
                         _ => unreachable!(),
                     };
-                    errors.push(err(format!(
-                        "'{name}' is declared as {} but '{callee}' returns {}",
-                        fmt_state(&decl),
-                        fmt_state(&actual)
-                    )));
+                    errors.push(
+                        err(format!(
+                            "'{name}' is declared as {} but '{callee}' returns {}",
+                            fmt_state(&decl),
+                            fmt_state(&actual)
+                        ))
+                        .about(name),
+                    );
                 }
                 Some(actual)
             }
@@ -1105,10 +1318,13 @@ impl<'a> FnChecker<'a> {
                     Some(Expr::Call { callee, .. }) => callee.as_str(),
                     _ => unreachable!(),
                 };
-                errors.push(err(format!(
+                errors.push(
+                        err(format!(
                     "'{name}' is declared as {} but '{callee}' does not return a typestate value; a state can only come from a function that returns it",
                     fmt_state(&decl)
-                )));
+                ))
+                        .about(name),
+                    );
                 None
             }
             (None, Some(actual)) => actual,
@@ -1119,22 +1335,29 @@ impl<'a> FnChecker<'a> {
                 if initial == Some(decl.1.as_str()) {
                     Some(decl)
                 } else {
-                    errors.push(err(format!(
+                    errors.push(
+                        err(format!(
                         "'{name}' cannot be created directly in state {}: a new value starts in {}<{}>, and later states can only come from a function that returns them",
                         fmt_state(&decl),
                         decl.0,
                         initial.unwrap_or("?")
-                    )));
+                    ))
+                        .about(name),
+                    );
                     None
                 }
             }
             (None, None) => None,
         };
 
-        self.locals.insert(
-            name.to_string(),
-            VarState::local(resolved_domain, resolved_typestate),
-        );
+        let mut var = VarState::local(resolved_domain, resolved_typestate, self.cur_span);
+        if let Some(d) = resolved_domain {
+            var.domain_since = Some((
+                self.cur_span,
+                format!("'{name}' is declared in @{} here", d.name()),
+            ));
+        }
+        self.locals.insert(name.to_string(), var);
     }
 
     fn check_borrow_decl(
@@ -1167,27 +1390,46 @@ impl<'a> FnChecker<'a> {
             })
         };
         if let Some(msg) = rejection {
-            errors.push(err(msg));
+            let note = if target_var.destroyed || target_var.consumed.is_some() {
+                Self::lifetime_note(target_var, target)
+            } else if target_var.borrow_of.is_some() {
+                Some((
+                    target_var.origin,
+                    format!("'{target}' is a borrow taken here"),
+                ))
+            } else {
+                target_var.domain_since.clone()
+            };
+            errors.push(err(msg).about(target).note_opt(note.as_ref()));
             // Register an inert placeholder so later references to `name`
             // get targeted errors instead of "unknown entity" noise.
-            let mut placeholder = VarState::local(None, None);
+            let mut placeholder = VarState::local(None, None, self.cur_span);
             placeholder.rejected_borrow = true;
             self.locals.insert(name.to_string(), placeholder);
             return;
         }
 
+        let conflict = self.borrow_note(target);
         let bs = self.borrows.entry(target.to_string()).or_default();
         let ok = match mode {
             BorrowMode::Write => {
                 if bs.writer.is_some() {
-                    errors.push(err(format!(
-                        "entity '{target}' already has an exclusive write borrow"
-                    )));
+                    errors.push(
+                        err(format!(
+                            "entity '{target}' already has an exclusive write borrow"
+                        ))
+                        .about(target)
+                        .note_opt(conflict.as_ref()),
+                    );
                     false
                 } else if !bs.readers.is_empty() {
-                    errors.push(err(format!(
-                        "entity '{target}' already has an active read borrow; cannot take exclusive write borrow"
-                    )));
+                    errors.push(
+                        err(format!(
+                            "entity '{target}' already has an active read borrow; cannot take exclusive write borrow"
+                        ))
+                        .about(target)
+                        .note_opt(conflict.as_ref()),
+                    );
                     false
                 } else {
                     bs.writer = Some(name.to_string());
@@ -1196,9 +1438,13 @@ impl<'a> FnChecker<'a> {
             }
             BorrowMode::Read => {
                 if bs.writer.is_some() {
-                    errors.push(err(format!(
-                        "entity '{target}' already has an exclusive write borrow"
-                    )));
+                    errors.push(
+                        err(format!(
+                            "entity '{target}' already has an exclusive write borrow"
+                        ))
+                        .about(target)
+                        .note_opt(conflict.as_ref()),
+                    );
                     false
                 } else {
                     bs.readers.insert(name.to_string());
@@ -1208,7 +1454,7 @@ impl<'a> FnChecker<'a> {
         };
 
         let (domain, typestate) = (target_var.domain, target_var.typestate.clone());
-        let mut var = VarState::local(domain, typestate);
+        let mut var = VarState::local(domain, typestate, self.cur_span);
         if ok {
             var.borrow_of = Some((target.to_string(), mode));
         } else {
@@ -1266,13 +1512,19 @@ impl<'a> FnChecker<'a> {
     /// plain scalar -- an entity has no scalar value to read.
     fn check_value_ident(&self, name: &str, errors: &mut Vec<AnalysisError>) {
         match self.locals.get(name) {
-            None => errors.push(err(format!("unknown name '{name}'"))),
-            Some(var) if var.is_tracked() => errors.push(err(format!(
-                "'{name}' is an entity, not a scalar value; it cannot be used in an expression"
-            ))),
-            Some(var) if var.destroyed => {
-                errors.push(err(format!("'{name}' was destroyed; cannot use it")))
-            }
+            None => errors.push(err(format!("unknown name '{name}'")).about(name)),
+            Some(var) if var.is_tracked() => errors.push(
+                err(format!(
+                    "'{name}' is an entity, not a scalar value; it cannot be used in an expression"
+                ))
+                .about(name)
+                .note(var.origin, format!("'{name}' is declared here")),
+            ),
+            Some(var) if var.destroyed => errors.push(
+                err(format!("'{name}' was destroyed; cannot use it"))
+                    .about(name)
+                    .note_opt(Self::lifetime_note(var, name).as_ref()),
+            ),
             Some(_) => {}
         }
     }
@@ -1289,30 +1541,45 @@ impl<'a> FnChecker<'a> {
         let Some(var) = self.locals.get(name) else {
             return false;
         };
+        let lifetime = Self::lifetime_note(var, name);
         if var.destroyed {
-            errors.push(err(format!(
-                "entity '{name}' was destroyed; cannot {usage}"
-            )));
+            errors.push(
+                err(format!("entity '{name}' was destroyed; cannot {usage}"))
+                    .about(name)
+                    .note_opt(lifetime.as_ref()),
+            );
             return false;
         }
         if let Some(how) = &var.consumed {
-            errors.push(err(format!(
-                "value '{name}' was already consumed ({how}); cannot {usage}"
-            )));
+            errors.push(
+                err(format!(
+                    "value '{name}' was already consumed ({how}); cannot {usage}"
+                ))
+                .about(name)
+                .note_opt(lifetime.as_ref()),
+            );
             return false;
         }
         if let Some((target, _)) = &var.borrow_of {
             if var.released {
-                errors.push(err(format!(
-                    "borrow '{name}' of '{target}' was already released; cannot {usage}"
-                )));
+                errors.push(
+                    err(format!(
+                        "borrow '{name}' of '{target}' was already released; cannot {usage}"
+                    ))
+                    .about(name)
+                    .note_opt(lifetime.as_ref()),
+                );
                 return false;
             }
         } else if let Some(bs) = self.borrows.get(name).filter(|b| !b.is_empty()) {
-            errors.push(err(format!(
-                "entity '{name}' is borrowed by '{}'; it cannot be used directly until that borrow is released",
-                bs.any_holder().unwrap_or_default()
-            )));
+            errors.push(
+                err(format!(
+                    "entity '{name}' is borrowed by '{}'; it cannot be used directly until that borrow is released",
+                    bs.any_holder().unwrap_or_default()
+                ))
+                .about(name)
+                .note_opt(self.borrow_note(name).as_ref()),
+            );
             return false;
         }
         true
@@ -1324,15 +1591,20 @@ impl<'a> FnChecker<'a> {
             Expr::Ident(name) => self.check_value_ident(name, errors),
             Expr::FieldAccess { base, .. } => match base.as_ref() {
                 Expr::Ident(name) => match self.locals.get(name) {
-                    None => errors.push(err(format!("unknown name '{name}'"))),
+                    None => errors.push(err(format!("unknown name '{name}'")).about(name)),
                     Some(var) => {
                         let domain = var.domain;
+                        let since = var.domain_since.clone();
                         if self.check_entity_access(name, "read its fields", errors) {
                             if let Some(d) = domain.filter(|d| is_device_owned(*d)) {
-                                errors.push(err(format!(
-                                    "entity '{name}' is owned by @{}; sync({name}) before reading its fields",
-                                    d.name()
-                                )));
+                                errors.push(
+                                    err(format!(
+                                        "entity '{name}' is owned by @{}; sync({name}) before reading its fields",
+                                        d.name()
+                                    ))
+                                    .about(name)
+                                    .note_opt(since.as_ref()),
+                                );
                             }
                         }
                     }
@@ -1413,7 +1685,10 @@ impl<'a> FnChecker<'a> {
             match arg {
                 Expr::Ident(name) => {
                     let Some(var) = self.locals.get(name).cloned() else {
-                        errors.push(err(format!("unknown entity '{name}' passed to '{callee}'")));
+                        errors.push(
+                            err(format!("unknown entity '{name}' passed to '{callee}'"))
+                                .about(name),
+                        );
                         continue;
                     };
                     if !self.check_entity_access(
@@ -1427,11 +1702,15 @@ impl<'a> FnChecker<'a> {
                     if let Some(Some(param_domain)) = sig.param_domains.get(i) {
                         if let Some(var_domain) = var.domain {
                             if var_domain != *param_domain {
-                                errors.push(err(format!(
-                                    "entity '{name}' is in domain @{} but '{callee}' expects @{} for this argument",
-                                    var_domain.name(),
-                                    param_domain.name()
-                                )));
+                                errors.push(
+                                    err(format!(
+                                        "entity '{name}' is in domain @{} but '{callee}' expects @{} for this argument",
+                                        var_domain.name(),
+                                        param_domain.name()
+                                    ))
+                                    .about(name)
+                                    .note_opt(var.domain_since.as_ref()),
+                                );
                             }
                         }
                     }
@@ -1440,29 +1719,47 @@ impl<'a> FnChecker<'a> {
                         let (req_machine, req_state) = required;
                         match &var.typestate {
                             Some((have_machine, have_state)) => {
+                                let origin_note = (
+                                    var.origin,
+                                    format!("'{name}' is {have_machine}<{have_state}> from here"),
+                                );
                                 if have_machine != req_machine {
-                                    errors.push(err(format!(
-                                        "entity '{name}' has typestate '{have_machine}' but '{callee}' expects typestate '{req_machine}'"
-                                    )));
+                                    errors.push(
+                                        err(format!(
+                                            "entity '{name}' has typestate '{have_machine}' but '{callee}' expects typestate '{req_machine}'"
+                                        ))
+                                        .about(name)
+                                        .note_opt(Some(&origin_note)),
+                                    );
                                 } else if have_state != req_state {
-                                    errors.push(err(format!(
-                                        "expected state {req_state}, found {have_state}"
-                                    )));
+                                    errors.push(
+                                        err(format!(
+                                            "expected state {req_state}, found {have_state}"
+                                        ))
+                                        .about(name)
+                                        .note_opt(Some(&origin_note)),
+                                    );
                                 }
                             }
-                            None => errors.push(err(format!(
-                                "'{callee}' requires {} but '{name}' has no proven typestate",
-                                fmt_state(required)
-                            ))),
+                            None => errors.push(
+                                err(format!(
+                                    "'{callee}' requires {} but '{name}' has no proven typestate",
+                                    fmt_state(required)
+                                ))
+                                .about(name),
+                            ),
                         }
                         // Linear: handing a value to a state-requiring
                         // parameter consumes it. A borrow handle cannot be
                         // consumed (it doesn't own the value).
                         if var.borrow_of.is_some() {
-                            errors.push(err(format!(
-                                "'{callee}' takes ownership of a {} value, but '{name}' is only a borrow",
-                                fmt_state(required)
-                            )));
+                            errors.push(
+                                err(format!(
+                                    "'{callee}' takes ownership of a {} value, but '{name}' is only a borrow",
+                                    fmt_state(required)
+                                ))
+                                .about(name),
+                            );
                         } else {
                             to_consume.push(name.clone());
                         }
@@ -1488,15 +1785,20 @@ impl<'a> FnChecker<'a> {
                 && roots[..idx].iter().all(|(r, _)| r != root)
                 && reported.insert(root.clone())
             {
-                errors.push(err(format!(
-                    "entity '{root}' is passed to '{callee}' more than once; aliased arguments are only allowed through read borrows"
-                )));
+                errors.push(
+                    err(format!(
+                        "entity '{root}' is passed to '{callee}' more than once; aliased arguments are only allowed through read borrows"
+                    ))
+                    .about(root),
+                );
             }
         }
 
+        let span = self.cur_span;
         for name in to_consume {
             if let Some(v) = self.locals.get_mut(&name) {
                 v.consumed = Some(format!("passed to '{callee}'"));
+                v.consumed_at = Some(span);
             }
         }
     }
@@ -2770,5 +3072,166 @@ mod soundness_tests {
         let mut dedup = msgs.clone();
         dedup.dedup();
         assert_eq!(msgs, dedup);
+    }
+}
+
+/// v1.1: every error carries the location of the offending statement, the
+/// entity it is about, and notes pointing at the cause.
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+
+    fn errors(src: &str) -> Vec<AnalysisError> {
+        analyze(&phase_parser::parse(src).expect("fixture must parse")).unwrap_err()
+    }
+
+    fn line_of(span: Option<Span>) -> u32 {
+        span.expect("error must have a span").line
+    }
+
+    const SRC: &str = "extern fn fir(in_: buffer<u8, 4> @RAM, out: buffer<u8, 4> @RAM);
+extern fn cap(x: buffer<u8, 4> @DMA);
+fn main() {
+    buffer<u8, 4> raw @RAM;
+    buffer<u8, 4> out @RAM;
+    move raw -> @DMA;
+    cap(raw);
+    fir(raw, out);
+    sync(raw);
+}
+";
+
+    #[test]
+    fn domain_error_points_at_the_call_and_notes_the_move() {
+        let errs = errors(SRC);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        let e = &errs[0];
+        assert_eq!(line_of(e.span), 8);
+        assert_eq!(e.subject.as_deref(), Some("raw"));
+        assert_eq!(e.notes.len(), 1);
+        assert_eq!(e.notes[0].span.line, 6);
+        assert!(e.notes[0].message.contains("moved to @DMA"));
+    }
+
+    #[test]
+    fn statement_span_covers_the_whole_statement() {
+        let e = &errors(SRC)[0];
+        let span = e.span.unwrap();
+        // `    fir(raw, out);` -- from `fir` to just past `;`
+        assert_eq!((span.col, span.end_line, span.end_col), (5, 8, 19));
+    }
+
+    #[test]
+    fn falling_off_the_end_is_reported_at_the_closing_brace() {
+        let src = "extern fn cap(x: buffer<u8, 4> @DMA);
+fn main() {
+    buffer<u8, 4> raw @RAM;
+    move raw -> @DMA;
+    cap(raw);
+}
+";
+        let e = &errors(src)[0];
+        assert!(e
+            .message
+            .contains("still owned by @DMA when 'main' returns"));
+        assert_eq!(e.span.map(|s| (s.line, s.col)), Some((6, 1)));
+        assert_eq!(e.notes[0].span.line, 4);
+    }
+
+    #[test]
+    fn errors_inside_a_branch_point_at_the_inner_statement() {
+        let src = "extern fn peek(x: buffer<u8, 4> @RAM);
+extern fn flag() -> bool;
+fn main() {
+    let f: bool = flag();
+    buffer<u8, 4> x @RAM;
+    if f {
+        destroy x;
+        peek(x);
+    }
+}
+";
+        let errs = errors(src);
+        let use_after = errs
+            .iter()
+            .find(|e| e.message.contains("was destroyed"))
+            .unwrap();
+        assert_eq!(line_of(use_after.span), 8);
+        assert_eq!(use_after.notes[0].span.line, 7);
+        // ...while the join disagreement points at the `if` itself.
+        let join = errs
+            .iter()
+            .find(|e| e.message.contains("destroyed-state"))
+            .unwrap();
+        assert_eq!(line_of(join.span), 6);
+    }
+
+    #[test]
+    fn branch_disagreement_notes_each_path() {
+        let src = "extern fn flag() -> bool;
+fn main() {
+    let f: bool = flag();
+    buffer<u8, 4> x @RAM;
+    if f {
+        move x -> @DMA;
+    } else {
+        move x -> @DEVICE;
+    }
+}
+";
+        let e = errors(src)
+            .into_iter()
+            .find(|e| e.message.contains("disagrees on domain"))
+            .unwrap();
+        let note_lines: Vec<u32> = e.notes.iter().map(|n| n.span.line).collect();
+        assert_eq!(note_lines, vec![6, 8]);
+    }
+
+    #[test]
+    fn borrow_conflict_notes_the_existing_borrow() {
+        let src = "fn main() {
+    buffer<u8, 4> x @RAM;
+    let a = borrow x write;
+    let b = borrow x write;
+    release a;
+}
+";
+        let e = errors(src)
+            .into_iter()
+            .find(|e| e.message.contains("exclusive write borrow"))
+            .unwrap();
+        assert_eq!(line_of(e.span), 4);
+        assert_eq!(e.notes[0].span.line, 3);
+    }
+
+    #[test]
+    fn duplicate_function_points_at_both_names() {
+        let e = &errors("fn main() { }\nfn main() { }\n")[0];
+        assert_eq!(e.span.map(|s| (s.line, s.col)), Some((2, 4)));
+        assert_eq!(e.notes[0].span.line, 1);
+    }
+
+    #[test]
+    fn every_gallery_style_error_has_a_span() {
+        // Exercise a spread of rules; none may come back location-less.
+        let src = "state P { A -> B }
+extern fn mk() -> P<A>;
+extern fn step(p: P<A>) -> P<B>;
+extern fn peek(x: buffer<u8, 4> @RAM);
+fn main() {
+    let p: P<B> = mk();
+    let q = mk();
+    let r = step(q);
+    let s = step(q);
+    buffer<u8, 4> x @RAM;
+    buffer<u8, 4> x @RAM;
+    let v = borrow x read;
+    peek(x);
+    if ghost { }
+}
+";
+        for e in errors(src) {
+            assert!(e.span.is_some(), "no span on: {}", e.message);
+        }
     }
 }

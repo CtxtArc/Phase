@@ -31,7 +31,7 @@ fn version_matches_the_crate_version() {
 fn help_succeeds_and_no_args_fails() {
     let help = phase().arg("--help").output().unwrap();
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("phase check <file>"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("check <file>"));
 
     let none = phase().output().unwrap();
     assert!(!none.status.success());
@@ -100,4 +100,79 @@ fn build_works_from_an_unrelated_working_directory() {
         5,
         "expected 5 ticks, got:\n{stdout}"
     );
+}
+
+#[test]
+fn human_errors_show_the_source_line_and_notes() {
+    let root = workspace_root();
+    let out = phase()
+        .arg("--color=never")
+        .arg("check")
+        .arg(root.join("examples/bug_gallery/stale_typestate_reuse.phase"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("stale_typestate_reuse.phase:22:5"), "{err}");
+    assert!(err.contains("22 |     let again = decode(p1);"), "{err}");
+    assert!(err.contains("   |                        ^^\n"), "{err}");
+    assert!(err.contains("note: 'p1' is consumed here"), "{err}");
+    assert!(
+        !err.contains('\x1b'),
+        "--color=never must not emit ANSI codes"
+    );
+}
+
+#[test]
+fn short_errors_are_one_line_each() {
+    let root = workspace_root();
+    let out = phase()
+        .args(["--error-format=short", "check"])
+        .arg(root.join("examples/bug_gallery/destroy_while_dma.phase"))
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let first = err.lines().next().unwrap();
+    assert!(
+        first.ends_with(
+            "destroy_while_dma.phase:14:5: error: entity 'rx' is still owned by @DMA; sync(rx) before destroying it"
+        ),
+        "{err}"
+    );
+    assert!(err.contains("destroy_while_dma.phase:10:5: note: 'rx' is moved to @DMA here"));
+}
+
+#[test]
+fn color_always_emits_ansi_and_bad_flags_are_rejected() {
+    let root = workspace_root();
+    let colored = phase()
+        .args(["--color=always", "check"])
+        .arg(root.join("examples/bug_gallery/use_after_release.phase"))
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&colored.stderr).contains("\x1b[1;31merror"));
+
+    let bad = phase()
+        .args(["--error-format=json", "check", "x.phase"])
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("unknown --error-format"));
+}
+
+#[test]
+fn parse_errors_are_rendered_with_their_location() {
+    let dir = std::env::temp_dir().join("phase_cli_parse_error");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("bad.phase");
+    std::fs::write(&file, "fn main() {\n    let x: u32 = 1\n}\n").unwrap();
+    let out = phase()
+        .args(["--color=never", "check"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("bad.phase:3:1"), "{err}");
+    assert!(err.contains("3 | }"), "{err}");
 }

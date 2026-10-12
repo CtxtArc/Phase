@@ -65,7 +65,12 @@ OK: examples/sdr_session.phase parsed and passed domain/ownership analysis (2 en
 Bug gallery #14: passing the same buffer as both input and output of a
 
 ```
-examples/bug_gallery/aliased_arguments.phase: error: entity 'samples' is passed to 'fir_filter' more than once; aliased arguments are only allowed through read borrows
+error: entity 'samples' is passed to 'fir_filter' more than once; aliased arguments are only allowed through read borrows
+  --> examples/bug_gallery/aliased_arguments.phase:12:5
+   |
+12 |     fir_filter(samples, samples);
+   |                ^^^^^^^
+
 examples/bug_gallery/aliased_arguments.phase: 1 error found
 ```
 
@@ -74,7 +79,17 @@ examples/bug_gallery/aliased_arguments.phase: 1 error found
 Bug gallery #15: taking a borrow as a back door around sync(). A
 
 ```
-examples/bug_gallery/borrow_unsynced_dma.phase: error: entity 'raw' is owned by @DMA; sync(raw) before borrowing it
+error: entity 'raw' is owned by @DMA; sync(raw) before borrowing it
+  --> examples/bug_gallery/borrow_unsynced_dma.phase:12:5
+   |
+12 |     let peek = borrow raw read;
+   |                       ^^^
+note: 'raw' is declared in @DMA here
+  --> examples/bug_gallery/borrow_unsynced_dma.phase:8:5
+   |
+ 8 |     buffer<u8, 64> raw @DMA;
+   |     ------------------------
+
 examples/bug_gallery/borrow_unsynced_dma.phase: 1 error found
 ```
 
@@ -83,7 +98,22 @@ examples/bug_gallery/borrow_unsynced_dma.phase: 1 error found
 Bug gallery #6: the two branches leave an entity in different domains,
 
 ```
-examples/bug_gallery/branch_domain_disagreement.phase: error: entity 'x' disagrees on domain across incoming branches (@DMA vs @DEVICE)
+error: entity 'x' disagrees on domain across incoming branches (@DMA vs @DEVICE)
+  --> examples/bug_gallery/branch_domain_disagreement.phase:11:5
+   |
+11 |     if use_dma {
+   |     ^^^^^^^^^^^^
+note: 'x' is moved to @DMA here
+  --> examples/bug_gallery/branch_domain_disagreement.phase:12:9
+   |
+12 |         move x -> @DMA;
+   |         ---------------
+note: 'x' is moved to @DEVICE here
+  --> examples/bug_gallery/branch_domain_disagreement.phase:15:9
+   |
+15 |         move x -> @DEVICE;
+   |         ------------------
+
 examples/bug_gallery/branch_domain_disagreement.phase: 1 error found
 ```
 
@@ -92,8 +122,28 @@ examples/bug_gallery/branch_domain_disagreement.phase: 1 error found
 Bug gallery #10: freeing a buffer while the DMA engine still owns it.
 
 ```
-examples/bug_gallery/destroy_while_dma.phase: error: entity 'rx' is still owned by @DMA; sync(rx) before destroying it
-examples/bug_gallery/destroy_while_dma.phase: error: entity 'rx' is still owned by @DMA when 'main' returns; sync(rx) before it goes out of scope
+error: entity 'rx' is still owned by @DMA; sync(rx) before destroying it
+  --> examples/bug_gallery/destroy_while_dma.phase:14:5
+   |
+14 |     destroy rx;
+   |             ^^
+note: 'rx' is moved to @DMA here
+  --> examples/bug_gallery/destroy_while_dma.phase:10:5
+   |
+10 |     move rx -> @DMA;
+   |     ----------------
+
+error: entity 'rx' is still owned by @DMA when 'main' returns; sync(rx) before it goes out of scope
+  --> examples/bug_gallery/destroy_while_dma.phase:15:1
+   |
+15 | }
+   | ^
+note: 'rx' is moved to @DMA here
+  --> examples/bug_gallery/destroy_while_dma.phase:10:5
+   |
+10 |     move rx -> @DMA;
+   |     ----------------
+
 examples/bug_gallery/destroy_while_dma.phase: 2 errors found
 ```
 
@@ -102,7 +152,17 @@ examples/bug_gallery/destroy_while_dma.phase: 2 errors found
 Bug gallery #11: a function returns while hardware still owns one of
 
 ```
-examples/bug_gallery/dma_escapes_function.phase: error: entity 'scratch' is still owned by @DMA when 'arm_capture' returns; sync(scratch) before it goes out of scope
+error: entity 'scratch' is still owned by @DMA when 'arm_capture' returns; sync(scratch) before it goes out of scope
+  --> examples/bug_gallery/dma_escapes_function.phase:13:1
+   |
+13 | }
+   | ^
+note: 'scratch' is moved to @DMA here
+  --> examples/bug_gallery/dma_escapes_function.phase:10:5
+   |
+10 |     move scratch -> @DMA;
+   |     ---------------------
+
 examples/bug_gallery/dma_escapes_function.phase: 1 error found
 ```
 
@@ -111,8 +171,23 @@ examples/bug_gallery/dma_escapes_function.phase: 1 error found
 Bug gallery #8: claiming a typestate with an annotation instead of
 
 ```
-examples/bug_gallery/forged_typestate.phase: error: 'p' is declared as Packet<Validated> but 'receive_packet' returns Packet<Received>
-examples/bug_gallery/forged_typestate.phase: error: expected state Validated, found Received
+error: 'p' is declared as Packet<Validated> but 'receive_packet' returns Packet<Received>
+  --> examples/bug_gallery/forged_typestate.phase:16:5
+   |
+16 |     let p: Packet<Validated> = receive_packet();
+   |         ^
+
+error: expected state Validated, found Received
+  --> examples/bug_gallery/forged_typestate.phase:17:5
+   |
+17 |     handle(p);
+   |            ^
+note: 'p' is Packet<Received> from here
+  --> examples/bug_gallery/forged_typestate.phase:16:5
+   |
+16 |     let p: Packet<Validated> = receive_packet();
+   |     --------------------------------------------
+
 examples/bug_gallery/forged_typestate.phase: 2 errors found
 ```
 
@@ -121,7 +196,17 @@ examples/bug_gallery/forged_typestate.phase: 2 errors found
 Bug gallery #2: moving an entity while a borrow of it is still live.
 
 ```
-examples/bug_gallery/move_while_borrowed.phase: error: entity 'x' has a live borrow; cannot move
+error: entity 'x' has a live borrow; cannot move
+ --> examples/bug_gallery/move_while_borrowed.phase:9:5
+  |
+9 |     move x -> @DMA;
+  |          ^
+note: 'x' is borrowed by 'view' here
+ --> examples/bug_gallery/move_while_borrowed.phase:6:5
+  |
+6 |     let view = borrow x read;
+  |     -------------------------
+
 examples/bug_gallery/move_while_borrowed.phase: 1 error found
 ```
 
@@ -130,8 +215,28 @@ examples/bug_gallery/move_while_borrowed.phase: 1 error found
 Bug gallery #16: redeclaring a name to hide an in-flight buffer. The
 
 ```
-examples/bug_gallery/shadowed_dma_buffer.phase: error: 'buf' is already declared in fn 'main'; PHASE does not allow shadowing or redeclaration
-examples/bug_gallery/shadowed_dma_buffer.phase: error: entity 'buf' is still owned by @DMA when 'main' returns; sync(buf) before it goes out of scope
+error: 'buf' is already declared in fn 'main'; PHASE does not allow shadowing or redeclaration
+  --> examples/bug_gallery/shadowed_dma_buffer.phase:14:5
+   |
+14 |     buffer<u8, 64> buf @RAM;
+   |                    ^^^
+note: 'buf' is first declared here
+  --> examples/bug_gallery/shadowed_dma_buffer.phase:9:5
+   |
+ 9 |     buffer<u8, 64> buf @RAM;
+   |     ------------------------
+
+error: entity 'buf' is still owned by @DMA when 'main' returns; sync(buf) before it goes out of scope
+  --> examples/bug_gallery/shadowed_dma_buffer.phase:15:1
+   |
+15 | }
+   | ^
+note: 'buf' is moved to @DMA here
+  --> examples/bug_gallery/shadowed_dma_buffer.phase:10:5
+   |
+10 |     move buf -> @DMA;
+   |     -----------------
+
 examples/bug_gallery/shadowed_dma_buffer.phase: 2 errors found
 ```
 
@@ -140,7 +245,17 @@ examples/bug_gallery/shadowed_dma_buffer.phase: 2 errors found
 Bug gallery #5: calling a function that requires one typestate with a
 
 ```
-examples/bug_gallery/skipped_state_transition.phase: error: expected state Decoded, found Received
+error: expected state Decoded, found Received
+  --> examples/bug_gallery/skipped_state_transition.phase:18:5
+   |
+18 |     let p3 = validate(p1);
+   |                       ^^
+note: 'p1' is Packet<Received> from here
+  --> examples/bug_gallery/skipped_state_transition.phase:15:5
+   |
+15 |     let p1 = receive_packet();
+   |     --------------------------
+
 examples/bug_gallery/skipped_state_transition.phase: 1 error found
 ```
 
@@ -149,7 +264,17 @@ examples/bug_gallery/skipped_state_transition.phase: 1 error found
 Bug gallery #9: reusing a typestate value after it has moved on.
 
 ```
-examples/bug_gallery/stale_typestate_reuse.phase: error: value 'p1' was already consumed (passed to 'decode'); cannot use as argument to 'decode'
+error: value 'p1' was already consumed (passed to 'decode'); cannot use as argument to 'decode'
+  --> examples/bug_gallery/stale_typestate_reuse.phase:22:5
+   |
+22 |     let again = decode(p1);
+   |                        ^^
+note: 'p1' is consumed here
+  --> examples/bug_gallery/stale_typestate_reuse.phase:17:5
+   |
+17 |     let p2 = decode(p1);
+   |     --------------------
+
 examples/bug_gallery/stale_typestate_reuse.phase: 1 error found
 ```
 
@@ -158,7 +283,17 @@ examples/bug_gallery/stale_typestate_reuse.phase: 1 error found
 Bug gallery #4: using an entity after it has been destroyed.
 
 ```
-examples/bug_gallery/use_after_destroy.phase: error: entity 'raw' was destroyed; cannot use as argument to 'fir_filter'
+error: entity 'raw' was destroyed; cannot use as argument to 'fir_filter'
+  --> examples/bug_gallery/use_after_destroy.phase:18:5
+   |
+18 |     fir_filter(raw, filtered);
+   |                ^^^
+note: 'raw' is destroyed here
+  --> examples/bug_gallery/use_after_destroy.phase:15:5
+   |
+15 |     destroy raw;
+   |     ------------
+
 examples/bug_gallery/use_after_destroy.phase: 1 error found
 ```
 
@@ -167,7 +302,17 @@ examples/bug_gallery/use_after_destroy.phase: 1 error found
 Bug gallery #13: using a borrow handle after releasing it. After
 
 ```
-examples/bug_gallery/use_after_release.phase: error: borrow 'view' of 'frame' was already released; cannot use as argument to 'inspect'
+error: borrow 'view' of 'frame' was already released; cannot use as argument to 'inspect'
+  --> examples/bug_gallery/use_after_release.phase:14:5
+   |
+14 |     inspect(view);
+   |             ^^^^
+note: 'view' is released here
+  --> examples/bug_gallery/use_after_release.phase:11:5
+   |
+11 |     release view;
+   |     -------------
+
 examples/bug_gallery/use_after_release.phase: 1 error found
 ```
 
@@ -176,8 +321,28 @@ examples/bug_gallery/use_after_release.phase: 1 error found
 Bug gallery #1: reading a @DMA buffer before it has been synced.
 
 ```
-examples/bug_gallery/use_before_sync.phase: error: entity 'raw' is in domain @DMA but 'fir_filter' expects @RAM for this argument
-examples/bug_gallery/use_before_sync.phase: error: entity 'raw' is still owned by @DMA when 'main' returns; sync(raw) before it goes out of scope
+error: entity 'raw' is in domain @DMA but 'fir_filter' expects @RAM for this argument
+  --> examples/bug_gallery/use_before_sync.phase:16:5
+   |
+16 |     fir_filter(raw, filtered);
+   |                ^^^
+note: 'raw' is declared in @DMA here
+  --> examples/bug_gallery/use_before_sync.phase:12:5
+   |
+12 |     buffer<Sample, 1024> raw @DMA;
+   |     ------------------------------
+
+error: entity 'raw' is still owned by @DMA when 'main' returns; sync(raw) before it goes out of scope
+  --> examples/bug_gallery/use_before_sync.phase:17:1
+   |
+17 | }
+   | ^
+note: 'raw' is declared in @DMA here
+  --> examples/bug_gallery/use_before_sync.phase:12:5
+   |
+12 |     buffer<Sample, 1024> raw @DMA;
+   |     ------------------------------
+
 examples/bug_gallery/use_before_sync.phase: 2 errors found
 ```
 
@@ -186,7 +351,17 @@ examples/bug_gallery/use_before_sync.phase: 2 errors found
 Bug gallery #12: bypassing a live write borrow by touching the owner
 
 ```
-examples/bug_gallery/use_owner_while_borrowed.phase: error: entity 'frame' is borrowed by 'view'; it cannot be used directly until that borrow is released
+error: entity 'frame' is borrowed by 'view'; it cannot be used directly until that borrow is released
+  --> examples/bug_gallery/use_owner_while_borrowed.phase:15:5
+   |
+15 |     scramble(frame);
+   |              ^^^^^
+note: 'frame' is borrowed by 'view' here
+  --> examples/bug_gallery/use_owner_while_borrowed.phase:11:5
+   |
+11 |     let view = borrow frame write;
+   |     ------------------------------
+
 examples/bug_gallery/use_owner_while_borrowed.phase: 1 error found
 ```
 
@@ -195,7 +370,12 @@ examples/bug_gallery/use_owner_while_borrowed.phase: 1 error found
 M6: volatile_read/volatile_write require an @MMIO register reference,
 
 ```
-examples/bug_gallery/volatile_wrong_domain.phase: error: 'volatile_read' requires an @MMIO register reference, but 'FAKE_REG' is tagged @RAM
+error: 'volatile_read' requires an @MMIO register reference, but 'FAKE_REG' is tagged @RAM
+ --> examples/bug_gallery/volatile_wrong_domain.phase:8:5
+  |
+8 |     let status: u32 = volatile_read(FAKE_REG @RAM);
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
 examples/bug_gallery/volatile_wrong_domain.phase: 1 error found
 ```
 
@@ -204,7 +384,17 @@ examples/bug_gallery/volatile_wrong_domain.phase: 1 error found
 Bug gallery #3: two exclusive write borrows of the same entity at once.
 
 ```
-examples/bug_gallery/write_borrow_conflict.phase: error: entity 'x' already has an exclusive write borrow
+error: entity 'x' already has an exclusive write borrow
+ --> examples/bug_gallery/write_borrow_conflict.phase:9:5
+  |
+9 |     let b = borrow x write;
+  |                    ^
+note: 'x' is borrowed by 'a' here
+ --> examples/bug_gallery/write_borrow_conflict.phase:6:5
+  |
+6 |     let a = borrow x write;
+  |     -----------------------
+
 examples/bug_gallery/write_borrow_conflict.phase: 1 error found
 ```
 

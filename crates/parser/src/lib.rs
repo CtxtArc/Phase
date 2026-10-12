@@ -35,6 +35,9 @@ pub struct Parser {
     /// used while parsing `if`/`while` conditions, where `{` instead opens
     /// the following block (the same ambiguity Rust resolves the same way).
     restrict_struct_lit: bool,
+    /// Span of the most recently consumed token -- the end of whatever
+    /// construct was just parsed.
+    prev_span: Span,
 }
 
 /// Parse a full PHASE source file into a `Program`.
@@ -49,6 +52,7 @@ impl Parser {
             tokens,
             pos: 0,
             restrict_struct_lit: false,
+            prev_span: Span::default(),
         }
     }
 
@@ -73,6 +77,7 @@ impl Parser {
 
     fn bump(&mut self) -> Token {
         let t = self.tokens[self.pos].clone();
+        self.prev_span = t.span;
         if self.pos + 1 < self.tokens.len() {
             self.pos += 1;
         }
@@ -193,11 +198,17 @@ impl Parser {
         self.expect(TokenKind::LParen)?;
         let mut params = Vec::new();
         while !self.at(&TokenKind::RParen) {
+            let start = self.peek_span();
             let name = self.expect_ident()?;
             self.expect(TokenKind::Colon)?;
             let ty = self.parse_type_expr()?;
             let domain = self.opt_domain()?;
-            params.push(Param { name, ty, domain });
+            params.push(Param {
+                name,
+                ty,
+                domain,
+                span: start.to(self.prev_span),
+            });
             if self.at(&TokenKind::Comma) {
                 self.bump();
             } else {
@@ -219,12 +230,14 @@ impl Parser {
 
     fn parse_fn_decl(&mut self) -> Result<FnDecl, ParseError> {
         self.expect(TokenKind::KwFn)?;
+        let name_span = self.peek_span();
         let name = self.expect_ident()?;
         let params = self.parse_params()?;
         let return_type = self.parse_return_type()?;
         let body = self.parse_block()?;
         Ok(FnDecl {
             name,
+            name_span,
             params,
             return_type,
             body,
@@ -234,12 +247,14 @@ impl Parser {
     fn parse_extern_fn_decl(&mut self) -> Result<ExternFnDecl, ParseError> {
         self.expect(TokenKind::KwExtern)?;
         self.expect(TokenKind::KwFn)?;
+        let name_span = self.peek_span();
         let name = self.expect_ident()?;
         let params = self.parse_params()?;
         let return_type = self.parse_return_type()?;
         self.expect(TokenKind::Semi)?;
         Ok(ExternFnDecl {
             name,
+            name_span,
             params,
             return_type,
         })
@@ -290,10 +305,15 @@ impl Parser {
         self.expect(TokenKind::LBrace)?;
         let mut stmts = Vec::new();
         while !self.at(&TokenKind::RBrace) {
-            stmts.push(self.parse_stmt()?);
+            let start = self.peek_span();
+            let node = self.parse_stmt()?;
+            stmts.push(Spanned {
+                node,
+                span: start.to(self.prev_span),
+            });
         }
-        self.expect(TokenKind::RBrace)?;
-        Ok(Block { stmts })
+        let close = self.expect(TokenKind::RBrace)?.span;
+        Ok(Block { stmts, close })
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
@@ -339,8 +359,13 @@ impl Parser {
         let else_block = if self.at(&TokenKind::KwElse) {
             self.bump();
             if self.at(&TokenKind::KwIf) {
+                let start = self.peek_span();
                 let inner = self.parse_if_stmt()?;
-                Some(Block { stmts: vec![inner] })
+                let span = start.to(self.prev_span);
+                Some(Block {
+                    stmts: vec![Spanned { node: inner, span }],
+                    close: self.prev_span,
+                })
             } else {
                 Some(self.parse_block()?)
             }
@@ -733,7 +758,7 @@ mod tests {
             Item::Fn(f) => {
                 assert_eq!(f.name, "main");
                 assert_eq!(
-                    f.body.stmts[0],
+                    f.body.stmts[0].node,
                     Stmt::VarDecl {
                         name: "s".into(),
                         ty: Some(TypeExpr::Named("Sample".into())),
@@ -754,7 +779,7 @@ mod tests {
         let prog = parse("fn main() { buffer<Sample, 1024> raw @DMA; }").unwrap();
         match &prog.items[0] {
             Item::Fn(f) => assert_eq!(
-                f.body.stmts[0],
+                f.body.stmts[0].node,
                 Stmt::VarDecl {
                     name: "raw".into(),
                     ty: Some(TypeExpr::Buffer {
@@ -783,15 +808,15 @@ mod tests {
         match &prog.items[0] {
             Item::Fn(f) => {
                 assert_eq!(
-                    f.body.stmts[0],
+                    f.body.stmts[0].node,
                     Stmt::Move {
                         name: "raw".into(),
                         to: Domain::Dma
                     }
                 );
-                assert_eq!(f.body.stmts[1], Stmt::Sync { name: "raw".into() });
+                assert_eq!(f.body.stmts[1].node, Stmt::Sync { name: "raw".into() });
                 assert_eq!(
-                    f.body.stmts[2],
+                    f.body.stmts[2].node,
                     Stmt::VarDecl {
                         name: "view".into(),
                         ty: None,
@@ -803,7 +828,7 @@ mod tests {
                     }
                 );
                 assert_eq!(
-                    f.body.stmts[3],
+                    f.body.stmts[3].node,
                     Stmt::Release {
                         name: "view".into()
                     }
@@ -825,7 +850,7 @@ mod tests {
         match &prog.items[0] {
             Item::Fn(f) => {
                 assert_eq!(
-                    f.body.stmts[0],
+                    f.body.stmts[0].node,
                     Stmt::VarDecl {
                         name: "status".into(),
                         ty: Some(TypeExpr::Named("u32".into())),
@@ -840,7 +865,7 @@ mod tests {
                     }
                 );
                 assert_eq!(
-                    f.body.stmts[1],
+                    f.body.stmts[1].node,
                     Stmt::Expr(Expr::Call {
                         callee: "volatile_write".into(),
                         args: vec![
@@ -888,7 +913,7 @@ mod tests {
     fn parses_binary_expressions_with_precedence() {
         let prog = parse("fn main() { let x = 1 + 2 * 3; }").unwrap();
         match &prog.items[0] {
-            Item::Fn(f) => match &f.body.stmts[0] {
+            Item::Fn(f) => match &f.body.stmts[0].node {
                 Stmt::VarDecl { init: Some(e), .. } => {
                     assert_eq!(
                         *e,
@@ -939,7 +964,7 @@ mod tests {
         let src = "fn main() { let p: Packet<Received> = receive(); }";
         let prog = parse(src).unwrap();
         match &prog.items[0] {
-            Item::Fn(f) => match &f.body.stmts[0] {
+            Item::Fn(f) => match &f.body.stmts[0].node {
                 Stmt::VarDecl { ty, .. } => assert_eq!(
                     *ty,
                     Some(TypeExpr::Stateful {
@@ -958,7 +983,7 @@ mod tests {
         let src = "fn main() { if flag { destroy x; } }";
         let prog = parse(src).unwrap();
         match &prog.items[0] {
-            Item::Fn(f) => match &f.body.stmts[0] {
+            Item::Fn(f) => match &f.body.stmts[0].node {
                 Stmt::If {
                     cond,
                     then_block,
@@ -979,7 +1004,7 @@ mod tests {
         let src = "fn main() { if flag { destroy x; } else { destroy y; } }";
         let prog = parse(src).unwrap();
         match &prog.items[0] {
-            Item::Fn(f) => match &f.body.stmts[0] {
+            Item::Fn(f) => match &f.body.stmts[0].node {
                 Stmt::If { else_block, .. } => {
                     let eb = else_block.as_ref().expect("expected else block");
                     assert_eq!(eb.stmts.len(), 1);
@@ -995,11 +1020,11 @@ mod tests {
         let src = "fn main() { if a { destroy x; } else if b { destroy y; } else { destroy z; } }";
         let prog = parse(src).unwrap();
         match &prog.items[0] {
-            Item::Fn(f) => match &f.body.stmts[0] {
+            Item::Fn(f) => match &f.body.stmts[0].node {
                 Stmt::If { else_block, .. } => {
                     let eb = else_block.as_ref().unwrap();
                     assert_eq!(eb.stmts.len(), 1);
-                    match &eb.stmts[0] {
+                    match &eb.stmts[0].node {
                         Stmt::If {
                             cond, else_block, ..
                         } => {
@@ -1020,7 +1045,7 @@ mod tests {
         let src = "fn main() { while flag { destroy x; } }";
         let prog = parse(src).unwrap();
         match &prog.items[0] {
-            Item::Fn(f) => match &f.body.stmts[0] {
+            Item::Fn(f) => match &f.body.stmts[0].node {
                 Stmt::While { cond, body } => {
                     assert_eq!(*cond, Expr::Ident("flag".into()));
                     assert_eq!(body.stmts.len(), 1);
@@ -1038,7 +1063,7 @@ mod tests {
         let src = "fn main() { n = n + 1; }";
         let prog = parse(src).unwrap();
         match &prog.items[0] {
-            Item::Fn(f) => match &f.body.stmts[0] {
+            Item::Fn(f) => match &f.body.stmts[0].node {
                 Stmt::Assign { name, value } => {
                     assert_eq!(name, "n");
                     assert_eq!(
@@ -1061,10 +1086,10 @@ mod tests {
         let src = "fn main() { while n < 5 { n = n + 1; } }";
         let prog = parse(src).unwrap();
         match &prog.items[0] {
-            Item::Fn(f) => match &f.body.stmts[0] {
+            Item::Fn(f) => match &f.body.stmts[0].node {
                 Stmt::While { body, .. } => {
                     assert_eq!(body.stmts.len(), 1);
-                    assert!(matches!(body.stmts[0], Stmt::Assign { .. }));
+                    assert!(matches!(body.stmts[0].node, Stmt::Assign { .. }));
                 }
                 other => panic!("expected while, got {:?}", other),
             },
@@ -1079,7 +1104,10 @@ mod tests {
         let src = "extern fn tick(); fn main() { tick(); }";
         let prog = parse(src).unwrap();
         match &prog.items[1] {
-            Item::Fn(f) => assert!(matches!(f.body.stmts[0], Stmt::Expr(Expr::Call { .. }))),
+            Item::Fn(f) => assert!(matches!(
+                f.body.stmts[0].node,
+                Stmt::Expr(Expr::Call { .. })
+            )),
             other => panic!("expected fn, got {:?}", other),
         }
     }
@@ -1105,7 +1133,7 @@ mod tests {
         let src = "fn main() { let s = Sample { value: 1.0 }; }";
         let prog = parse(src).unwrap();
         match &prog.items[0] {
-            Item::Fn(f) => match &f.body.stmts[0] {
+            Item::Fn(f) => match &f.body.stmts[0].node {
                 Stmt::VarDecl {
                     init: Some(Expr::StructLit { name, .. }),
                     ..

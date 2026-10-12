@@ -87,7 +87,7 @@ fn radio_pipeline_main_body_statement_sequence() {
         .body
         .stmts
         .iter()
-        .map(|s| match s {
+        .map(|s| match &s.node {
             Stmt::VarDecl { .. } => "VarDecl",
             Stmt::Move { .. } => "Move",
             Stmt::Sync { .. } => "Sync",

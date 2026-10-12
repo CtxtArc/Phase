@@ -2,6 +2,53 @@
 //! machines, functions and `extern fn` signatures, and the statement and
 //! expression forms (including `if`/`while` and scalar assignment).
 
+/// A region of source text: from `(line, col)` up to, but not including,
+/// `(end_line, end_col)`. Lines and columns are 1-based and count chars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct Span {
+    pub line: u32,
+    pub col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+}
+
+impl Span {
+    /// The smallest span covering both `self` and `other`.
+    pub fn to(self, other: Span) -> Span {
+        let (start, _) = if (self.line, self.col) <= (other.line, other.col) {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        let end = if (self.end_line, self.end_col) >= (other.end_line, other.end_col) {
+            self
+        } else {
+            other
+        };
+        Span {
+            line: start.line,
+            col: start.col,
+            end_line: end.end_line,
+            end_col: end.end_col,
+        }
+    }
+}
+
+/// A syntax node paired with the source span it was parsed from. Derefs to
+/// the node, so most code can use it as if it were the node itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spanned<T> {
+    pub node: T,
+    pub span: Span,
+}
+
+impl<T> std::ops::Deref for Spanned<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.node
+    }
+}
+
 /// The five physical domains (spec §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Domain {
@@ -86,6 +133,7 @@ pub struct Param {
     pub name: String,
     pub ty: TypeExpr,
     pub domain: Option<Domain>,
+    pub span: Span,
 }
 
 /// `entity Sample : @RAM { value: f32 }`
@@ -108,6 +156,8 @@ pub struct StateDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
     pub name: String,
+    /// Span of the function's name in `fn name(..)`.
+    pub name_span: Span,
     pub params: Vec<Param>,
     pub return_type: Option<TypeExpr>,
     pub body: Block,
@@ -118,6 +168,8 @@ pub struct FnDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternFnDecl {
     pub name: String,
+    /// Span of the function's name in `extern fn name(..)`.
+    pub name_span: Span,
     pub params: Vec<Param>,
     pub return_type: Option<TypeExpr>,
 }
@@ -132,7 +184,10 @@ pub enum Item {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
-    pub stmts: Vec<Stmt>,
+    pub stmts: Vec<Spanned<Stmt>>,
+    /// Span of the closing `}` -- where falling off the end of a function
+    /// body is reported.
+    pub close: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
