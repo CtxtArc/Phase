@@ -540,6 +540,7 @@ mod tests {
             fn main() {
                 buffer<u8, 4> x @RAM;
                 move x -> @DMA;
+                sync(x);
             }
         "#;
         let g = generate_src(src, "t");

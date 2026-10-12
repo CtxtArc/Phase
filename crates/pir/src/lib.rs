@@ -857,6 +857,7 @@ mod tests {
             extern fn tick();
             extern fn tock();
             fn main() {
+                let flag: bool = true;
                 if flag {
                     tick();
                 } else {
@@ -866,7 +867,7 @@ mod tests {
         "#;
         let pir = build_src(src).unwrap();
         assert_eq!(
-            pir.fns[0].body[0],
+            pir.fns[0].body[1],
             PirInst::If {
                 cond: PirExpr::Ident("flag".into()),
                 then_body: vec![PirInst::Call {
@@ -886,6 +887,7 @@ mod tests {
         let src = r#"
             extern fn tick();
             fn main() {
+                let flag: bool = true;
                 if flag {
                     tick();
                 }
@@ -893,7 +895,7 @@ mod tests {
         "#;
         let pir = build_src(src).unwrap();
         assert_eq!(
-            pir.fns[0].body[0],
+            pir.fns[0].body[1],
             PirInst::If {
                 cond: PirExpr::Ident("flag".into()),
                 then_body: vec![PirInst::Call {
