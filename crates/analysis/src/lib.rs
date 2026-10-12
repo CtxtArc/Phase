@@ -899,8 +899,12 @@ impl<'a> FnChecker<'a> {
                 .get(name)
                 .expect("pre-existing local must survive both branches");
 
+            // `None` on one side while the other is known means an earlier
+            // error already poisoned that path; don't report it again.
             let domain = if a.domain == b.domain {
                 a.domain
+            } else if a.domain.is_none() || b.domain.is_none() {
+                None
             } else {
                 errors.push(err(format!(
                     "entity '{name}' disagrees on domain across incoming branches (@{} vs @{}){loop_note}",
@@ -912,6 +916,8 @@ impl<'a> FnChecker<'a> {
 
             let typestate = if a.typestate == b.typestate {
                 a.typestate.clone()
+            } else if a.typestate.is_none() || b.typestate.is_none() {
+                None
             } else {
                 errors.push(err(format!(
                     "entity '{name}' disagrees on typestate across incoming branches{loop_note}"
@@ -2743,6 +2749,15 @@ mod soundness_tests {
             "fn main() { } fn main() { }",
             "function 'main' is declared more than once",
         );
+    }
+
+    #[test]
+    fn nested_branch_error_does_not_cascade_to_the_outer_join() {
+        let errs = check(&with_buf(
+            "fn main() { let f: bool = get_flag(); let g: bool = get_flag(); buffer<u8, 16> x @RAM; if f { peek(x); } else { if g { move x -> @DMA; } else { peek(x); } } }",
+        ))
+        .unwrap_err();
+        assert_eq!(errs.len(), 1, "{errs:?}");
     }
 
     #[test]

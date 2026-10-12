@@ -102,7 +102,9 @@ fn generate_header(program: &PirProgram, stem: &str) -> String {
 
     if !program.mmio_registers.is_empty() {
         out.push_str("/* --- simulated MMIO registers (M6) ---\n");
-        out.push_str(" * The host simulation has no real memory-mapped hardware, so each register\n");
+        out.push_str(
+            " * The host simulation has no real memory-mapped hardware, so each register\n",
+        );
         out.push_str(" * name used with `volatile_read`/`volatile_write` becomes one `volatile`\n");
         out.push_str(" * global. `volatile` is what makes the compiler's own \"never reordered\n");
         out.push_str(" * or eliminated\" guarantee (spec bug-gallery #7) real rather than a\n");
