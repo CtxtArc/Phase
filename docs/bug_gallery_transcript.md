@@ -72,7 +72,7 @@ Bug gallery #14: passing the same buffer as both input and output of a
 
 ```
 error: entity 'samples' is passed to 'fir_filter' more than once; aliased arguments are only allowed through read borrows
-  --> examples/bug_gallery/aliased_arguments.phase:12:5
+  --> examples/bug_gallery/aliased_arguments.phase:12:16
    |
 12 |     fir_filter(samples, samples);
    |                ^^^^^^^
@@ -86,7 +86,7 @@ Bug gallery #15: taking a borrow as a back door around sync(). A
 
 ```
 error: entity 'raw' is owned by @DMA; sync(raw) before borrowing it
-  --> examples/bug_gallery/borrow_unsynced_dma.phase:12:5
+  --> examples/bug_gallery/borrow_unsynced_dma.phase:12:23
    |
 12 |     let peek = borrow raw read;
    |                       ^^^
@@ -148,7 +148,7 @@ Bug gallery #10: freeing a buffer while the DMA engine still owns it.
 
 ```
 error: entity 'rx' is still owned by @DMA; sync(rx) before destroying it
-  --> examples/bug_gallery/destroy_while_dma.phase:14:5
+  --> examples/bug_gallery/destroy_while_dma.phase:14:13
    |
 14 |     destroy rx;
    |             ^^
@@ -197,13 +197,13 @@ Bug gallery #8: claiming a typestate with an annotation instead of
 
 ```
 error: 'p' is declared as Packet<Validated> but 'receive_packet' returns Packet<Received>
-  --> examples/bug_gallery/forged_typestate.phase:16:5
+  --> examples/bug_gallery/forged_typestate.phase:16:9
    |
 16 |     let p: Packet<Validated> = receive_packet();
    |         ^
 
 error: expected state Validated, found Received
-  --> examples/bug_gallery/forged_typestate.phase:17:5
+  --> examples/bug_gallery/forged_typestate.phase:17:12
    |
 17 |     handle(p);
    |            ^
@@ -236,7 +236,7 @@ Bug gallery #2: moving an entity while a borrow of it is still live.
 
 ```
 error: entity 'x' has a live borrow; cannot move
- --> examples/bug_gallery/move_while_borrowed.phase:9:5
+ --> examples/bug_gallery/move_while_borrowed.phase:9:10
   |
 9 |     move x -> @DMA;
   |          ^
@@ -255,7 +255,7 @@ Bug gallery #19: reading a buffer between the call that starts its DMA
 
 ```
 error: entity 'frame' is in domain @DMA but 'report' expects @RAM for this argument
-  --> examples/bug_gallery/read_while_capture_in_flight.phase:19:5
+  --> examples/bug_gallery/read_while_capture_in_flight.phase:19:12
    |
 19 |     report(frame);
    |            ^^^^^
@@ -274,7 +274,7 @@ Bug gallery #16: redeclaring a name to hide an in-flight buffer. The
 
 ```
 error: 'buf' is already declared in fn 'main'; PHASE does not allow shadowing or redeclaration
-  --> examples/bug_gallery/shadowed_dma_buffer.phase:14:5
+  --> examples/bug_gallery/shadowed_dma_buffer.phase:14:20
    |
 14 |     buffer<u8, 64> buf @RAM;
    |                    ^^^
@@ -304,7 +304,7 @@ Bug gallery #5: calling a function that requires one typestate with a
 
 ```
 error: expected state Decoded, found Received
-  --> examples/bug_gallery/skipped_state_transition.phase:18:5
+  --> examples/bug_gallery/skipped_state_transition.phase:18:23
    |
 18 |     let p3 = validate(p1);
    |                       ^^
@@ -323,7 +323,7 @@ Bug gallery #9: reusing a typestate value after it has moved on.
 
 ```
 error: value 'p1' was already consumed (passed to 'decode'); cannot use as argument to 'decode'
-  --> examples/bug_gallery/stale_typestate_reuse.phase:22:5
+  --> examples/bug_gallery/stale_typestate_reuse.phase:22:24
    |
 22 |     let again = decode(p1);
    |                        ^^
@@ -342,7 +342,7 @@ Bug gallery #4: using an entity after it has been destroyed.
 
 ```
 error: entity 'raw' was destroyed; cannot use as argument to 'fir_filter'
-  --> examples/bug_gallery/use_after_destroy.phase:18:5
+  --> examples/bug_gallery/use_after_destroy.phase:18:16
    |
 18 |     fir_filter(raw, filtered);
    |                ^^^
@@ -361,7 +361,7 @@ Bug gallery #13: using a borrow handle after releasing it. After
 
 ```
 error: borrow 'view' of 'frame' was already released; cannot use as argument to 'inspect'
-  --> examples/bug_gallery/use_after_release.phase:14:5
+  --> examples/bug_gallery/use_after_release.phase:14:13
    |
 14 |     inspect(view);
    |             ^^^^
@@ -380,7 +380,7 @@ Bug gallery #1: reading a @DMA buffer before it has been synced.
 
 ```
 error: entity 'raw' is in domain @DMA but 'fir_filter' expects @RAM for this argument
-  --> examples/bug_gallery/use_before_sync.phase:16:5
+  --> examples/bug_gallery/use_before_sync.phase:16:16
    |
 16 |     fir_filter(raw, filtered);
    |                ^^^
@@ -410,7 +410,7 @@ Bug gallery #12: bypassing a live write borrow by touching the owner
 
 ```
 error: entity 'frame' is borrowed by 'view'; it cannot be used directly until that borrow is released
-  --> examples/bug_gallery/use_owner_while_borrowed.phase:15:5
+  --> examples/bug_gallery/use_owner_while_borrowed.phase:15:14
    |
 15 |     scramble(frame);
    |              ^^^^^
@@ -443,7 +443,7 @@ Bug gallery #3: two exclusive write borrows of the same entity at once.
 
 ```
 error: entity 'x' already has an exclusive write borrow
- --> examples/bug_gallery/write_borrow_conflict.phase:9:5
+ --> examples/bug_gallery/write_borrow_conflict.phase:9:20
   |
 9 |     let b = borrow x write;
   |                    ^

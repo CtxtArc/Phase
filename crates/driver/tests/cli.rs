@@ -113,7 +113,7 @@ fn human_errors_show_the_source_line_and_notes() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("stale_typestate_reuse.phase:22:5"), "{err}");
+    assert!(err.contains("stale_typestate_reuse.phase:22:24"), "{err}");
     assert!(err.contains("22 |     let again = decode(p1);"), "{err}");
     assert!(err.contains("   |                        ^^\n"), "{err}");
     assert!(err.contains("note: 'p1' is consumed here"), "{err}");
@@ -135,7 +135,7 @@ fn short_errors_are_one_line_each() {
     let first = err.lines().next().unwrap();
     assert!(
         first.ends_with(
-            "destroy_while_dma.phase:14:5: error: entity 'rx' is still owned by @DMA; sync(rx) before destroying it"
+            "destroy_while_dma.phase:14:13: error: entity 'rx' is still owned by @DMA; sync(rx) before destroying it"
         ),
         "{err}"
     );

@@ -93,15 +93,30 @@ pub fn render(
     color: bool,
 ) -> String {
     match format {
-        ErrorFormat::Short => render_short(diag, path),
+        ErrorFormat::Short => render_short(diag, path, src),
         ErrorFormat::Human => render_human(diag, path, src, &Style { on: color }),
     }
 }
 
-fn render_short(diag: &Diagnostic, path: &str) -> String {
+/// The column a location should be reported at: where the underline
+/// starts (the subject's name, when it was found in the span).
+fn reported_col(span: Span, src: &str, subject: Option<&str>) -> usize {
+    match src.lines().nth(span.line.saturating_sub(1) as usize) {
+        Some(line) => underline_range(span, line, subject).0,
+        None => span.col as usize,
+    }
+}
+
+fn render_short(diag: &Diagnostic, path: &str, src: &str) -> String {
     let mut out = String::new();
     match diag.span {
-        Some(s) => writeln!(out, "{path}:{}:{}: error: {}", s.line, s.col, diag.message),
+        Some(s) => writeln!(
+            out,
+            "{path}:{}:{}: error: {}",
+            s.line,
+            reported_col(s, src, diag.subject.as_deref()),
+            diag.message
+        ),
         None => writeln!(out, "{path}: error: {}", diag.message),
     }
     .unwrap();
@@ -206,18 +221,13 @@ fn snippet(
     primary: bool,
 ) {
     let blank = st.gutter(&format!("{:>width$} |", ""));
-    writeln!(
-        out,
-        "{} {path}:{}:{}",
-        st.gutter(&format!("{:>width$}-->", "")),
-        span.line,
-        span.col
-    )
-    .unwrap();
+    let arrow = st.gutter(&format!("{:>width$}-->", ""));
     let Some(line) = lines.get(span.line.saturating_sub(1) as usize) else {
+        writeln!(out, "{arrow} {path}:{}:{}", span.line, span.col).unwrap();
         return;
     };
     let (start, end) = underline_range(span, line, subject);
+    writeln!(out, "{arrow} {path}:{}:{start}", span.line).unwrap();
     // Reuse the line's own tabs so the underline stays aligned.
     let pad: String = line
         .chars()
@@ -275,7 +285,7 @@ mod tests {
         );
         let expected = "\
 error: entity 'raw' is in domain @DMA
- --> t.phase:2:5
+ --> t.phase:2:16
   |
 2 |     fir_filter(raw, filtered);
   |                ^^^
@@ -314,7 +324,7 @@ note: declared here
         );
         assert_eq!(
             out,
-            "t.phase:2:5: error: entity 'raw' is in domain @DMA\nt.phase:1:1: note: declared here\n"
+            "t.phase:2:16: error: entity 'raw' is in domain @DMA\nt.phase:1:1: note: declared here\n"
         );
     }
 
