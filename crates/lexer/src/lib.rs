@@ -417,8 +417,8 @@ mod tests {
     #[test]
     fn integer_and_float_literals() {
         assert_eq!(
-            kinds("1024 0.0 3.14 42"),
-            vec![Int(1024), Float(0.0), Float(3.14), Int(42), Eof]
+            kinds("1024 0.0 2.75 42"),
+            vec![Int(1024), Float(0.0), Float(2.75), Int(42), Eof]
         );
     }
 

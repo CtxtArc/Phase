@@ -1,22 +1,34 @@
-//! PHASE M2/M3: the domain/ownership/borrow analyzer, plus typestate.
+//! The PHASE safety analyzer: physical domains, ownership and borrows,
+//! typestate, control-flow merging, and MMIO access rules.
 //!
-//! Scope (matches the roadmap in phase_specification.md): straight-line
-//! function bodies only — the AST has no `if`/`while` yet, so control flow
-//! and `ENTITY_PHI` merging (M4) simply don't arise here.
+//! [`analyze`] checks every function body independently against the
+//! signatures of every function in the program. It never stops at the
+//! first error: an erroring statement is treated as a no-op and checking
+//! continues, so one mistake does not cascade into unrelated errors.
 //!
-//! M2 covers bug-gallery items #1-#4:
-//!   1. use of a `@DMA`/`@DEVICE`-domain entity where a different domain
-//!      was required, without an intervening `sync`
-//!   2. `move`/`sync`/`destroy` while a borrow is live
-//!   3. conflicting borrows (two writers, or a writer alongside readers)
-//!   4. use of a destroyed entity
-//! plus the domain-transition-table check from spec §2.4.
+//! What is enforced (spec Part 4):
 //!
-//! M3 adds bug-gallery item #5: typestate checking. A `state` declaration
-//! (spec §3.8) defines a named machine and its states; a value's type can
-//! be parameterized by state (`Packet<Received>`), and calling a function
-//! that requires one state with a value proven to be in a different state
-//! is a compile error, the same way a domain mismatch is.
+//! * **Domains** -- an entity is only accepted where its *current* domain
+//!   matches the parameter's; `move`/`sync` follow the transition table
+//!   (spec 2.4); `@DMA`/`@DEVICE`-owned entities cannot be borrowed,
+//!   destroyed, or have their fields read until synced.
+//! * **Ownership and borrows** -- many readers or one writer; the owner
+//!   cannot be used, moved, synced or destroyed while borrowed; released
+//!   handles are dead; the same storage may appear twice in one call only
+//!   through read borrows; entities cannot be copied with `let`.
+//! * **Lifetimes** -- no use after `destroy`; at every `return` (explicit
+//!   or implicit) no local may still be hardware-owned, no borrow may be
+//!   live, and parameters must be back in their entry domain.
+//! * **Typestate** -- a value's state comes only from a function's
+//!   declared return state (or the initial state, for a fresh value); an
+//!   annotation is checked against that, never trusted. Values are linear:
+//!   passing one to a state-requiring parameter consumes it.
+//! * **Control flow** -- each `if` arm starts from the same state and
+//!   pre-existing entities must agree at the join (arms that `return` do
+//!   not reach it); a `while` body must leave every entity as it found it,
+//!   which makes a single pass a sound loop invariant.
+//! * **MMIO** -- `volatile_read`/`volatile_write` take an `@MMIO` register
+//!   reference as their first argument.
 
 use phase_ast::{BorrowMode, Domain, Expr, FnDecl, Item, Program, Stmt, TypeExpr};
 use std::collections::{HashMap, HashSet};
@@ -1108,13 +1120,13 @@ impl<'a> FnChecker<'a> {
             Some(format!(
                 "'{target}' is itself a borrow of '{owner}'; borrow '{owner}' directly instead"
             ))
-        } else if let Some(d) = target_var.domain.filter(|d| is_device_owned(*d)) {
-            Some(format!(
-                "entity '{target}' is owned by @{}; sync({target}) before borrowing it",
-                d.name()
-            ))
         } else {
-            None
+            target_var.domain.filter(|d| is_device_owned(*d)).map(|d| {
+                format!(
+                    "entity '{target}' is owned by @{}; sync({target}) before borrowing it",
+                    d.name()
+                )
+            })
         };
         if let Some(msg) = rejection {
             errors.push(err(msg));
