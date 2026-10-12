@@ -188,6 +188,11 @@ pub enum PirInst {
     EntityRelease {
         name: String,
     },
+    /// `swap a, b;` -- exchange which storage the two buffer names refer to.
+    Swap {
+        a: String,
+        b: String,
+    },
     EntityDestroy {
         name: String,
     },
@@ -547,6 +552,22 @@ impl<'a> Lowerer<'a> {
                 Ok(())
             }
 
+            Stmt::Swap { a, b } => {
+                let da = self.domains.remove(a);
+                let db = self.domains.remove(b);
+                if let Some(d) = db {
+                    self.domains.insert(a.clone(), d);
+                }
+                if let Some(d) = da {
+                    self.domains.insert(b.clone(), d);
+                }
+                out.push(PirInst::Swap {
+                    a: a.clone(),
+                    b: b.clone(),
+                });
+                Ok(())
+            }
+
             Stmt::Expr(e) => self.lower_expr_stmt(e, out),
 
             Stmt::Return(value) => {
@@ -806,6 +827,26 @@ fn lower_literal(e: &Expr, context: &str) -> Result<PirLiteral, PirError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_exchanges_domain_bookkeeping() {
+        // After `swap a, b`, `a` is the one that was moved to @DMA, so
+        // `sync(a)` is a DMA wait and `b` needs none.
+        let src = r#"
+            fn main() {
+                buffer<u8, 4> a @RAM;
+                buffer<u8, 4> b @RAM;
+                move b -> @DMA;
+                swap a, b;
+                sync(a);
+            }
+        "#;
+        let pir = build(&phase_parser::parse(src).unwrap()).unwrap();
+        assert!(pir.fns[0].body.iter().any(|i| matches!(
+            i,
+            PirInst::EntitySync { name, from: Domain::Dma } if name == "a"
+        )));
+    }
 
     #[test]
     fn sync_after_a_domain_changing_call_waits_on_the_right_transfer() {

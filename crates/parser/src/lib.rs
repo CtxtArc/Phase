@@ -354,6 +354,7 @@ impl Parser {
             TokenKind::KwSync => self.parse_sync_stmt(),
             TokenKind::KwRelease => self.parse_release_stmt(),
             TokenKind::KwDestroy => self.parse_destroy_stmt(),
+            TokenKind::KwSwap => self.parse_swap_stmt(),
             TokenKind::KwReturn => self.parse_return_stmt(),
             TokenKind::KwIf => self.parse_if_stmt(),
             TokenKind::KwWhile => self.parse_while_stmt(),
@@ -484,6 +485,16 @@ impl Parser {
         let name = self.expect_ident()?;
         self.expect(TokenKind::Semi)?;
         Ok(Stmt::Release { name })
+    }
+
+    /// `swap a, b;`
+    fn parse_swap_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(TokenKind::KwSwap)?;
+        let a = self.expect_ident()?;
+        self.expect(TokenKind::Comma)?;
+        let b = self.expect_ident()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(Stmt::Swap { a, b })
     }
 
     fn parse_destroy_stmt(&mut self) -> Result<Stmt, ParseError> {
@@ -722,6 +733,21 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_statement_is_parsed() {
+        let p = parse("fn main() { swap ping, pong; }").unwrap();
+        let Item::Fn(f) = &p.items[0] else {
+            panic!("expected fn")
+        };
+        assert_eq!(
+            f.body.stmts[0].node,
+            Stmt::Swap {
+                a: "ping".into(),
+                b: "pong".into()
+            }
+        );
+    }
 
     #[test]
     fn parameter_access_modes_are_parsed() {

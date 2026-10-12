@@ -52,6 +52,12 @@ OK: examples/overlapped_capture.phase parsed and passed domain/ownership analysi
 OK: examples/packet_pipeline.phase parsed and passed domain/ownership analysis (0 entities, 1 fn)
 ```
 
+### `examples/ping_pong.phase`
+
+```
+OK: examples/ping_pong.phase parsed and passed domain/ownership analysis (1 entity, 2 fns)
+```
+
 ### `examples/radio_pipeline.phase`
 
 ```
@@ -249,6 +255,46 @@ note: 'x' is borrowed by 'view' here
 examples/bug_gallery/move_while_borrowed.phase: 1 error found
 ```
 
+### `examples/bug_gallery/ping_pong_without_swap.phase`
+
+Bug gallery #23: double buffering without trading places. After the
+
+```
+error: entity 'ping' is @RAM at the end of the `while` body but @DMA when the loop is entered; a `while` body must leave every entity exactly as it found it
+  --> examples/bug_gallery/ping_pong_without_swap.phase:20:5
+   |
+20 |     while n < 6 {
+   |     ^^^^^^^^^^^^^
+note: 'ping' is synced back to @RAM by 'wait_capture' here
+  --> examples/bug_gallery/ping_pong_without_swap.phase:21:9
+   |
+21 |         wait_capture(ping);
+   |         -------------------
+note: 'ping' is moved to @DMA by 'start_capture' here
+  --> examples/bug_gallery/ping_pong_without_swap.phase:19:5
+   |
+19 |     start_capture(ping);
+   |     --------------------
+
+error: entity 'pong' is @DMA at the end of the `while` body but @RAM when the loop is entered; a `while` body must leave every entity exactly as it found it
+  --> examples/bug_gallery/ping_pong_without_swap.phase:20:5
+   |
+20 |     while n < 6 {
+   |     ^^^^^^^^^^^^^
+note: 'pong' is moved to @DMA by 'start_capture' here
+  --> examples/bug_gallery/ping_pong_without_swap.phase:22:9
+   |
+22 |         start_capture(pong);
+   |         --------------------
+note: 'pong' is declared in @RAM here
+  --> examples/bug_gallery/ping_pong_without_swap.phase:16:5
+   |
+16 |     buffer<f32, 128> pong @RAM;
+   |     ---------------------------
+
+examples/bug_gallery/ping_pong_without_swap.phase: 2 errors found
+```
+
 ### `examples/bug_gallery/read_param_handed_to_writer.phase`
 
 Bug gallery #21: a helper that promises (`read`) not to modify its
@@ -285,6 +331,57 @@ note: 'frame' is moved to @DMA by 'start_capture' here
    |     ---------------------
 
 examples/bug_gallery/read_while_capture_in_flight.phase: 1 error found
+```
+
+### `examples/bug_gallery/refill_while_processing.phase`
+
+Bug gallery #22: the classic ping-pong mistake -- restarting the DMA
+
+```
+error: entity 'ping' is in domain @DMA but 'process' expects @RAM for this argument
+  --> examples/bug_gallery/refill_while_processing.phase:23:17
+   |
+23 |         process(ping);
+   |                 ^^^^
+note: 'ping' is moved to @DMA by 'start_capture' here
+  --> examples/bug_gallery/refill_while_processing.phase:22:9
+   |
+22 |         start_capture(ping);
+   |         --------------------
+
+error: entity 'ping' is @RAM at the end of the `while` body but @DMA when the loop is entered; a `while` body must leave every entity exactly as it found it
+  --> examples/bug_gallery/refill_while_processing.phase:19:5
+   |
+19 |     while n < 6 {
+   |     ^^^^^^^^^^^^^
+note: 'ping' is @RAM after `swap ping, pong` here
+  --> examples/bug_gallery/refill_while_processing.phase:24:9
+   |
+24 |         swap ping, pong;
+   |         ----------------
+note: 'ping' is moved to @DMA by 'start_capture' here
+  --> examples/bug_gallery/refill_while_processing.phase:18:5
+   |
+18 |     start_capture(ping);
+   |     --------------------
+
+error: entity 'pong' is @DMA at the end of the `while` body but @RAM when the loop is entered; a `while` body must leave every entity exactly as it found it
+  --> examples/bug_gallery/refill_while_processing.phase:19:5
+   |
+19 |     while n < 6 {
+   |     ^^^^^^^^^^^^^
+note: 'pong' is @DMA after `swap ping, pong` here
+  --> examples/bug_gallery/refill_while_processing.phase:24:9
+   |
+24 |         swap ping, pong;
+   |         ----------------
+note: 'pong' is declared in @RAM here
+  --> examples/bug_gallery/refill_while_processing.phase:15:5
+   |
+15 |     buffer<f32, 128> pong @RAM;
+   |     ---------------------------
+
+examples/bug_gallery/refill_while_processing.phase: 3 errors found
 ```
 
 ### `examples/bug_gallery/shadowed_dma_buffer.phase`
@@ -353,6 +450,25 @@ note: 'p1' is consumed here
    |     --------------------
 
 examples/bug_gallery/stale_typestate_reuse.phase: 1 error found
+```
+
+### `examples/bug_gallery/swap_while_borrowed.phase`
+
+Bug gallery #24: swapping a buffer while a borrow of it is live. After
+
+```
+error: entity 'ping' has a live borrow; cannot swap
+  --> examples/bug_gallery/swap_while_borrowed.phase:15:10
+   |
+15 |     swap ping, pong;
+   |          ^^^^
+note: 'ping' is borrowed by 'view' here
+  --> examples/bug_gallery/swap_while_borrowed.phase:13:5
+   |
+13 |     let view = borrow ping read;
+   |     ----------------------------
+
+examples/bug_gallery/swap_while_borrowed.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/use_after_destroy.phase`

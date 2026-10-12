@@ -217,6 +217,10 @@ pub enum Stmt {
     Release { name: String },
     /// `destroy x;`
     Destroy { name: String },
+    /// `swap a, b;` (v1.2) -- exchange the storage two buffer names refer
+    /// to, along with everything known about it (domain, history). The
+    /// building block for ping-pong double buffering.
+    Swap { a: String, b: String },
     /// A bare expression statement, e.g. a function call: `fir_filter(a, b);`
     Expr(Expr),
     /// `return expr?;`

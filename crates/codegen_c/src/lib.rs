@@ -28,7 +28,7 @@ use phase_ast::{BinOp, BorrowMode, Domain};
 use phase_pir::{
     CallArg, PirEntityDef, PirExpr, PirFn, PirFnSig, PirInst, PirLiteral, PirProgram, PirType,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct Generated {
     pub header: String,
@@ -217,8 +217,9 @@ fn format_fn(f: &PirFn, sigs: &HashMap<&str, &PirFnSig>) -> String {
     for (pname, pty) in &f.sig.params {
         locals.insert(pname.clone(), pty.clone());
     }
+    let swapped = swapped_buffers(&f.body);
     for inst in &f.body {
-        out.push_str(&format_inst(inst, sigs, &mut locals, 1));
+        out.push_str(&format_inst(inst, sigs, &mut locals, &swapped, 1));
     }
     if is_main {
         out.push_str("    return 0;\n");
@@ -227,17 +228,62 @@ fn format_fn(f: &PirFn, sigs: &HashMap<&str, &PirFnSig>) -> String {
     out
 }
 
+/// Every buffer named in a `swap` anywhere in `body`. These are emitted as
+/// a storage array plus a pointer to it, so a swap exchanges pointers
+/// instead of copying contents.
+fn swapped_buffers(body: &[PirInst]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for inst in body {
+        match inst {
+            PirInst::Swap { a, b } => {
+                out.insert(a.clone());
+                out.insert(b.clone());
+            }
+            PirInst::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                out.extend(swapped_buffers(then_body));
+                out.extend(swapped_buffers(else_body));
+            }
+            PirInst::While { body, .. } => out.extend(swapped_buffers(body)),
+            _ => {}
+        }
+    }
+    out
+}
+
 fn format_inst(
     inst: &PirInst,
     sigs: &HashMap<&str, &PirFnSig>,
     locals: &mut HashMap<String, PirType>,
+    swapped: &HashSet<String>,
     indent: usize,
 ) -> String {
     let pad = "    ".repeat(indent);
     match inst {
         PirInst::EntityCreate { name, ty, .. } => {
             locals.insert(name.clone(), ty.clone());
-            format!("{pad}{};\n", declare(name, ty))
+            match ty {
+                PirType::Buffer { elem, len } if swapped.contains(name) => {
+                    let elem = type_name(elem);
+                    format!(
+                        "{pad}{elem} {name}__storage[{len}];\n{pad}{elem}* {name} = {name}__storage; /* swappable: see `swap` */\n"
+                    )
+                }
+                _ => format!("{pad}{};\n", declare(name, ty)),
+            }
+        }
+
+        PirInst::Swap { a, b } => {
+            let elem = match locals.get(a) {
+                Some(PirType::Buffer { elem, .. }) => type_name(elem),
+                _ => "void".to_string(),
+            };
+            format!(
+                "{pad}{{ /* swap {a}, {b} */ {elem}* phase_swap_tmp = {a}; {a} = {b}; {b} = phase_swap_tmp; }}\n"
+            )
         }
 
         PirInst::EntityCreateWithFields {
@@ -366,14 +412,14 @@ fn format_inst(
         } => {
             let mut s = format!("{pad}if ({}) {{\n", format_pir_expr(cond));
             for inst in then_body {
-                s.push_str(&format_inst(inst, sigs, locals, indent + 1));
+                s.push_str(&format_inst(inst, sigs, locals, swapped, indent + 1));
             }
             if else_body.is_empty() {
                 s.push_str(&format!("{pad}}}\n"));
             } else {
                 s.push_str(&format!("{pad}}} else {{\n"));
                 for inst in else_body {
-                    s.push_str(&format_inst(inst, sigs, locals, indent + 1));
+                    s.push_str(&format_inst(inst, sigs, locals, swapped, indent + 1));
                 }
                 s.push_str(&format!("{pad}}}\n"));
             }
@@ -383,7 +429,7 @@ fn format_inst(
         PirInst::While { cond, body } => {
             let mut s = format!("{pad}while ({}) {{\n", format_pir_expr(cond));
             for inst in body {
-                s.push_str(&format_inst(inst, sigs, locals, indent + 1));
+                s.push_str(&format_inst(inst, sigs, locals, swapped, indent + 1));
             }
             s.push_str(&format!("{pad}}}\n"));
             s
@@ -480,6 +526,34 @@ fn format_literal(lit: &PirLiteral) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swapped_buffers_are_pointer_backed_and_swap_exchanges_pointers() {
+        let src = r#"
+            fn main() {
+                buffer<u16, 4> a @RAM;
+                buffer<u16, 4> b @RAM;
+                buffer<u16, 4> c @RAM;
+                swap a, b;
+            }
+        "#;
+        let g = generate_src(src, "t");
+        assert!(
+            g.source
+                .contains("uint16_t a__storage[4];\n    uint16_t* a = a__storage;"),
+            "{}",
+            g.source
+        );
+        assert!(g.source.contains("uint16_t b__storage[4];"), "{}", g.source);
+        // A buffer that is never swapped stays a plain array.
+        assert!(g.source.contains("uint16_t c[4];"), "{}", g.source);
+        assert!(
+            g.source
+                .contains("uint16_t* phase_swap_tmp = a; a = b; b = phase_swap_tmp;"),
+            "{}",
+            g.source
+        );
+    }
 
     #[test]
     fn read_buffer_parameters_are_const_pointers() {

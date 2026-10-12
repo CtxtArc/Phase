@@ -1,0 +1,28 @@
+// Bug gallery #23: double buffering without trading places. After the
+// first iteration the roles no longer match the code: the loop waits on
+// `ping`, which is idle, while `pong` is still being filled -- and the next
+// start_capture(pong) reprograms a transfer that is already running.
+// Expected: "entity 'ping' is @RAM at the end of the `while` body but @DMA when the loop is entered"
+
+extern fn start_capture(dst: write buffer<f32, 128> @RAM -> @DMA);
+extern fn process(frame: read buffer<f32, 128> @RAM);
+
+fn wait_capture(b: buffer<f32, 128> @DMA -> @RAM) {
+    sync(b);
+}
+
+fn main() {
+    buffer<f32, 128> ping @RAM;
+    buffer<f32, 128> pong @RAM;
+    let n: u32 = 0;
+
+    start_capture(ping);
+    while n < 6 {
+        wait_capture(ping);
+        start_capture(pong);
+        process(ping);
+        // BUG: no `swap ping, pong;`
+        n = n + 1;
+    }
+    wait_capture(ping);
+}

@@ -98,6 +98,7 @@ fn radio_pipeline_main_body_statement_sequence() {
             Stmt::If { .. } => "If",
             Stmt::While { .. } => "While",
             Stmt::Assign { .. } => "Assign",
+            Stmt::Swap { .. } => "Swap",
         })
         .collect();
 

@@ -401,6 +401,8 @@ struct VarState {
     /// can't be moved, synced, destroyed, write-borrowed, or passed where
     /// a callee may write.
     read_only: bool,
+    /// The declared type, where known (used by `swap`).
+    ty: Option<TypeExpr>,
 
     // ---- where things happened, for diagnostics ----------------------
     /// Where this name was declared (for a borrow handle: the borrow).
@@ -429,6 +431,7 @@ impl VarState {
             param_exit: None,
             rejected_borrow: false,
             read_only: false,
+            ty: None,
         }
     }
 
@@ -505,6 +508,14 @@ fn is_device_owned(d: Domain) -> bool {
     matches!(d, Domain::Dma | Domain::Device)
 }
 
+fn fmt_type(t: &TypeExpr) -> String {
+    match t {
+        TypeExpr::Named(n) => n.clone(),
+        TypeExpr::Buffer { elem, len } => format!("buffer<{}, {len}>", fmt_type(elem)),
+        TypeExpr::Stateful { name, state } => format!("{name}<{state}>"),
+    }
+}
+
 fn fmt_state((machine, state): &Typestate) -> String {
     format!("{machine}<{state}>")
 }
@@ -565,6 +576,7 @@ impl<'a> FnChecker<'a> {
                     VarState::local(domain, sig.param_states.get(i).cloned().flatten(), p.span);
                 var.read_only =
                     sig.param_access.get(i).copied().flatten() == Some(BorrowMode::Read);
+                var.ty = Some(p.ty.clone());
                 let after = sig.param_domains_after.get(i).copied().flatten();
                 var.param_exit = Some((after.or(domain), after.and(domain)));
                 if let Some(d) = domain {
@@ -736,6 +748,68 @@ impl<'a> FnChecker<'a> {
     /// Shared preconditions for `move` / `sync` / `destroy`: the name must be
     /// a live, owned entity (not a borrow handle, not destroyed, not
     /// consumed) with no outstanding borrow. Returns its state on success.
+    /// `swap a, b;` -- both must be live, unborrowed, owned local buffers of
+    /// the same type. Everything the checker knows about the two storages
+    /// (domain, history) moves with them.
+    fn check_swap(&mut self, a: &str, b: &str, errors: &mut Vec<AnalysisError>) {
+        if a == b {
+            errors.push(err(format!("cannot swap '{a}' with itself")).about(a));
+            return;
+        }
+        let va = self.owned_target(a, "swap", errors);
+        let vb = self.owned_target(b, "swap", errors);
+        let (Some(va), Some(vb)) = (va, vb) else {
+            return;
+        };
+        for (name, v) in [(a, &va), (b, &vb)] {
+            if v.is_param() {
+                errors.push(
+                    err(format!(
+                        "cannot swap parameter '{name}': its storage belongs to the caller"
+                    ))
+                    .about(name)
+                    .note(
+                        v.origin,
+                        format!("'{name}' is a parameter of '{}'", self.fn_name),
+                    ),
+                );
+                return;
+            }
+            if !matches!(v.ty, Some(TypeExpr::Buffer { .. })) {
+                errors.push(
+                    err(format!(
+                        "'{name}' is not a buffer; only buffers can be swapped"
+                    ))
+                    .about(name)
+                    .note(v.origin, format!("'{name}' is declared here")),
+                );
+                return;
+            }
+        }
+        if va.ty != vb.ty {
+            let show = |t: &Option<TypeExpr>| t.as_ref().map(fmt_type).unwrap_or_default();
+            errors.push(
+                err(format!(
+                    "cannot swap '{a}' ({}) with '{b}' ({}): the buffer types differ",
+                    show(&va.ty),
+                    show(&vb.ty)
+                ))
+                .about(a),
+            );
+            return;
+        }
+        let span = self.cur_span;
+        for (name, mut v) in [(a, vb), (b, va)] {
+            if let Some(d) = v.domain {
+                v.domain_since = Some((
+                    span,
+                    format!("'{name}' is @{} after `swap {a}, {b}` here", d.name()),
+                ));
+            }
+            self.locals.insert(name.to_string(), v);
+        }
+    }
+
     /// A note pointing at a live borrow of `target`, if there is one.
     fn borrow_note(&self, target: &str) -> Option<(Span, String)> {
         let holder = self.borrows.get(target)?.any_holder()?;
@@ -909,6 +983,8 @@ impl<'a> FnChecker<'a> {
                 v.released = true;
                 v.released_at = Some(span);
             }
+
+            Stmt::Swap { a, b } => self.check_swap(a, b, errors),
 
             Stmt::Destroy { name } => {
                 let Some(var) = self.owned_target(name, "destroy", errors) else {
@@ -1233,13 +1309,21 @@ impl<'a> FnChecker<'a> {
             } else if a.domain.is_none() || b.domain.is_none() {
                 None
             } else {
-                let mut e = err(format!(
-                    "entity '{name}' disagrees on domain across incoming branches (@{} vs @{}){loop_note}",
+                let (da, db) = (
                     a.domain.map(|d| d.name()).unwrap_or("?"),
                     b.domain.map(|d| d.name()).unwrap_or("?"),
-                ))
-                .about(name)
-                .note_opt(a.domain_since.as_ref());
+                );
+                // For a loop, `a` is the end of the body and `b` the state
+                // the loop was entered with.
+                let msg = match kind {
+                    MergeKind::Loop => format!(
+                        "entity '{name}' is @{da} at the end of the `while` body but @{db} when the loop is entered{loop_note}"
+                    ),
+                    MergeKind::If => format!(
+                        "entity '{name}' disagrees on domain across incoming branches (@{da} vs @{db})"
+                    ),
+                };
+                let mut e = err(msg).about(name).note_opt(a.domain_since.as_ref());
                 if b.domain_since.as_ref().map(|n| n.0) != a.domain_since.as_ref().map(|n| n.0) {
                     e = e.note_opt(b.domain_since.as_ref());
                 }
@@ -1295,6 +1379,7 @@ impl<'a> FnChecker<'a> {
                     consumed,
                     param_exit: base_var.param_exit,
                     read_only: base_var.read_only,
+                    ty: base_var.ty.clone(),
                     rejected_borrow: base_var.rejected_borrow,
                     origin: base_var.origin,
                     domain_since: a.domain_since.clone().or_else(|| b.domain_since.clone()),
@@ -1487,6 +1572,7 @@ impl<'a> FnChecker<'a> {
         };
 
         let mut var = VarState::local(resolved_domain, resolved_typestate, self.cur_span);
+        var.ty = ty.cloned();
         if let Some(d) = resolved_domain {
             var.domain_since = Some((
                 self.cur_span,
@@ -1596,6 +1682,7 @@ impl<'a> FnChecker<'a> {
 
         let (domain, typestate) = (target_var.domain, target_var.typestate.clone());
         let mut var = VarState::local(domain, typestate, self.cur_span);
+        var.ty = target_var.ty.clone();
         if ok {
             var.borrow_of = Some((target.to_string(), mode));
         } else {
@@ -2602,7 +2689,7 @@ mod tests {
         // unsound if the loop runs a variable number of times.
         assert_single_error_containing(
             src,
-            "entity 'x' disagrees on domain across incoming branches",
+            "entity 'x' is @DMA at the end of the `while` body but @RAM when the loop is entered",
         );
     }
 
@@ -3881,6 +3968,152 @@ mod access_mode_tests {
     fn field_read_is_allowed_during_a_read_borrow() {
         accepts(
             "entity S : @RAM { v: u32 } fn main() { let s: S @RAM = S { v: 1 }; let r = borrow s read; if s.v == 1 { } release r; }",
+        );
+    }
+}
+
+/// v1.2: `swap a, b;` and ping-pong double buffering.
+#[cfg(test)]
+mod swap_tests {
+    use super::*;
+
+    fn check(src: &str) -> Result<(), Vec<AnalysisError>> {
+        analyze(&phase_parser::parse(src).expect("fixture must parse"))
+    }
+
+    #[track_caller]
+    fn rejects(src: &str, needle: &str) {
+        match check(src) {
+            Ok(()) => panic!("expected an error containing {needle:?}, got Ok(())"),
+            Err(errs) => assert!(
+                errs.iter().any(|e| e.message.contains(needle)),
+                "expected {needle:?}, got {errs:?}"
+            ),
+        }
+    }
+
+    #[track_caller]
+    fn accepts(src: &str) {
+        assert_eq!(check(src), Ok(()));
+    }
+
+    const SIGS: &str = r#"
+        extern fn start(dst: write buffer<u8, 8> @RAM -> @DMA);
+        extern fn use_it(x: read buffer<u8, 8> @RAM);
+        extern fn get_n() -> u32;
+        fn wait(b: buffer<u8, 8> @DMA -> @RAM) { sync(b); }
+    "#;
+
+    fn with(body: &str) -> String {
+        format!("{SIGS}\n{body}")
+    }
+
+    const PING_PONG: &str = r#"
+        fn main() {
+            buffer<u8, 8> ping @RAM;
+            buffer<u8, 8> pong @RAM;
+            let n: u32 = 0;
+            start(ping);
+            while n < 4 {
+                wait(ping);
+                start(pong);
+                use_it(ping);
+                swap ping, pong;
+                n = n + 1;
+            }
+            wait(ping);
+            use_it(ping);
+        }
+    "#;
+
+    #[test]
+    fn ping_pong_loop_is_accepted() {
+        accepts(&with(PING_PONG));
+    }
+
+    #[test]
+    fn swap_exchanges_domains() {
+        // After the swap `a` is the one in flight.
+        rejects(
+            &with("fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; start(b); swap a, b; use_it(a); sync(a); }"),
+            "entity 'a' is in domain @DMA but 'use_it' expects @RAM",
+        );
+        accepts(&with(
+            "fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; start(b); swap a, b; use_it(b); sync(a); }",
+        ));
+    }
+
+    #[test]
+    fn swap_moves_the_history_too() {
+        let errs = check(&with(
+            "fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; start(b); swap a, b; use_it(a); sync(a); }",
+        ))
+        .unwrap_err();
+        assert!(
+            errs[0].notes[0]
+                .message
+                .contains("'a' is @DMA after `swap a, b`"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn forgetting_the_swap_breaks_the_loop_invariant() {
+        rejects(
+            &with(&PING_PONG.replace("swap ping, pong;", "")),
+            "entity 'ping' is @RAM at the end of the `while` body but @DMA when the loop is entered",
+        );
+    }
+
+    #[test]
+    fn swap_with_a_live_borrow_is_rejected() {
+        rejects(
+            &with("fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; let r = borrow b read; swap a, b; release r; }"),
+            "entity 'b' has a live borrow; cannot swap",
+        );
+    }
+
+    #[test]
+    fn swap_of_different_buffer_types_is_rejected() {
+        rejects(
+            "fn main() { buffer<u8, 8> a @RAM; buffer<u8, 16> b @RAM; swap a, b; }",
+            "cannot swap 'a' (buffer<u8, 8>) with 'b' (buffer<u8, 16>): the buffer types differ",
+        );
+    }
+
+    #[test]
+    fn swap_of_non_buffers_parameters_or_itself_is_rejected() {
+        rejects(
+            "entity S : @RAM { v: u32 } fn main() { let a: S @RAM = S { v: 1 }; let b: S @RAM = S { v: 2 }; swap a, b; }",
+            "'a' is not a buffer; only buffers can be swapped",
+        );
+        rejects(
+            "fn f(p: buffer<u8, 8> @RAM) { buffer<u8, 8> q @RAM; swap p, q; } fn main() { }",
+            "cannot swap parameter 'p'",
+        );
+        rejects(
+            "fn main() { buffer<u8, 8> a @RAM; swap a, a; }",
+            "cannot swap 'a' with itself",
+        );
+    }
+
+    #[test]
+    fn swap_of_destroyed_or_borrow_handles_is_rejected() {
+        rejects(
+            "fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; destroy a; swap a, b; }",
+            "entity 'a' was destroyed; cannot swap",
+        );
+        rejects(
+            "fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; let r = borrow a read; swap r, b; release r; }",
+            "'r' is a borrow of 'a'; cannot swap a borrow handle",
+        );
+    }
+
+    #[test]
+    fn swap_on_one_branch_only_disagrees_at_the_join() {
+        rejects(
+            &with("fn main() { let n: u32 = get_n(); buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; start(b); if n == 1 { swap a, b; } sync(b); }"),
+            "disagrees on domain across incoming branches",
         );
     }
 }

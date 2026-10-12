@@ -1,0 +1,18 @@
+// Bug gallery #24: swapping a buffer while a borrow of it is live. After
+// the swap the name `ping` would refer to the other buffer, but `view`
+// would still point at the old one -- two names, no longer in agreement
+// about which storage is which.
+// Expected: "entity 'ping' has a live borrow; cannot swap"
+
+extern fn plot(x: read buffer<f32, 128> @RAM);
+
+fn main() {
+    buffer<f32, 128> ping @RAM;
+    buffer<f32, 128> pong @RAM;
+
+    let view = borrow ping read;
+    // BUG: `view` is still live.
+    swap ping, pong;
+    plot(view);
+    release view;
+}

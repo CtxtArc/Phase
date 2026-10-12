@@ -240,3 +240,43 @@ fn warnings_are_printed_but_do_not_fail_the_check() {
         .unwrap();
     assert!(String::from_utf8_lossy(&short.stderr).contains("warn.phase:5:12: warning: "));
 }
+
+#[test]
+fn ping_pong_processes_every_frame_in_order_from_alternating_buffers() {
+    let root = workspace_root();
+    let out = phase()
+        .current_dir(std::env::temp_dir())
+        .env_remove("PHASE_RUNTIME_DIR")
+        .arg("build")
+        .arg(root.join("examples/ping_pong.phase"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = Command::new(root.join("build/ping_pong")).output().unwrap();
+    assert!(run.status.success());
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let processed: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.contains("process: frame"))
+        .collect();
+    assert_eq!(processed.len(), 7, "{stdout}");
+    for (k, line) in processed.iter().enumerate() {
+        let buffer = if k % 2 == 0 { 'A' } else { 'B' };
+        assert_eq!(
+            **line,
+            format!("[sim] process: frame {k} from buffer {buffer}"),
+            "{stdout}"
+        );
+    }
+    // Every frame after the first is already in flight before the CPU
+    // starts on the previous one.
+    for k in 1..7 {
+        let started = stdout.find(&format!("start_capture: frame {k} ")).unwrap();
+        let processed_prev = stdout.find(&format!("process: frame {} ", k - 1)).unwrap();
+        assert!(started < processed_prev, "frame {k}:\n{stdout}");
+    }
+}

@@ -1,0 +1,47 @@
+// v1.2 example: ping-pong double buffering.
+//
+// The standard way to stream from a DMA engine without dropping samples:
+// two buffers, one being filled by the hardware while the CPU processes
+// the other, trading places every frame.
+//
+//              iteration k                       iteration k+1
+//   ping:  [wait]--> process -->      (swap)   in flight (DMA) ...
+//   pong:   start --> in flight (DMA) (swap)   [wait]--> process --> ...
+//
+// The checker verifies every frame is waited for before the CPU touches
+// it, and that no buffer is refilled while it is being processed (see
+// bug_gallery/refill_while_processing.phase). The loop is checked as an
+// invariant: at the top of each iteration `ping` is the buffer in flight
+// and `pong` is free. The body breaks that -- `swap` restores it, which is
+// what lets one pass over the body stand for every iteration.
+
+entity Sample : @RAM {
+    value: f32
+}
+
+// Program the DMA engine to fill `dst` with the next frame, and return.
+extern fn start_capture(dst: write buffer<Sample, 128> @RAM -> @DMA);
+extern fn process(frame: read buffer<Sample, 128> @RAM);
+
+fn wait_capture(b: buffer<Sample, 128> @DMA -> @RAM) {
+    sync(b);
+}
+
+fn main() {
+    buffer<Sample, 128> ping @RAM;
+    buffer<Sample, 128> pong @RAM;
+    let n: u32 = 0;
+
+    start_capture(ping);            // prime the pipeline: ping in flight
+
+    while n < 6 {
+        wait_capture(ping);         // ping: captured, CPU-visible
+        start_capture(pong);        // pong: next frame in flight
+        process(ping);              // CPU works on ping meanwhile
+        swap ping, pong;            // roles trade: ping is in flight again
+        n = n + 1;
+    }
+
+    wait_capture(ping);             // drain the last frame
+    process(ping);
+}
