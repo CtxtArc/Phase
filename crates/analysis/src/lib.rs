@@ -104,6 +104,9 @@ type Typestate = (String, String);
 #[derive(Debug, Clone)]
 struct FnSig {
     param_domains: Vec<Option<Domain>>,
+    /// `Some(to)` where a parameter is declared `@FROM -> @TO`: the call
+    /// leaves the argument in `to`.
+    param_domains_after: Vec<Option<Domain>>,
     param_states: Vec<Option<Typestate>>,
     return_state: Option<Typestate>,
 }
@@ -196,9 +199,38 @@ pub fn analyze(program: &Program) -> Result<(), Vec<AnalysisError>> {
                      return_type: &Option<TypeExpr>,
                      errors: &mut Vec<AnalysisError>|
      -> FnSig {
-        let _ = name;
+        // A declared domain change must be a transition the hardware model
+        // allows (spec §2.4) -- the same table `move` and `sync` obey.
+        for p in params {
+            if let (Some(from), Some(to)) = (p.domain, p.domain_after) {
+                let msg = if from == to {
+                    Some(format!(
+                        "parameter '{}' of '{name}' declares @{} -> @{}, which changes nothing; drop the `-> @{}`",
+                        p.name,
+                        from.name(),
+                        to.name(),
+                        to.name()
+                    ))
+                } else if !(legal_move(from, to) || (legal_sync_source(from) && to == Domain::Ram))
+                {
+                    Some(format!(
+                        "no legal transition from @{} to @{} in the signature of '{name}' (parameter '{}')",
+                        from.name(),
+                        to.name(),
+                        p.name
+                    ))
+                } else {
+                    None
+                };
+                if let Some(msg) = msg {
+                    // Underline the whole parameter, `-> @TO` included.
+                    errors.push(err(msg).at(p.span));
+                }
+            }
+        }
         FnSig {
             param_domains: params.iter().map(|p| p.domain).collect(),
+            param_domains_after: params.iter().map(|p| p.domain_after).collect(),
             param_states: params
                 .iter()
                 .map(|p| resolve_stateful(&p.ty, &state_machines, errors))
@@ -286,9 +318,11 @@ struct VarState {
     /// can never be used again. `Some(how)` once that has happened, where
     /// `how` is a human-readable description for diagnostics.
     consumed: Option<String>,
-    /// `Some(d)` for a function parameter: the domain the caller handed it
-    /// over in, which it must be back in when the function returns.
-    param_entry_domain: Option<Option<Domain>>,
+    /// `Some(..)` for a function parameter: the domain it must be in when
+    /// the function returns -- the domain it arrived in, or the `@TO` of a
+    /// declared `@FROM -> @TO` change -- and, when a change was declared,
+    /// its `@FROM` (for diagnostics).
+    param_exit: Option<(Option<Domain>, Option<Domain>)>,
     /// A `let v = borrow ..` whose borrow was rejected (already reported).
     /// Kept as a name so later lines get no "unknown entity" noise, and its
     /// `release` is accepted silently.
@@ -318,7 +352,7 @@ impl VarState {
             borrow_of: None,
             released: false,
             consumed: None,
-            param_entry_domain: None,
+            param_exit: None,
             rejected_borrow: false,
         }
     }
@@ -330,7 +364,7 @@ impl VarState {
     }
 
     fn is_param(&self) -> bool {
-        self.param_entry_domain.is_some()
+        self.param_exit.is_some()
     }
 }
 
@@ -449,7 +483,8 @@ impl<'a> FnChecker<'a> {
                 let domain = sig.param_domains.get(i).copied().flatten();
                 let mut var =
                     VarState::local(domain, sig.param_states.get(i).cloned().flatten(), p.span);
-                var.param_entry_domain = Some(domain);
+                let after = sig.param_domains_after.get(i).copied().flatten();
+                var.param_exit = Some((after.or(domain), after.and(domain)));
                 if let Some(d) = domain {
                     var.domain_since = Some((
                         p.span,
@@ -498,16 +533,23 @@ impl<'a> FnChecker<'a> {
             if var.destroyed || var.consumed.is_some() {
                 continue;
             }
-            match (var.param_entry_domain, var.domain) {
-                (Some(Some(entry)), Some(now)) if entry != now => {
-                    errors.push(
-                        err(format!(
-                            "parameter '{name}' must be back in @{} when '{fn_name}' returns, but it is in @{}",
-                            entry.name(),
+            match (var.param_exit, var.domain) {
+                (Some((Some(required), declared_from)), Some(now)) if required != now => {
+                    let msg = match declared_from {
+                        Some(from) => format!(
+                            "parameter '{name}' must be in @{} when '{fn_name}' returns (its signature says @{} -> @{}), but it is in @{}",
+                            required.name(),
+                            from.name(),
+                            required.name(),
                             now.name()
-                        ))
-                        .note_opt(var.domain_since.as_ref()),
-                    );
+                        ),
+                        None => format!(
+                            "parameter '{name}' must be back in @{} when '{fn_name}' returns, but it is in @{}",
+                            required.name(),
+                            now.name()
+                        ),
+                    };
+                    errors.push(err(msg).about(name).note_opt(var.domain_since.as_ref()));
                 }
                 (Some(_), _) => {}
                 (None, Some(now)) if is_device_owned(now) => {
@@ -1158,7 +1200,7 @@ impl<'a> FnChecker<'a> {
                     borrow_of: base_var.borrow_of.clone(),
                     released: a.released || b.released,
                     consumed,
-                    param_entry_domain: base_var.param_entry_domain,
+                    param_exit: base_var.param_exit,
                     rejected_borrow: base_var.rejected_borrow,
                     origin: base_var.origin,
                     domain_since: a.domain_since.clone().or_else(|| b.domain_since.clone()),
@@ -1680,6 +1722,8 @@ impl<'a> FnChecker<'a> {
         // see two names for memory at least one of them may write.
         let mut roots: Vec<(String, bool)> = Vec::new(); // (root, read_only)
         let mut to_consume: Vec<String> = Vec::new();
+        // (name, new domain) for arguments to `@FROM -> @TO` parameters.
+        let mut to_transition: Vec<(String, Domain)> = Vec::new();
 
         for (i, arg) in args.iter().enumerate() {
             match arg {
@@ -1699,9 +1743,11 @@ impl<'a> FnChecker<'a> {
                         continue;
                     }
 
+                    let mut domain_ok = true;
                     if let Some(Some(param_domain)) = sig.param_domains.get(i) {
                         if let Some(var_domain) = var.domain {
                             if var_domain != *param_domain {
+                                domain_ok = false;
                                 errors.push(
                                     err(format!(
                                         "entity '{name}' is in domain @{} but '{callee}' expects @{} for this argument",
@@ -1712,6 +1758,24 @@ impl<'a> FnChecker<'a> {
                                     .note_opt(var.domain_since.as_ref()),
                                 );
                             }
+                        }
+                    }
+
+                    // `@FROM -> @TO` parameter: the call changes the
+                    // argument's domain. Only an owner can be handed over
+                    // that way -- a borrow can't move the storage it views.
+                    if let Some(Some(after)) = sig.param_domains_after.get(i) {
+                        if var.borrow_of.is_some() {
+                            errors.push(
+                                err(format!(
+                                    "'{callee}' moves its argument to @{}, but '{name}' is only a borrow",
+                                    after.name()
+                                ))
+                                .about(name)
+                                .note(var.origin, format!("'{name}' is borrowed here")),
+                            );
+                        } else if domain_ok && var.domain.is_some() {
+                            to_transition.push((name.clone(), *after));
                         }
                     }
 
@@ -1795,6 +1859,17 @@ impl<'a> FnChecker<'a> {
         }
 
         let span = self.cur_span;
+        for (name, after) in to_transition {
+            if let Some(v) = self.locals.get_mut(&name) {
+                v.domain = Some(after);
+                let how = if after == Domain::Ram {
+                    format!("'{name}' is synced back to @RAM by '{callee}' here")
+                } else {
+                    format!("'{name}' is moved to @{} by '{callee}' here", after.name())
+                };
+                v.domain_since = Some((span, how));
+            }
+        }
         for name in to_consume {
             if let Some(v) = self.locals.get_mut(&name) {
                 v.consumed = Some(format!("passed to '{callee}'"));
@@ -3233,5 +3308,187 @@ fn main() {
         for e in errors(src) {
             assert!(e.span.is_some(), "no span on: {}", e.message);
         }
+    }
+}
+
+/// v1.1: `@FROM -> @TO` domain changes declared on parameters.
+#[cfg(test)]
+mod domain_change_tests {
+    use super::*;
+
+    fn check(src: &str) -> Result<(), Vec<AnalysisError>> {
+        analyze(&phase_parser::parse(src).expect("fixture must parse"))
+    }
+
+    #[track_caller]
+    fn rejects(src: &str, needle: &str) -> AnalysisError {
+        match check(src) {
+            Ok(()) => panic!("expected an error containing {needle:?}, got Ok(())"),
+            Err(errs) => errs
+                .into_iter()
+                .find(|e| e.message.contains(needle))
+                .unwrap_or_else(|| panic!("no error containing {needle:?}")),
+        }
+    }
+
+    #[track_caller]
+    fn accepts(src: &str) {
+        assert_eq!(check(src), Ok(()));
+    }
+
+    const SIGS: &str = r#"
+        extern fn start(dst: buffer<u8, 16> @RAM -> @DMA);
+        extern fn finish(dst: buffer<u8, 16> @DMA -> @RAM);
+        extern fn play(src: buffer<u8, 16> @RAM -> @DEVICE);
+        extern fn peek(x: buffer<u8, 16> @RAM);
+        extern fn get_n() -> u32;
+    "#;
+
+    fn with_sigs(body: &str) -> String {
+        format!("{SIGS}\n{body}")
+    }
+
+    #[test]
+    fn extern_call_moves_the_argument_to_its_declared_domain() {
+        let e = rejects(
+            &with_sigs("fn main() { buffer<u8, 16> x @RAM; start(x); peek(x); sync(x); }"),
+            "entity 'x' is in domain @DMA but 'peek' expects @RAM",
+        );
+        assert!(
+            e.notes[0].message.contains("moved to @DMA by 'start'"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn start_then_sync_is_accepted() {
+        accepts(&with_sigs(
+            "fn main() { buffer<u8, 16> x @RAM; start(x); sync(x); peek(x); }",
+        ));
+    }
+
+    #[test]
+    fn start_then_extern_finish_is_accepted() {
+        accepts(&with_sigs(
+            "fn main() { buffer<u8, 16> x @RAM; start(x); finish(x); peek(x); }",
+        ));
+    }
+
+    #[test]
+    fn device_hand_off_must_also_be_synced_before_scope_exit() {
+        rejects(
+            &with_sigs("fn main() { buffer<u8, 16> x @RAM; play(x); }"),
+            "still owned by @DEVICE when 'main' returns",
+        );
+    }
+
+    #[test]
+    fn phase_helper_keeping_its_promise_is_accepted() {
+        accepts(&with_sigs(
+            r#"
+            fn wait(b: buffer<u8, 16> @DMA -> @RAM) { sync(b); }
+            fn main() { buffer<u8, 16> x @RAM; start(x); wait(x); peek(x); }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn phase_helper_breaking_its_promise_is_rejected() {
+        rejects(
+            &with_sigs("fn wait(b: buffer<u8, 16> @DMA -> @RAM) { } fn main() { }"),
+            "parameter 'b' must be in @RAM when 'wait' returns (its signature says @DMA -> @RAM), but it is in @DMA",
+        );
+    }
+
+    #[test]
+    fn phase_helper_breaking_its_promise_on_one_path_is_rejected() {
+        rejects(
+            &with_sigs(
+                "fn wait(b: buffer<u8, 16> @DMA -> @RAM) { let n: u32 = get_n(); if n == 0 { return; } sync(b); } fn main() { }",
+            ),
+            "parameter 'b' must be in @RAM when 'wait' returns",
+        );
+    }
+
+    #[test]
+    fn phase_helper_can_start_a_transfer_for_its_caller() {
+        accepts(&with_sigs(
+            r#"
+            fn arm(b: buffer<u8, 16> @RAM -> @DMA) { start(b); }
+            fn main() { buffer<u8, 16> x @RAM; arm(x); sync(x); peek(x); }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn caller_view_follows_a_phase_helper_declared_later_in_the_file() {
+        rejects(
+            &with_sigs(
+                r#"
+                fn main() { buffer<u8, 16> x @RAM; arm(x); peek(x); sync(x); }
+                fn arm(b: buffer<u8, 16> @RAM -> @DMA) { start(b); }
+                "#,
+            ),
+            "entity 'x' is in domain @DMA but 'peek' expects @RAM",
+        );
+    }
+
+    #[test]
+    fn argument_in_the_wrong_starting_domain_is_rejected_without_a_transition() {
+        // finish(x) takes x from @DMA to @RAM, then start(x) hands it back:
+        accepts(&with_sigs(
+            "fn main() { buffer<u8, 16> x @DMA; finish(x); start(x); sync(x); }",
+        ));
+        // ...but starting a transfer on a buffer the engine already owns is
+        // the domain error, at the call:
+        let e = rejects(
+            &with_sigs("fn main() { buffer<u8, 16> x @DMA; start(x); sync(x); }"),
+            "entity 'x' is in domain @DMA but 'start' expects @RAM",
+        );
+        assert_eq!(e.span.map(|s| s.line), Some(8)); // the body line
+    }
+
+    #[test]
+    fn a_borrow_cannot_be_handed_to_the_hardware() {
+        rejects(
+            &with_sigs(
+                "fn main() { buffer<u8, 16> x @RAM; let w = borrow x write; start(w); release w; }",
+            ),
+            "'start' moves its argument to @DMA, but 'w' is only a borrow",
+        );
+    }
+
+    #[test]
+    fn illegal_declared_transition_is_rejected() {
+        let e = rejects(
+            "extern fn teleport(b: buffer<u8, 16> @DMA -> @DEVICE); fn main() { }",
+            "no legal transition from @DMA to @DEVICE in the signature of 'teleport'",
+        );
+        assert_eq!(e.span.map(|s| (s.line, s.col)), Some((1, 20)));
+    }
+
+    #[test]
+    fn no_op_declared_transition_is_rejected() {
+        rejects(
+            "extern fn f(b: buffer<u8, 16> @RAM -> @RAM); fn main() { }",
+            "declares @RAM -> @RAM, which changes nothing",
+        );
+    }
+
+    #[test]
+    fn transfer_started_and_finished_inside_a_loop_is_accepted() {
+        accepts(&with_sigs(
+            "fn main() { let n: u32 = 0; buffer<u8, 16> x @RAM; while n < 4 { start(x); finish(x); peek(x); n = n + 1; } }",
+        ));
+    }
+
+    #[test]
+    fn transfer_started_inside_a_loop_but_not_finished_is_rejected() {
+        rejects(
+            &with_sigs(
+                "fn main() { let n: u32 = 0; buffer<u8, 16> x @RAM; while n < 4 { start(x); n = n + 1; } sync(x); }",
+            ),
+            "a `while` body must leave every entity exactly as it found it",
+        );
     }
 }

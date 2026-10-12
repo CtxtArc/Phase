@@ -1,0 +1,18 @@
+// Bug gallery #17: a helper whose signature promises to hand a buffer back
+// to the CPU, but whose body forgets the sync. Every caller trusts the
+// signature, so each would go on to read memory the DMA engine still owns.
+// Expected: "parameter 'b' must be in @RAM when 'wait_capture' returns (its signature says @DMA -> @RAM), but it is in @DMA"
+
+extern fn start_capture(dst: buffer<u8, 64> @RAM -> @DMA);
+extern fn log_progress();
+
+fn wait_capture(b: buffer<u8, 64> @DMA -> @RAM) {
+    log_progress();
+    // BUG: no sync(b) -- the signature's promise is never kept.
+}
+
+fn main() {
+    buffer<u8, 64> frame @RAM;
+    start_capture(frame);
+    wait_capture(frame);
+}

@@ -176,3 +176,39 @@ fn parse_errors_are_rendered_with_their_location() {
     assert!(err.contains("bad.phase:3:1"), "{err}");
     assert!(err.contains("3 | }"), "{err}");
 }
+
+#[test]
+fn overlapped_capture_builds_and_overlaps_cpu_work_with_the_transfer() {
+    let root = workspace_root();
+    let out = phase()
+        .current_dir(std::env::temp_dir())
+        .env_remove("PHASE_RUNTIME_DIR")
+        .arg("build")
+        .arg(root.join("examples/overlapped_capture.phase"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = Command::new(root.join("build/overlapped_capture"))
+        .output()
+        .unwrap();
+    assert!(run.status.success());
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let pos = |needle: &str| {
+        stdout
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?} in:\n{stdout}"))
+    };
+    // The window is computed while the DMA transfer is in flight, and the
+    // samples are only touched after the wait.
+    assert!(pos("start_capture") < pos("make_window"));
+    assert!(pos("make_window") < pos("sim_dma_wait(\"b\"): DMA transfer complete"));
+    assert!(pos("DMA transfer complete") < pos("apply_window"));
+    assert!(
+        stdout.contains("(1024 bytes)"),
+        "256 f32 samples:\n{stdout}"
+    );
+}

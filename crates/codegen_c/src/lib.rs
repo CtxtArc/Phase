@@ -528,7 +528,9 @@ mod tests {
             }
         "#;
         let g = generate_src(src, "t");
-        assert!(g.source.contains("sim_dma_wait(\"x\", x, 4 * sizeof(x[0]));"));
+        assert!(g
+            .source
+            .contains("sim_dma_wait(\"x\", x, 4 * sizeof(x[0]));"));
     }
 
     #[test]
@@ -540,7 +542,8 @@ mod tests {
         "#;
         let g = generate_src(src, "t");
         assert!(
-            g.source.contains("sim_dma_wait(\"b\", b, 8 * sizeof(b[0]));"),
+            g.source
+                .contains("sim_dma_wait(\"b\", b, 8 * sizeof(b[0]));"),
             "{}",
             g.source
         );
@@ -558,7 +561,9 @@ mod tests {
             }
         "#;
         let g = generate_src(src, "t");
-        assert!(g.source.contains("sim_device_wait(\"x\", x, 4 * sizeof(x[0]));"));
+        assert!(g
+            .source
+            .contains("sim_device_wait(\"x\", x, 4 * sizeof(x[0]));"));
     }
 
     #[test]

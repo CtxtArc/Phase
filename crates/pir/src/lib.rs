@@ -304,6 +304,20 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
         })
         .collect();
 
+    // Per-function `@FROM -> @TO` parameter changes, so a call that hands a
+    // buffer to the DMA engine updates the domain bookkeeping a later
+    // `sync` relies on.
+    let domain_changes: HashMap<&str, Vec<Option<Domain>>> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Fn(f) => Some((f.name.as_str(), &f.params)),
+            Item::ExternFn(f) => Some((f.name.as_str(), &f.params)),
+            _ => None,
+        })
+        .map(|(name, params)| (name, params.iter().map(|p| p.domain_after).collect()))
+        .collect();
+
     let mut out = PirProgram::default();
 
     for item in &program.items {
@@ -330,6 +344,7 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
                 let sig = lower_fn_sig(&f.name, &f.params, &f.return_type, &known_entities)?;
                 let mut lowerer = Lowerer {
                     known_entities: &known_entities,
+                    domain_changes: &domain_changes,
                     domains: HashMap::new(),
                 };
                 for p in &f.params {
@@ -447,6 +462,7 @@ fn lower_fn_sig(
 
 struct Lowerer<'a> {
     known_entities: &'a HashMap<&'a str, ()>,
+    domain_changes: &'a HashMap<&'a str, Vec<Option<Domain>>>,
     /// Tracks each local's *current* domain, just enough to know whether a
     /// `sync` is waiting on a DMA or a device transfer. Safety itself was
     /// already proven by `phase_analysis`; this is bookkeeping, not a check.
@@ -454,6 +470,18 @@ struct Lowerer<'a> {
 }
 
 impl<'a> Lowerer<'a> {
+    /// Record the domain changes a call to `callee` makes to its arguments.
+    fn apply_domain_changes(&mut self, callee: &str, args: &[Expr]) {
+        let Some(changes) = self.domain_changes.get(callee) else {
+            return;
+        };
+        for (arg, change) in args.iter().zip(changes) {
+            if let (Expr::Ident(name), Some(to)) = (arg, change) {
+                self.domains.insert(name.clone(), *to);
+            }
+        }
+    }
+
     fn lower_block(
         &mut self,
         block: &phase_ast::Block,
@@ -638,6 +666,7 @@ impl<'a> Lowerer<'a> {
                 })?;
                 let resolved_ty = self.resolve(ty)?;
                 let lowered_args = self.lower_call_args(args, name)?;
+                self.apply_domain_changes(callee, args);
                 out.push(PirInst::CallAssign {
                     name: name.to_string(),
                     ty: resolved_ty,
@@ -685,6 +714,7 @@ impl<'a> Lowerer<'a> {
         match e {
             Expr::Call { callee, args } => {
                 let lowered_args = self.lower_call_args(args, callee)?;
+                self.apply_domain_changes(callee, args);
                 out.push(PirInst::Call {
                     callee: callee.clone(),
                     args: lowered_args,
@@ -770,6 +800,30 @@ fn lower_literal(e: &Expr, context: &str) -> Result<PirLiteral, PirError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_after_a_domain_changing_call_waits_on_the_right_transfer() {
+        // `start` declares @RAM -> @DMA, so the later `sync(x)` is a DMA
+        // wait even though `x` was declared @RAM and never `move`d.
+        let src = r#"
+            extern fn start(dst: buffer<u8, 4> @RAM -> @DMA);
+            fn main() {
+                buffer<u8, 4> x @RAM;
+                start(x);
+                sync(x);
+            }
+        "#;
+        let program = phase_parser::parse(src).unwrap();
+        let pir = build(&program).unwrap();
+        assert!(
+            pir.fns[0].body.iter().any(|i| matches!(
+                i,
+                PirInst::EntitySync { name, from: Domain::Dma } if name == "x"
+            )),
+            "{:#?}",
+            pir.fns[0].body
+        );
+    }
 
     fn build_src(src: &str) -> Result<PirProgram, PirError> {
         let program = phase_parser::parse(src).expect("fixture must parse");

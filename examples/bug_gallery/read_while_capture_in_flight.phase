@@ -1,0 +1,22 @@
+// Bug gallery #19: reading a buffer between the call that starts its DMA
+// transfer and the one that finishes it. start_capture()'s signature says
+// the buffer belongs to the DMA engine after the call, so this is the
+// use-before-sync race (#1) -- just spread across function calls.
+// Expected: "entity 'frame' is in domain @DMA but 'report' expects @RAM"
+
+extern fn start_capture(dst: buffer<u8, 64> @RAM -> @DMA);
+extern fn report(x: buffer<u8, 64> @RAM);
+
+fn wait_capture(b: buffer<u8, 64> @DMA -> @RAM) {
+    sync(b);
+}
+
+fn main() {
+    buffer<u8, 64> frame @RAM;
+    start_capture(frame);
+
+    // BUG: the capture is still in flight.
+    report(frame);
+
+    wait_capture(frame);
+}

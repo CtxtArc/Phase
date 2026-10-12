@@ -203,10 +203,28 @@ impl Parser {
             self.expect(TokenKind::Colon)?;
             let ty = self.parse_type_expr()?;
             let domain = self.opt_domain()?;
+            // `@FROM -> @TO`: a domain change the function performs on this
+            // argument. Unambiguous with a return type, which only follows
+            // the closing `)`.
+            let domain_after = if self.at(&TokenKind::Arrow) {
+                if domain.is_none() {
+                    return Err(ParseError {
+                        message: format!(
+                            "parameter '{name}' has `->` but no starting domain; write `{name}: <type> @FROM -> @TO`"
+                        ),
+                        span: self.peek_span(),
+                    });
+                }
+                self.bump();
+                Some(self.parse_domain()?)
+            } else {
+                None
+            };
             params.push(Param {
                 name,
                 ty,
                 domain,
+                domain_after,
                 span: start.to(self.prev_span),
             });
             if self.at(&TokenKind::Comma) {
@@ -692,6 +710,37 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameter_domain_change_is_parsed() {
+        let p = parse("extern fn start(dst: buffer<u8, 4> @RAM -> @DMA); fn main() {}").unwrap();
+        let Item::ExternFn(f) = &p.items[0] else {
+            panic!("expected extern fn")
+        };
+        assert_eq!(f.params[0].domain, Some(Domain::Ram));
+        assert_eq!(f.params[0].domain_after, Some(Domain::Dma));
+    }
+
+    #[test]
+    fn return_type_arrow_is_not_a_domain_change() {
+        let p = parse("state P { A } extern fn f(x: buffer<u8, 4> @RAM) -> P<A>; fn main() {}")
+            .unwrap();
+        let Item::ExternFn(f) = &p.items[1] else {
+            panic!("expected extern fn")
+        };
+        assert_eq!(f.params[0].domain_after, None);
+        assert!(f.return_type.is_some());
+    }
+
+    #[test]
+    fn domain_change_without_a_starting_domain_is_an_error() {
+        let err = parse("extern fn f(x: buffer<u8, 4> -> @DMA); fn main() {}").unwrap_err();
+        assert!(
+            err.message.contains("has `->` but no starting domain"),
+            "{}",
+            err.message
+        );
+    }
 
     #[test]
     fn parses_empty_entity() {

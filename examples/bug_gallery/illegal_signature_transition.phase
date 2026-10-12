@@ -1,0 +1,10 @@
+// Bug gallery #18: a signature claiming a domain change the hardware model
+// doesn't allow. A buffer goes DMA -> CPU via sync and CPU -> device via
+// move; there is no direct DMA -> device hand-off (spec §2.4), so a
+// "trusted" extern can't claim one either.
+// Expected: "no legal transition from @DMA to @DEVICE in the signature of 'forward'"
+
+extern fn forward(b: buffer<u8, 64> @DMA -> @DEVICE);
+
+fn main() {
+}

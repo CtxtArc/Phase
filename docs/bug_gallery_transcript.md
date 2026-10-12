@@ -40,6 +40,12 @@ OK: examples/mmio_poll.phase parsed and passed domain/ownership analysis (0 enti
 OK: examples/mmio_registers.phase parsed and passed domain/ownership analysis (0 entities, 1 fn)
 ```
 
+### `examples/overlapped_capture.phase`
+
+```
+OK: examples/overlapped_capture.phase parsed and passed domain/ownership analysis (1 entity, 2 fns)
+```
+
 ### `examples/packet_pipeline.phase`
 
 ```
@@ -117,6 +123,25 @@ note: 'x' is moved to @DEVICE here
 examples/bug_gallery/branch_domain_disagreement.phase: 1 error found
 ```
 
+### `examples/bug_gallery/broken_sync_promise.phase`
+
+Bug gallery #17: a helper whose signature promises to hand a buffer back
+
+```
+error: parameter 'b' must be in @RAM when 'wait_capture' returns (its signature says @DMA -> @RAM), but it is in @DMA
+  --> examples/bug_gallery/broken_sync_promise.phase:12:1
+   |
+12 | }
+   | ^
+note: 'b' arrives in @DMA here
+  --> examples/bug_gallery/broken_sync_promise.phase:9:17
+   |
+ 9 | fn wait_capture(b: buffer<u8, 64> @DMA -> @RAM) {
+   |                 ------------------------------
+
+examples/bug_gallery/broken_sync_promise.phase: 1 error found
+```
+
 ### `examples/bug_gallery/destroy_while_dma.phase`
 
 Bug gallery #10: freeing a buffer while the DMA engine still owns it.
@@ -191,6 +216,20 @@ note: 'p' is Packet<Received> from here
 examples/bug_gallery/forged_typestate.phase: 2 errors found
 ```
 
+### `examples/bug_gallery/illegal_signature_transition.phase`
+
+Bug gallery #18: a signature claiming a domain change the hardware model
+
+```
+error: no legal transition from @DMA to @DEVICE in the signature of 'forward' (parameter 'b')
+ --> examples/bug_gallery/illegal_signature_transition.phase:7:19
+  |
+7 | extern fn forward(b: buffer<u8, 64> @DMA -> @DEVICE);
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+examples/bug_gallery/illegal_signature_transition.phase: 1 error found
+```
+
 ### `examples/bug_gallery/move_while_borrowed.phase`
 
 Bug gallery #2: moving an entity while a borrow of it is still live.
@@ -208,6 +247,25 @@ note: 'x' is borrowed by 'view' here
   |     -------------------------
 
 examples/bug_gallery/move_while_borrowed.phase: 1 error found
+```
+
+### `examples/bug_gallery/read_while_capture_in_flight.phase`
+
+Bug gallery #19: reading a buffer between the call that starts its DMA
+
+```
+error: entity 'frame' is in domain @DMA but 'report' expects @RAM for this argument
+  --> examples/bug_gallery/read_while_capture_in_flight.phase:19:5
+   |
+19 |     report(frame);
+   |            ^^^^^
+note: 'frame' is moved to @DMA by 'start_capture' here
+  --> examples/bug_gallery/read_while_capture_in_flight.phase:16:5
+   |
+16 |     start_capture(frame);
+   |     ---------------------
+
+examples/bug_gallery/read_while_capture_in_flight.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/shadowed_dma_buffer.phase`

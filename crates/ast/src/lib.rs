@@ -132,7 +132,11 @@ pub struct FieldDecl {
 pub struct Param {
     pub name: String,
     pub ty: TypeExpr,
+    /// The domain the argument must be in when the function is called.
     pub domain: Option<Domain>,
+    /// `Some(to)` for `name: T @FROM -> @TO`: the function leaves the
+    /// argument in `to` instead of handing it back in `domain`.
+    pub domain_after: Option<Domain>,
     pub span: Span,
 }
 
