@@ -3,7 +3,7 @@
 **A compiler that statically checks memory safety for hardware pipelines — DMA, MMIO, and zero-copy devices — before the code ever runs.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.1.0-success" alt="Version 1.1.0">
+  <img src="https://img.shields.io/badge/version-1.2.0-success" alt="Version 1.2.0">
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
 </p>
@@ -36,10 +36,11 @@ compiler guarantees:
 
 1. **Domain safety** — the CPU never reads, borrows, or frees a buffer
    owned by hardware (`@DMA`, `@DEVICE`) without an explicit `sync()` first.
-2. **Ownership/borrow safety** — many readers or one writer; while a
-   buffer is borrowed it is reachable only through its borrows; released
-   borrows are dead; one buffer is never passed twice to a call unless
-   every use is read-only.
+2. **Ownership/borrow safety** — many readers or one writer; read-only data
+   (a read borrow, a `read` parameter) is never handed to code that writes;
+   while a buffer is borrowed it can't be written, moved, or freed;
+   released borrows are dead; one buffer is never passed twice to a call
+   unless every use is read-only.
 3. **Lifetime safety** — nothing is used after `destroy`, and no function
    returns while hardware still owns one of its buffers, a borrow is still
    live, or a parameter is in a different domain than its signature
@@ -50,7 +51,7 @@ compiler guarantees:
    used exactly once.
 5. **Branch/loop consistency** — `if`/`else` paths can't leave a buffer in
    disagreeing physical domains, and a loop body must leave every buffer
-   as it found it.
+   as it found it — with `swap` to rotate buffers for ping-pong DMA.
 6. **Volatile MMIO semantics** — hardware control registers are never
    silently reordered or eliminated by C compiler optimization.
 
@@ -115,6 +116,8 @@ deliberately broken program per rule, each rejected at compile time:
 - **[CWE-362/672] Broken exclusivity** — [`write_borrow_conflict.phase`](examples/bug_gallery/write_borrow_conflict.phase), [`use_owner_while_borrowed.phase`](examples/bug_gallery/use_owner_while_borrowed.phase), [`use_after_release.phase`](examples/bug_gallery/use_after_release.phase): two writers at once, writing behind a borrow's back, or using a borrow after giving it up.
 - **[CWE-696/672] Typestate skipping and replay** — [`skipped_state_transition.phase`](examples/bug_gallery/skipped_state_transition.phase), [`forged_typestate.phase`](examples/bug_gallery/forged_typestate.phase), [`stale_typestate_reuse.phase`](examples/bug_gallery/stale_typestate_reuse.phase): a packet reaching a "validated" stage without being validated, or being processed twice — the same bug shape as Apple's 2014 "goto fail" (CVE-2014-1266), where a required verification step was silently skipped.
 - **[CWE-696/691] Inconsistent paths** — [`branch_domain_disagreement.phase`](examples/bug_gallery/branch_domain_disagreement.phase): two branches leaving a buffer in different domains.
+- **[CWE-362] Writing through read-only views** — [`write_through_read_borrow.phase`](examples/bug_gallery/write_through_read_borrow.phase), [`read_param_handed_to_writer.phase`](examples/bug_gallery/read_param_handed_to_writer.phase): a read borrow or a `read` parameter handed to a kernel that writes.
+- **[CWE-362/367] Broken double buffering** — [`refill_while_processing.phase`](examples/bug_gallery/refill_while_processing.phase), [`ping_pong_without_swap.phase`](examples/bug_gallery/ping_pong_without_swap.phase), [`swap_while_borrowed.phase`](examples/bug_gallery/swap_while_borrowed.phase): refilling the buffer the CPU is processing (a torn frame), forgetting to trade buffers, or swapping one out from under a live view.
 - **[CWE-758] Aliasing and silent MMIO optimization** — [`aliased_arguments.phase`](examples/bug_gallery/aliased_arguments.phase) passes one buffer as both input and output of a kernel; [`volatile_wrong_domain.phase`](examples/bug_gallery/volatile_wrong_domain.phase) points a register access at RAM. `@MMIO` registers always lower to `volatile` C globals, so the C standard itself — not convention or code review — forbids the compiler from deleting or reordering the access.
 
 Each gallery file states its expected error in an `// Expected:` header,
@@ -242,6 +245,12 @@ capture-filter-playback, a status packet that must pass through a full
 `Received -> Decoded -> Validated` typestate chain, and MMIO register
 control, composed in one program that actually builds and runs.
 
+`examples/ping_pong.phase`: ping-pong double buffering — the DMA engine
+fills one buffer while the CPU processes the other, and `swap ping, pong;`
+trades them each frame. Seven frames, processed in order from alternating
+buffers, each next capture already in flight; the checker proves no frame
+is touched before it's synced or refilled while being processed.
+
 `examples/overlapped_capture.phase`: one call starts a DMA capture
 (`start_capture(dst: buffer<..> @RAM -> @DMA)`), the CPU computes a window
 while it runs, and a PHASE helper declared `@DMA -> @RAM` waits for it —
@@ -310,27 +319,30 @@ has to discover the hard way:
   plumbing.
 - **Loops are checked by invariant, not by iteration.** A `while` body
   must leave every pre-existing entity exactly as it found it. That makes
-  the single-pass check sound for any iteration count, but it rejects
-  loops that, say, alternate a buffer between domains on odd and even
-  iterations.
+  the single-pass check sound for any iteration count; a body that rotates
+  buffers between roles restores the invariant with `swap`. Patterns that
+  need more state than that (say, a ring of three buffers advanced by
+  index) aren't expressible yet.
+- **Unannotated parameters are trusted to write.** A buffer parameter
+  without `read`/`write` is assumed to possibly write. Passing read-only
+  data to one is a warning rather than an error, so 1.1 programs keep
+  compiling; annotate your externs to make it exact.
 
 Full rationale for all of these is in
 [`phase_specification.md`](phase_specification.md) §4.4 and §10.
 
 ## What's next
 
-1.1 adds source-located diagnostics and domain changes in signatures on
-top of 1.0's soundness work (see [`CHANGELOG.md`](CHANGELOG.md)). Likely
-next steps:
+1.2 adds `read`/`write` access modes and ping-pong double buffering on top
+of 1.1's diagnostics and signature domain changes (see
+[`CHANGELOG.md`](CHANGELOG.md)). Likely next steps:
 
-- **Read/write modes on `extern fn` parameters**, so aliasing and
-  owner-access rules can distinguish kernels that only read a buffer.
-- **Ping-pong double buffering** — two buffers swapping between the DMA
-  engine and the CPU each loop iteration, checked as one invariant.
 - **A runtime-checking build mode plus fuzzing**, as empirical evidence
   that every program `check` accepts really keeps its guarantees.
 - **M12 — An LLVM backend**, removing the dependency on an external `cc`
   ([`phase_specification.md`](phase_specification.md) §9).
+- **A real DMA controller** — the ping-pong pipeline on a board with one
+  (e.g. an STM32 Nucleo), instead of QEMU's MPS2 model, which has none.
 
 For the complete language specification, domain model, type system, and
 full milestone roadmap, see

@@ -383,6 +383,69 @@ over.
 
 ---
 
+## v1.2 additions
+
+v1.2 adds `read`/`write` access modes on parameters and `swap` for
+ping-pong double buffering (spec §3.12, §3.13).
+
+## #20 — Writing through a read borrow, #21 — a `read` parameter handed to a writer
+
+**`examples/bug_gallery/write_through_read_borrow.phase`**,
+**`examples/bug_gallery/read_param_handed_to_writer.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html) —
+the exclusivity discipline of #3: the harm is memory changing under a
+reader that believes it stable.
+
+**Real-world precedent:** the same shared-buffer race pattern as #3: a
+reader holds a view it believes stable while something else writes the
+memory. Up to 1.1, PHASE's borrow rule had this exact hole: a read borrow
+could be passed to any parameter, including one that writes.
+
+**What PHASE does now:** read-only data may only reach `read` parameters
+(a parameter with no mode gets a warning, so existing code keeps
+compiling), and a `read` buffer is a `const` pointer in the generated C,
+so the C compiler also rejects an extern body that writes through it.
+
+---
+
+## #22 — Refilling the buffer being processed
+
+**`examples/bug_gallery/refill_while_processing.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html),
+[CWE-367](https://cwe.mitre.org/data/definitions/367.html).
+
+**Real-world precedent:** the classic double-buffering mistake in
+streaming drivers: restarting the DMA transfer into the buffer the CPU is
+about to read, so the engine overwrites the frame mid-processing. The
+result is a torn frame — silently corrupted data, not a crash.
+
+**What PHASE does:** the restart moves the buffer to `@DMA`, so the
+processing call that follows is the use-before-sync error (#1), pointing
+at the call that handed it back to the hardware.
+
+---
+
+## #23 — Double buffering without trading places, #24 — swapping a borrowed buffer
+
+**`examples/bug_gallery/ping_pong_without_swap.phase`**,
+**`examples/bug_gallery/swap_while_borrowed.phase`**
+
+**Category:** [CWE-696](https://cwe.mitre.org/data/definitions/696.html)
+(#23), [CWE-362](https://cwe.mitre.org/data/definitions/362.html) (#24).
+
+**Real-world precedent:** a ping-pong loop whose roles drift out of sync
+with the code waits on the idle buffer and reprograms a transfer that is
+already running; a view kept across the swap ends up pointing at the
+other buffer.
+
+**What PHASE does:** the loop invariant (spec §4.3) fails unless the body
+leaves both buffers as it found them — `swap` is how a correct loop
+restores it — and `swap` is rejected while either buffer is borrowed.
+
+---
+
 ## Summary table
 
 | # | Bug-gallery file | CWE | Named real-world precedent |
@@ -406,3 +469,8 @@ over.
 | 17 | `broken_sync_promise.phase` | CWE-362, CWE-367 | cross-function form of #1 |
 | 18 | `illegal_signature_transition.phase` | CWE-696 | skipped step in a hardware hand-off |
 | 19 | `read_while_capture_in_flight.phase` | CWE-362, CWE-367 | same as #1, split across calls |
+| 20 | `write_through_read_borrow.phase` | CWE-362 | general shared-buffer race pattern (as #3) |
+| 21 | `read_param_handed_to_writer.phase` | CWE-362 | general shared-buffer race pattern (as #3) |
+| 22 | `refill_while_processing.phase` | CWE-362, CWE-367 | torn frame in a double-buffered stream |
+| 23 | `ping_pong_without_swap.phase` | CWE-696 | double-buffer roles out of sync with the code |
+| 24 | `swap_while_borrowed.phase` | CWE-362 | a view left pointing at the wrong buffer |

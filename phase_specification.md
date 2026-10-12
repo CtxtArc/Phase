@@ -2,7 +2,7 @@
 
 **A physical-domain safety language for signal, RF, and embedded pipelines**
 
-Version 1.1
+Version 1.2
 
 ---
 
@@ -164,8 +164,9 @@ volatile access -- always observable, never eliminated by codegen
 ### 3.1 Lexical elements
 
 Identifiers, integer/float literals, string literals, comments (`//`, `/* */`).
-Keywords: `entity`, `fn`, `let`, `move`, `sync`, `borrow`, `release`, `destroy`,
-`domain`, `state`, `if`, `else`, `while`, `return`, `struct`, `extern`.
+Keywords: `entity`, `fn`, `extern`, `let`, `buffer`, `move`, `sync`, `borrow`,
+`release`, `destroy`, `swap`, `read`, `write`, `state`, `if`, `else`, `while`,
+`return`, `true`, `false`.
 
 ### 3.2 Entities and domains
 
@@ -217,7 +218,9 @@ release view;
 
 Multiple concurrent `read` borrows are legal. A `write` borrow must be
 exclusive (no other borrows of any kind may be live). Attempting a `move` or
-`destroy` while a borrow is live is a compile error.
+`destroy` while a borrow is live is a compile error. While only `read`
+borrows are live, the owner may still be read — passed to a `read`
+parameter (§3.12) or have its fields read — but not written.
 
 ### 3.7 volatile MMIO access
 
@@ -318,6 +321,68 @@ into separate functions with CPU work in between — the overlap DMA exists
 for — while the checker still tracks the buffer through both calls. See
 `examples/overlapped_capture.phase`.
 
+### 3.12 Access modes on parameters
+
+```phase
+extern fn fir_filter(in_: read buffer<Sample, 1024> @RAM,
+                      out: write buffer<Sample, 1024> @RAM);
+extern fn inspect(p: read Packet<Validated>);
+```
+
+`read` or `write` before a parameter's type says how the function accesses
+the buffer or entity it is given. A parameter with neither (the pre-1.2
+form) is assumed to possibly write.
+
+- **Read-only data stays read-only.** A read borrow, or a `read`
+  parameter inside its function, may only be passed to `read` parameters.
+  Passing it to a `write` parameter is an error; passing it to a parameter
+  with no mode is a **warning** (accepted, because a 1.1 program may do it;
+  expected to become an error in 2.0).
+- **Inside a PHASE function** a `read` parameter cannot be moved, synced,
+  destroyed, or write-borrowed.
+- **Aliasing.** The same storage may appear more than once in a call when
+  every occurrence is read-only — a `read` parameter or a read borrow — so
+  `cmp(x, x)` is fine and `fir_filter(x, x)` is not.
+- **Borrows.** While only read borrows of an entity are live, the owner may
+  be passed to a `read` parameter.
+- **Typestate.** A `read` parameter that requires a state checks it but
+  does not consume the value: `inspect(v); handle(v);` is legal.
+- **Signatures.** Modes apply only to buffers and entities, and `read`
+  cannot be combined with a domain change (§3.11): handing a buffer to
+  hardware lets the hardware write it.
+- **Codegen.** A `read` buffer parameter is a `const` pointer in C, so the C
+  compiler rejects an extern body that writes through it — the first part
+  of the `extern fn` contract (§4.4) that is machine-checked.
+
+### 3.13 swap and double buffering
+
+```phase
+start_capture(ping);            // ping in flight
+while n < 6 {
+    wait_capture(ping);         // ping: CPU-visible
+    start_capture(pong);        // pong: next frame in flight
+    process(ping);
+    swap ping, pong;            // ping is in flight again
+    n = n + 1;
+}
+wait_capture(ping);
+```
+
+`swap a, b;` exchanges the storage two buffer names refer to, together
+with everything the checker knows about it (domain, history). Both must be
+live, owned, unborrowed local buffers of the same type — not borrow
+handles, `read` parameters, or parameters at all (their storage belongs to
+the caller).
+
+It exists for ping-pong double buffering, the standard way to stream from
+a DMA engine: one buffer is filled by hardware while the CPU processes the
+other. Without `swap` that loop's body ends with the two buffers in each
+other's starting domains, which the loop invariant (§4.3) rejects; with
+it, the body leaves `ping` and `pong` exactly as it found them, so the
+single-pass loop check remains sound. In C, a swapped buffer is a storage
+array plus a pointer, and `swap` exchanges the pointers. See
+`examples/ping_pong.phase`.
+
 ---
 
 <a name="part-4-type-system--static-analysis"></a>
@@ -354,6 +419,17 @@ on the branch that's missing one). This is the direct analogue of KAIROS's
 `ENTITY_PHI` (Part 6, §10 of the KAIROS doc) and is the single hardest piece
 of the analyzer — flagged explicitly as its own milestone (§9, Milestone 4).
 
+A branch that ends in `return` never reaches the join, so it takes no part
+in the merge.
+
+A `while` loop is a join too: the state the loop is entered with meets the
+state at the end of its body. PHASE requires them to agree on every entity
+that existed before the loop — the body must leave each one exactly as it
+found it. That makes the body's effect a loop invariant, so checking it
+once covers any number of iterations, including zero. A body that has to
+rotate buffers between roles each iteration restores the invariant with
+`swap` (§3.13).
+
 ### 4.4 What the type system guarantees
 
 For every program `phase check` accepts, within a function body:
@@ -361,15 +437,20 @@ For every program `phase check` accepts, within a function body:
 - **Domains.** No use, borrow, field read, or `destroy` of a `@DMA`/
   `@DEVICE`-owned entity by the host without a `sync`; every `move`/`sync`
   follows §2.4.
-- **Borrows.** Many readers or one writer, never both. While any borrow
-  of an entity is live, the entity is reachable only through its borrows
-  (the owner cannot be used, moved, synced, or destroyed). A released
-  handle is dead. Handles cannot be moved, synced, destroyed, or
+- **Borrows.** Many readers or one writer, never both. While a write
+  borrow is live the owner is reachable only through it; while only read
+  borrows are live the owner may be read (a `read` parameter, a field
+  read) but not written, moved, synced, destroyed, or swapped. A released
+  handle is dead. Handles cannot be moved, synced, destroyed, swapped, or
   re-borrowed.
+- **Read-only access.** A read borrow or a `read` parameter is never
+  passed to a `write` parameter, and a `read` parameter is never moved,
+  synced, destroyed, or write-borrowed (§3.12).
 - **Aliasing.** One storage location appears at most once among a call's
-  arguments, unless every occurrence is a read borrow. Entities cannot be
-  copied with `let`, and names cannot be redeclared, so one location never
-  has two independently tracked names.
+  arguments, unless every occurrence is read-only (a `read` parameter or a
+  read borrow). Entities cannot be copied with `let`, and names cannot be
+  redeclared, so one location never has two independently tracked names;
+  `swap` exchanges two names' storage and their tracked state together.
 - **Lifetimes.** No access after `destroy`. At every `return` (explicit or
   falling off the end): no local is still `@DMA`/`@DEVICE`-owned, no borrow
   is live, and every parameter is in the domain its signature promises —
@@ -392,8 +473,10 @@ For every program `phase check` accepts, within a function body:
 
 **Trust boundary.** `extern fn` bodies are not analyzed (§3.9): PHASE
 trusts that a kernel does only what its signature says — touches only the
-buffers it is passed, does not retain them past the call, and really
-performs the state transition its return type claims. A buggy or
+buffers it is passed, does not retain them past the call, writes only
+parameters not declared `read` (this part is enforced by the C compiler
+through `const`, §3.12), and really performs the state transition and
+domain change its signature claims. A buggy or
 malicious extern can violate any guarantee above. Likewise the analysis is
 per-function and assumes the hardware honors the ownership model (e.g.
 that a transfer is complete when `sync` returns).
@@ -532,9 +615,14 @@ note: 'frame' is moved to @DMA by 'start_capture' here
    |     ---------------------
 ```
 
-`short` format prints one `file:line:col: error|note: message` line per
-error and note, for editors and scripts. Parse errors use the same
-renderer.
+`short` format prints one `file:line:col: error|warning|note: message`
+line per diagnostic and note, for editors and scripts. Parse errors use
+the same renderer.
+
+**Warnings** (v1.2) use the same format with a `warning` label. They never
+reject a program or change the exit status; `check` reports their count on
+its success line. The one warning today is read-only data passed to a
+parameter that declares no access mode (§3.12).
 
 ### 6.6 Transition table representation
 
@@ -621,6 +709,11 @@ for the analyzer and as the security narrative for the portfolio write-up.
 | 17 | A helper declared `@DMA -> @RAM` that never syncs | A "wait" function that doesn't wait | "parameter `b` must be in @RAM when `f` returns (its signature says @DMA -> @RAM)" |
 | 18 | A signature claiming an illegal domain change | A trusted kernel promising an impossible hand-off | "no legal transition from @DMA to @DEVICE in the signature of `f`" |
 | 19 | Using a buffer between start-transfer and wait calls | Use-before-sync spread across functions | "entity `X` is in domain @DMA but `f` expects @RAM" (note: moved to @DMA by `start`) |
+| 20 | Passing a read borrow to a `write` parameter | Writing through a read-only view | "`f` may write its parameter `x`, but `v` is read-only" |
+| 21 | A `read` parameter handed to a writer | A helper breaking its own read-only promise | "`f` may write its parameter `x`, but `p` is read-only" |
+| 22 | Restarting the capture into the buffer being processed | Torn frame in a ping-pong pipeline | "entity `ping` is in domain @DMA but `process` expects @RAM" |
+| 23 | Ping-pong loop without trading the buffers | Waiting on the idle buffer, reprogramming a running transfer | "entity `ping` is @RAM at the end of the `while` body but @DMA when the loop is entered" |
+| 24 | `swap` while one buffer is borrowed | A view left pointing at the wrong buffer | "entity `X` has a live borrow; cannot swap" |
 
 Every file in `examples/bug_gallery/` carries its expected error in an
 `// Expected: "..."` header, and a test asserts the analyzer produces it.
@@ -766,6 +859,16 @@ starting and finishing a transfer can live in separate functions with CPU
 work in between, checked across both calls. Output:
 `examples/overlapped_capture.phase` builds and runs with a window computed
 while the capture is in flight; bug-gallery entries #17–#19.
+
+**v1.2 — Access modes and double buffering**
+Parameters may be declared `read` or `write` (§3.12): exact aliasing and
+borrow rules, read-only data that stays read-only, non-consuming `read`
+typestate parameters, and `const` pointers in the generated C. This closed
+a hole — a read borrow could be passed to a parameter that writes — and,
+to keep 1.1 programs compiling, introduced warnings. `swap a, b;` (§3.13)
+makes ping-pong double buffering expressible and checkable as a loop
+invariant. Output: `examples/ping_pong.phase` builds and runs, processing
+seven frames in order from alternating buffers; bug-gallery #20–#24.
 
 **M12 — LLVM backend** *(not yet started)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead

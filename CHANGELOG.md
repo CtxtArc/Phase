@@ -4,6 +4,68 @@ All notable changes to PHASE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-10-12
+
+Parameters can say whether a function reads or writes what it's given,
+which makes the aliasing and borrow rules exact and closes a hole in
+them; and `swap` makes ping-pong double buffering — the standard way to
+stream from a DMA engine — expressible and checked.
+
+Every program 1.1 accepted is still accepted; at most it now gets a
+warning.
+
+### Added
+
+- **Access modes** (spec §3.12): `name: read T` / `name: write T`.
+  - The same buffer may appear several times in one call if every use is
+    read-only: `cmp(x, x)` is fine, `fir_filter(x, x)` still isn't.
+  - While only read borrows are live, the owner may be passed to `read`
+    parameters (and its fields read).
+  - Inside a PHASE function a `read` parameter can't be moved, synced,
+    destroyed, write-borrowed, or passed to a `write` parameter.
+  - A `read` typestate parameter checks the state without consuming the
+    value: `inspect(v); handle(v);`.
+  - `read` buffer parameters are `const` pointers in the generated C, so
+    the C compiler rejects an extern body that writes through one.
+- **Warnings.** Diagnostics now have a severity. Warnings use the same
+  renderer (`warning:` in yellow; `warning` in `--error-format=short`),
+  never change the exit status, and are counted on `check`'s success
+  line. Library: `Severity`, `Report`, and `analyze_full`; `analyze` is
+  unchanged and still returns only errors.
+- **`swap a, b;`** (spec §3.13): exchanges the storage two buffer names
+  refer to, with everything the checker knows about it. A ping-pong loop
+  ends each iteration with a `swap`, which restores the loop invariant, so
+  the single-pass loop check stays sound. Swapped buffers are emitted as
+  storage plus a pointer, and `swap` exchanges pointers — no copying.
+- `examples/ping_pong.phase` (+ runtime): seven frames processed in order
+  from alternating buffers, each next capture started before the CPU
+  works on the previous one. Builds and runs; an end-to-end test checks
+  the order and the alternation.
+- Bug gallery #20 `write_through_read_borrow`, #21
+  `read_param_handed_to_writer`, #22 `refill_while_processing`, #23
+  `ping_pong_without_swap`, #24 `swap_while_borrowed`, with CWE mappings.
+- Spec §4.3 now describes how loops are checked (the loop invariant).
+
+### Fixed
+
+- **A read borrow could be passed to a parameter that writes**, so a
+  "read" borrow didn't actually prevent writes. Passing read-only data to
+  a `write` parameter is now an error; to a parameter with no mode, a
+  warning (that parameter may write, but 1.1 code had no way to say
+  otherwise). Expect the warning to become an error in 2.0.
+
+### Changed
+
+- The examples' externs are annotated `read`/`write`, and their
+  hand-written C uses `const` to match the generated prototypes.
+- Loop invariant errors say what happened: "entity 'ping' is @RAM at the
+  end of the `while` body but @DMA when the loop is entered", instead of
+  the branch-merge wording.
+- `swap` is now a keyword.
+- Internal crate APIs: `Param` gains `access`; `Stmt::Swap` and
+  `PirInst::Swap`; `PirFnSig` gains `read_only`; `AnalysisError` gains
+  `severity`.
+
 ## [1.1.0] — 2026-10-12
 
 Errors now show where they happen and why, and function signatures can
