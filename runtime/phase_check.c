@@ -16,8 +16,6 @@ typedef struct {
     const void *p;
     const char *name;
     int domain;
-    int readers;
-    int writer;
     int destroyed;
     int in_use;
 } Storage;
@@ -28,10 +26,37 @@ typedef struct {
     int write;
     int released;
     int in_use;
+    int depth; /* call depth the borrow was taken at */
 } Handle;
 
 static Storage storages[MAX_STORAGES];
 static Handle handles[MAX_HANDLES];
+
+/* Call depth of the PHASE function currently running. Borrow rules are
+ * per frame: a function only conflicts with borrows taken in its own
+ * frame. A borrow held by a caller is what *grants* the callee its access
+ * to the parameter -- the static rules already ensure a caller can only
+ * hand down access it holds (a read borrow only to a `read` parameter). */
+static int depth = 0;
+
+void phase_chk_enter(void) { depth++; }
+void phase_chk_leave(void) { depth--; }
+
+/* Live borrows of storage `p`: in the current frame only, or in any. */
+static void borrows_of(const void *p, int any_frame, int *readers, int *writer) {
+    *readers = 0;
+    *writer = 0;
+    for (int i = 0; i < MAX_HANDLES; i++) {
+        const Handle *h = &handles[i];
+        if (h->in_use && !h->released && h->p == p && (any_frame || h->depth == depth)) {
+            if (h->write) {
+                (*writer)++;
+            } else {
+                (*readers)++;
+            }
+        }
+    }
+}
 
 static const char *dom_name(int d) {
     switch (d) {
@@ -76,7 +101,9 @@ static Storage *live(const void *p, const char *name, const char *what) {
 }
 
 static void no_borrows(const Storage *s, const char *name, const char *what) {
-    if (s->readers || s->writer) {
+    int readers, writer;
+    borrows_of(s->p, 0, &readers, &writer);
+    if (readers || writer) {
         fail("'%s' has a live borrow; cannot %s", name, what);
     }
 }
@@ -89,7 +116,7 @@ void phase_chk_create(const void *storage, int domain, const char *name) {
     }
     for (int i = 0; i < MAX_STORAGES; i++) {
         if (!storages[i].in_use) {
-            storages[i] = (Storage){storage, name, domain, 0, 0, 0, 1};
+            storages[i] = (Storage){storage, name, domain, 0, 1};
             return;
         }
     }
@@ -101,7 +128,9 @@ void phase_chk_scope_end(const void *storage, const char *name) {
     if (!s->destroyed && device_owned(s->domain)) {
         fail("'%s' goes out of scope while owned by %s", name, dom_name(s->domain));
     }
-    if (s->readers || s->writer) {
+    int readers, writer;
+    borrows_of(storage, 1, &readers, &writer);
+    if (readers || writer) {
         fail("'%s' goes out of scope with a live borrow", name);
     }
     s->in_use = 0;
@@ -149,17 +178,14 @@ int phase_chk_borrow(const void *p, int write, const char *name) {
     if (device_owned(s->domain)) {
         fail("borrow '%s' of a buffer owned by %s", name, dom_name(s->domain));
     }
-    if (s->writer || (write && s->readers)) {
+    int readers, writer;
+    borrows_of(p, 0, &readers, &writer);
+    if (writer || (write && readers)) {
         fail("borrow '%s' conflicts with a live borrow of the same buffer", name);
-    }
-    if (write) {
-        s->writer = 1;
-    } else {
-        s->readers++;
     }
     for (int i = 0; i < MAX_HANDLES; i++) {
         if (!handles[i].in_use) {
-            handles[i] = (Handle){p, name, write, 0, 1};
+            handles[i] = (Handle){p, name, write, 0, 1, depth};
             return i;
         }
     }
@@ -178,12 +204,6 @@ void phase_chk_release(int h, const char *name) {
     Handle *hd = handle(h, name);
     if (hd->released) {
         fail("borrow '%s' released twice", name);
-    }
-    Storage *s = find(hd->p, name);
-    if (hd->write) {
-        s->writer = 0;
-    } else {
-        s->readers--;
     }
     hd->released = 1;
 }
@@ -209,9 +229,11 @@ void phase_chk_arg(const void *p, int via, int param_domain, int access,
         fail("'%s' is in %s but '%s' expects %s", name, dom_name(s->domain), callee,
              dom_name(param_domain));
     }
+    int readers, writer;
+    borrows_of(p, 0, &readers, &writer);
     switch (via) {
     case PHASE_VIA_OWNER:
-        if (s->writer || (access != PHASE_ACC_READ && s->readers)) {
+        if (writer || (access != PHASE_ACC_READ && readers)) {
             fail("'%s' passed to '%s' while borrowed", name, callee);
         }
         break;

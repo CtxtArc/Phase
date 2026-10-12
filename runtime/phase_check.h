@@ -27,6 +27,10 @@ enum { PHASE_DOM_RAM, PHASE_DOM_STACK, PHASE_DOM_DMA, PHASE_DOM_MMIO, PHASE_DOM_
 enum { PHASE_ACC_NONE, PHASE_ACC_READ, PHASE_ACC_WRITE };
 enum { PHASE_VIA_OWNER, PHASE_VIA_READ_BORROW, PHASE_VIA_WRITE_BORROW };
 
+/* PHASE function entry/exit (borrow rules are per call frame) */
+void phase_chk_enter(void);
+void phase_chk_leave(void);
+
 /* storage lifetime */
 void phase_chk_create(const void *storage, int domain, const char *name);
 void phase_chk_scope_end(const void *storage, const char *name);

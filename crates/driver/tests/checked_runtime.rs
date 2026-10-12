@@ -260,3 +260,37 @@ fn every_buildable_example_runs_clean_when_checked() {
         );
     }
 }
+
+#[test]
+fn a_callee_using_a_parameter_granted_by_a_callers_borrow_is_not_a_violation() {
+    // The caller's write borrow is what grants `helper` access to `p`; it
+    // must not count against `helper`'s own use of `p` (borrow checks are
+    // per call frame). Was a false alarm in the first version of the
+    // runtime checker, found by the fuzzer.
+    let src = with(
+        r#"
+        fn helper(p: read buffer<u8, 8> @RAM) { look(p); let r = borrow p read; look(r); look(p); release r; }
+        fn mover(p: buffer<u8, 8> @RAM) { move p -> @DMA; sync(p); poke(p); }
+        fn main() {
+            buffer<u8, 8> x @RAM;
+            let w = borrow x write;
+            helper(w);
+            mover(w);
+            release w;
+        }
+        "#,
+    );
+    let (code, stderr) = run_unanalyzed("rt_frames", &src, 1);
+    assert_eq!(code, 0, "{stderr}");
+}
+
+#[test]
+fn a_callee_still_conflicts_with_its_own_borrows() {
+    caught(
+        "rt_own_frame",
+        &with(
+            "fn helper(p: buffer<u8, 8> @RAM) { let r = borrow p read; poke(p); release r; } fn main() { buffer<u8, 8> x @RAM; helper(x); }",
+        ),
+        "'p' passed to 'poke' while borrowed",
+    );
+}

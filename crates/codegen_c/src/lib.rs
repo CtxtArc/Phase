@@ -345,6 +345,9 @@ impl FnCx<'_> {
         for scope in self.scopes.iter().rev() {
             s.push_str(&Self::scope_end_checks(scope, pad));
         }
+        if self.sig.name != "main" {
+            s.push_str(&format!("{pad}phase_chk_leave();\n"));
+        }
         s
     }
 
@@ -437,6 +440,9 @@ fn format_fn(
     };
 
     let mut out = format!("{ret} {name}({params}) {{\n");
+    if checked && !is_main {
+        out.push_str("    phase_chk_enter();\n");
+    }
     let mut cx = FnCx {
         sigs,
         externs,
