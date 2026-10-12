@@ -1,0 +1,18 @@
+// Bug gallery #27: passing a shorter buffer where a longer one is
+// expected. The callee is told the length it declared, not the one it was
+// given -- `fill` below would write 256 samples into 64: a buffer
+// overflow in the generated C. Before v1.3 buffer types weren't compared
+// at call sites at all.
+// Expected: "'calibrate' expects buffer<f32, 256> for 'frame', but 'probe' is buffer<f32, 64>"
+
+extern fn fill(dst: write buffer<f32, 256> @RAM);
+
+fn calibrate(frame: write buffer<f32, 256> @RAM) {
+    fill(frame);
+}
+
+fn main() {
+    buffer<f32, 64> probe @RAM;
+    // BUG: 64 samples where 256 are required.
+    calibrate(probe);
+}

@@ -49,6 +49,23 @@ impl<T> std::ops::Deref for Spanned<T> {
     }
 }
 
+/// A buffer type's length: a constant, or `_` -- any length, allowed only
+/// in parameter types (the actual length is passed at run time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferLen {
+    Fixed(u64),
+    Any,
+}
+
+impl std::fmt::Display for BufferLen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BufferLen::Fixed(n) => write!(f, "{n}"),
+            BufferLen::Any => write!(f, "_"),
+        }
+    }
+}
+
 /// The five physical domains (spec §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Domain {
@@ -90,7 +107,7 @@ pub enum TypeExpr {
     Named(String),
     Buffer {
         elem: Box<TypeExpr>,
-        len: u64,
+        len: BufferLen,
     },
     /// `Packet<Received>` — `name` is the `state`-declared machine name
     /// (`Packet`), `state` is the specific state (`Received`).

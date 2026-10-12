@@ -30,7 +30,7 @@
 //! * **MMIO** -- `volatile_read`/`volatile_write` take an `@MMIO` register
 //!   reference as their first argument.
 
-use phase_ast::{BorrowMode, Domain, Expr, FnDecl, Item, Program, Span, Stmt, TypeExpr};
+use phase_ast::{BorrowMode, BufferLen, Domain, Expr, FnDecl, Item, Program, Span, Stmt, TypeExpr};
 use std::collections::{HashMap, HashSet};
 
 /// How serious a diagnostic is.
@@ -130,6 +130,8 @@ type Typestate = (String, String);
 #[derive(Debug, Clone)]
 struct FnSig {
     param_names: Vec<String>,
+    /// Declared parameter types (for checking buffer arguments).
+    param_types: Vec<TypeExpr>,
     /// Declared `read` / `write` access per parameter (`None`: no mode).
     param_access: Vec<Option<BorrowMode>>,
     param_domains: Vec<Option<Domain>>,
@@ -299,6 +301,7 @@ pub fn analyze_full(program: &Program) -> Report {
         }
         FnSig {
             param_names: params.iter().map(|p| p.name.clone()).collect(),
+            param_types: params.iter().map(|p| p.ty.clone()).collect(),
             param_access: params.iter().map(|p| p.access).collect(),
             param_domains: params.iter().map(|p| p.domain).collect(),
             param_domains_after: params.iter().map(|p| p.domain_after).collect(),
@@ -320,6 +323,49 @@ pub fn analyze_full(program: &Program) -> Report {
             Item::ExternFn(f) => {
                 let sig = build_sig(&f.name, &f.params, &f.return_type, &mut errors);
                 fn_sigs.insert(f.name.as_str(), sig);
+            }
+            _ => {}
+        }
+    }
+
+    // `buffer<T, _>` (run-time length) is only meaningful for parameters,
+    // whose length travels with them; storage needs a concrete length.
+    let any_len = |t: &TypeExpr| {
+        matches!(
+            t,
+            TypeExpr::Buffer {
+                len: BufferLen::Any,
+                ..
+            }
+        )
+    };
+    for item in &program.items {
+        match item {
+            Item::Entity(e) => {
+                for f in e.fields.iter().filter(|f| any_len(&f.ty)) {
+                    errors.push(err(format!(
+                        "field '{}' of entity '{}' has length `_`; only parameters may have a run-time length",
+                        f.name, e.name
+                    )));
+                }
+            }
+            Item::Fn(f) if f.return_type.as_ref().is_some_and(any_len) => {
+                errors.push(
+                    err(format!(
+                        "'{}' returns a buffer of length `_`; only parameters may have a run-time length",
+                        f.name
+                    ))
+                    .at(f.name_span),
+                );
+            }
+            Item::ExternFn(f) if f.return_type.as_ref().is_some_and(any_len) => {
+                errors.push(
+                    err(format!(
+                        "'{}' returns a buffer of length `_`; only parameters may have a run-time length",
+                        f.name
+                    ))
+                    .at(f.name_span),
+                );
             }
             _ => {}
         }
@@ -511,6 +557,51 @@ fn legal_sync_source(from: Domain) -> bool {
 /// Domains in which an entity is owned by hardware, not the CPU.
 fn is_device_owned(d: Domain) -> bool {
     matches!(d, Domain::Dma | Domain::Device)
+}
+
+/// If `arg` can't be passed where `param` is expected, describe what it is
+/// instead. Only buffers and entity/typestate base types are compared;
+/// scalars convert as in C. `None` arg type (inferred) is not checked here.
+fn arg_type_mismatch(param: &TypeExpr, arg: Option<&TypeExpr>) -> Option<String> {
+    let arg = arg?;
+    match (param, arg) {
+        (TypeExpr::Buffer { elem: pe, len: pl }, TypeExpr::Buffer { elem: ae, len: al }) => {
+            let len_ok = match (pl, al) {
+                (BufferLen::Any, _) => true,
+                (BufferLen::Fixed(m), BufferLen::Fixed(n)) => m == n,
+                (BufferLen::Fixed(_), BufferLen::Any) => false,
+            };
+            if pe == ae && len_ok {
+                None
+            } else if pe == ae {
+                Some(match al {
+                    BufferLen::Any => format!(
+                        "{} (a run-time length, which may not be {})",
+                        fmt_type(arg),
+                        pl
+                    ),
+                    BufferLen::Fixed(_) => fmt_type(arg),
+                })
+            } else {
+                Some(fmt_type(arg))
+            }
+        }
+        (TypeExpr::Buffer { .. }, other) => Some(format!("{}, not a buffer", fmt_type(other))),
+        (_, TypeExpr::Buffer { .. }) => Some(format!("a buffer ({})", fmt_type(arg))),
+        _ => match (param.base_name(), arg.base_name()) {
+            (Some(p), Some(a)) if p != a && !is_scalar_name(p) && !is_scalar_name(a) => {
+                Some(fmt_type(arg))
+            }
+            _ => None,
+        },
+    }
+}
+
+fn is_scalar_name(n: &str) -> bool {
+    matches!(
+        n,
+        "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64" | "bool"
+    )
 }
 
 fn fmt_type(t: &TypeExpr) -> String {
@@ -1544,6 +1635,19 @@ impl<'a> FnChecker<'a> {
             }
         }
 
+        if let Some(TypeExpr::Buffer {
+            len: BufferLen::Any,
+            ..
+        }) = ty
+        {
+            errors.push(
+                err(format!(
+                    "'{name}' needs a concrete length: `_` is only allowed in parameter types, where the length is passed at run time"
+                ))
+                .about(name),
+            );
+        }
+
         let resolved_domain = match (domain, ty) {
             (Some(d), _) => Some(d),
             (None, Some(TypeExpr::Buffer { .. })) => {
@@ -2005,6 +2109,23 @@ impl<'a> FnChecker<'a> {
                         errors,
                     ) {
                         continue;
+                    }
+
+                    // Buffer arguments must match the parameter's element type
+                    // and length; a `buffer<T, _>` parameter accepts any
+                    // length, but a run-time length only fits another `_`.
+                    if let Some(param_ty) = sig.param_types.get(i) {
+                        if let Some(msg) = arg_type_mismatch(param_ty, var.ty.as_ref()) {
+                            errors.push(
+                                err(format!(
+                                    "'{callee}' expects {} for '{pname}', but '{name}' is {msg}",
+                                    fmt_type(param_ty)
+                                ))
+                                .about(name)
+                                .note(var.origin, format!("'{name}' is declared here")),
+                            );
+                            continue;
+                        }
                     }
 
                     // Read-only data (a read borrow or a `read` parameter)
@@ -4281,6 +4402,119 @@ mod swap_scope_tests {
                 "extern fn flip() -> bool; fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; let c: bool = flip(); if c { swap a, b; } }",
             ),
             Ok(())
+        );
+    }
+}
+
+/// v1.3: buffer types are checked at call sites; `buffer<T, _>` parameters.
+#[cfg(test)]
+mod buffer_type_tests {
+    use super::*;
+
+    fn check(src: &str) -> Result<(), Vec<AnalysisError>> {
+        analyze(&phase_parser::parse(src).expect("fixture must parse"))
+    }
+
+    #[track_caller]
+    fn rejects(src: &str, needle: &str) {
+        match check(src) {
+            Ok(()) => panic!("expected an error containing {needle:?}, got Ok(())"),
+            Err(errs) => assert!(
+                errs.iter().any(|e| e.message.contains(needle)),
+                "expected {needle:?}, got {errs:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn length_mismatch_is_rejected() {
+        rejects(
+            "extern fn f(x: write buffer<u8, 16> @RAM); fn main() { buffer<u8, 4> b @RAM; f(b); }",
+            "'f' expects buffer<u8, 16> for 'x', but 'b' is buffer<u8, 4>",
+        );
+    }
+
+    #[test]
+    fn element_type_mismatch_is_rejected() {
+        rejects(
+            "extern fn f(x: write buffer<f32, 4> @RAM); fn main() { buffer<u8, 4> b @RAM; f(b); }",
+            "'f' expects buffer<f32, 4> for 'x', but 'b' is buffer<u8, 4>",
+        );
+    }
+
+    #[test]
+    fn a_borrow_carries_its_targets_type() {
+        rejects(
+            "extern fn f(x: read buffer<u8, 16> @RAM); fn main() { buffer<u8, 4> b @RAM; let r = borrow b read; f(r); release r; }",
+            "but 'r' is buffer<u8, 4>",
+        );
+    }
+
+    #[test]
+    fn scalar_or_entity_where_a_buffer_is_expected_is_rejected() {
+        rejects(
+            "extern fn f(x: read buffer<u8, 4> @RAM); fn main() { let n: u32 = 1; f(n); }",
+            "but 'n' is u32, not a buffer",
+        );
+        rejects(
+            "entity S : @RAM { v: u32 } extern fn g(s: S @RAM); fn main() { buffer<u8, 4> b @RAM; g(b); }",
+            "'g' expects S for 's', but 'b' is a buffer (buffer<u8, 4>)",
+        );
+    }
+
+    #[test]
+    fn entity_base_type_mismatch_is_rejected() {
+        rejects(
+            "entity A : @RAM { v: u32 } entity B : @RAM { v: u32 } extern fn g(a: A @RAM); fn main() { let b: B @RAM = B { v: 1 }; g(b); }",
+            "'g' expects A for 'a', but 'b' is B",
+        );
+    }
+
+    #[test]
+    fn generic_length_parameter_accepts_any_length() {
+        assert_eq!(
+            check(
+                "extern fn f(x: read buffer<u8, _> @RAM); fn main() { buffer<u8, 4> a @RAM; buffer<u8, 64> b @RAM; f(a); f(b); }"
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn generic_length_flows_only_into_generic_parameters() {
+        assert_eq!(
+            check(
+                "extern fn f(x: read buffer<u8, _> @RAM); fn g(b: read buffer<u8, _> @RAM) { f(b); } fn main() { buffer<u8, 4> a @RAM; g(a); }"
+            ),
+            Ok(())
+        );
+        rejects(
+            "extern fn f(x: read buffer<u8, 8> @RAM); fn g(b: read buffer<u8, _> @RAM) { f(b); } fn main() { }",
+            "but 'b' is buffer<u8, _> (a run-time length, which may not be 8)",
+        );
+    }
+
+    #[test]
+    fn generic_length_still_checks_the_element_type() {
+        rejects(
+            "extern fn f(x: read buffer<f32, _> @RAM); fn main() { buffer<u8, 4> a @RAM; f(a); }",
+            "'f' expects buffer<f32, _> for 'x', but 'a' is buffer<u8, 4>",
+        );
+    }
+
+    #[test]
+    fn underscore_length_outside_parameters_is_rejected() {
+        rejects(
+            "fn main() { buffer<u8, _> b @RAM; }",
+            "'b' needs a concrete length",
+        );
+        rejects(
+            "entity S : @RAM { data: buffer<u8, _> } fn main() { }",
+            "field 'data' of entity 'S' has length `_`",
+        );
+        rejects(
+            "extern fn mk() -> buffer<u8, _>; fn main() { }",
+            "'mk' returns a buffer of length `_`",
         );
     }
 }

@@ -300,11 +300,12 @@ impl Parser {
             self.expect(TokenKind::Comma)?;
             let len_span = self.peek_span();
             let len = match self.bump().kind {
-                TokenKind::Int(n) if n >= 0 => n as u64,
+                TokenKind::Int(n) if n >= 0 => BufferLen::Fixed(n as u64),
+                TokenKind::Ident(s) if s == "_" => BufferLen::Any,
                 other => {
                     return Err(ParseError {
                         message: format!(
-                            "expected non-negative integer buffer length, found {:?}",
+                            "expected a non-negative integer buffer length or `_`, found {:?}",
                             other
                         ),
                         span: len_span,
@@ -846,7 +847,7 @@ mod tests {
                     f.params[0].ty,
                     TypeExpr::Buffer {
                         elem: Box::new(TypeExpr::Named("Sample".into())),
-                        len: 1024
+                        len: BufferLen::Fixed(1024)
                     }
                 );
             }
@@ -887,7 +888,7 @@ mod tests {
                     name: "raw".into(),
                     ty: Some(TypeExpr::Buffer {
                         elem: Box::new(TypeExpr::Named("Sample".into())),
-                        len: 1024
+                        len: BufferLen::Fixed(1024)
                     }),
                     domain: Some(Domain::Dma),
                     init: None,

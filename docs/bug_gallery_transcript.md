@@ -40,6 +40,12 @@ OK: examples/mmio_poll.phase parsed and passed domain/ownership analysis (0 enti
 OK: examples/mmio_registers.phase parsed and passed domain/ownership analysis (0 entities, 1 fn)
 ```
 
+### `examples/multi_rate.phase`
+
+```
+OK: examples/multi_rate.phase parsed and passed domain/ownership analysis (1 entity, 3 fns)
+```
+
 ### `examples/overlapped_capture.phase`
 
 ```
@@ -146,6 +152,44 @@ note: 'b' arrives in @DMA here
    |                 ------------------------------
 
 examples/bug_gallery/broken_sync_promise.phase: 1 error found
+```
+
+### `examples/bug_gallery/buffer_element_mismatch.phase`
+
+Bug gallery #28: passing a buffer of the wrong element type -- raw bytes
+
+```
+error: 'fir' expects buffer<f32, 64> for 'in_', but 'raw' is buffer<u8, 64>
+  --> examples/bug_gallery/buffer_element_mismatch.phase:14:9
+   |
+14 |     fir(raw, out);
+   |         ^^^
+note: 'raw' is declared here
+  --> examples/bug_gallery/buffer_element_mismatch.phase:10:5
+   |
+10 |     buffer<u8, 64> raw @RAM;
+   |     ------------------------
+
+examples/bug_gallery/buffer_element_mismatch.phase: 1 error found
+```
+
+### `examples/bug_gallery/buffer_length_mismatch.phase`
+
+Bug gallery #27: passing a shorter buffer where a longer one is
+
+```
+error: 'calibrate' expects buffer<f32, 256> for 'frame', but 'probe' is buffer<f32, 64>
+  --> examples/bug_gallery/buffer_length_mismatch.phase:17:15
+   |
+17 |     calibrate(probe);
+   |               ^^^^^
+note: 'probe' is declared here
+  --> examples/bug_gallery/buffer_length_mismatch.phase:15:5
+   |
+15 |     buffer<f32, 64> probe @RAM;
+   |     ---------------------------
+
+examples/bug_gallery/buffer_length_mismatch.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/destroy_while_dma.phase`
@@ -401,6 +445,25 @@ note: 'pong' is declared in @RAM here
    |     ---------------------------
 
 examples/bug_gallery/refill_while_processing.phase: 3 errors found
+```
+
+### `examples/bug_gallery/runtime_length_to_fixed.phase`
+
+Bug gallery #29: a length-generic helper (`buffer<T, _>`) handing its
+
+```
+error: 'fft128' expects buffer<f32, 128> for 'x', but 'b' is buffer<f32, _> (a run-time length, which may not be 128)
+  --> examples/bug_gallery/runtime_length_to_fixed.phase:10:12
+   |
+10 |     fft128(b);
+   |            ^
+note: 'b' is declared here
+  --> examples/bug_gallery/runtime_length_to_fixed.phase:8:16
+   |
+ 8 | fn analyze_any(b: write buffer<f32, _> @RAM) {
+   |                ----------------------------
+
+examples/bug_gallery/runtime_length_to_fixed.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/shadowed_dma_buffer.phase`

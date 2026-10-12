@@ -1,0 +1,15 @@
+// Bug gallery #28: passing a buffer of the wrong element type -- raw bytes
+// where a kernel expects floating-point samples. The kernel would
+// reinterpret every 4 bytes as a float (and read 4x past the end).
+// Expected: "'fir' expects buffer<f32, 64> for 'in_', but 'raw' is buffer<u8, 64>"
+
+extern fn fir(in_: read buffer<f32, 64> @RAM, out: write buffer<f32, 64> @RAM);
+extern fn receive(dst: write buffer<u8, 64> @RAM);
+
+fn main() {
+    buffer<u8, 64> raw @RAM;
+    buffer<f32, 64> out @RAM;
+    receive(raw);
+    // BUG: bytes, not samples.
+    fir(raw, out);
+}

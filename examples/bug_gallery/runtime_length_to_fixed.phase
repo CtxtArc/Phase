@@ -1,0 +1,16 @@
+// Bug gallery #29: a length-generic helper (`buffer<T, _>`) handing its
+// buffer to a kernel that requires one exact length. The helper accepts
+// buffers of any length, so nothing guarantees this one is 128 long.
+// Expected: "'fft128' expects buffer<f32, 128> for 'x', but 'b' is buffer<f32, _>"
+
+extern fn fft128(x: write buffer<f32, 128> @RAM);
+
+fn analyze_any(b: write buffer<f32, _> @RAM) {
+    // BUG: `b` may be any length.
+    fft128(b);
+}
+
+fn main() {
+    buffer<f32, 32> short @RAM;
+    analyze_any(short);
+}

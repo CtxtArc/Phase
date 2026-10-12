@@ -35,7 +35,7 @@
 //! typestate safety, only enough domain bookkeeping (which domain an
 //! entity is in right now) to pick the correct runtime call for `sync`.
 
-use phase_ast::{BinOp, BorrowMode, Domain, Expr, Item, Program, Stmt, TypeExpr};
+use phase_ast::{BinOp, BorrowMode, BufferLen, Domain, Expr, Item, Program, Stmt, TypeExpr};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,9 +76,11 @@ pub enum PirType {
     Scalar(String),
     /// The name of a struct generated from a PHASE `entity` declaration.
     Named(String),
+    /// `len` is `None` for a `buffer<T, _>` parameter: the length is only
+    /// known at run time, from the parameter's `_len` companion.
     Buffer {
         elem: Box<PirType>,
-        len: u64,
+        len: Option<u64>,
     },
 }
 
@@ -301,7 +303,10 @@ fn resolve_type(ty: &TypeExpr, known_entities: &HashMap<&str, ()>) -> Result<Pir
         }
         TypeExpr::Buffer { elem, len } => Ok(PirType::Buffer {
             elem: Box::new(resolve_type(elem, known_entities)?),
-            len: *len,
+            len: match len {
+                BufferLen::Fixed(n) => Some(*n),
+                BufferLen::Any => None,
+            },
         }),
     }
 }
@@ -905,7 +910,7 @@ mod tests {
                     name: "x".into(),
                     ty: PirType::Buffer {
                         elem: Box::new(PirType::Scalar("uint8_t".into())),
-                        len: 16
+                        len: Some(16)
                     },
                     domain: Some(Domain::Ram),
                 },
@@ -943,7 +948,7 @@ mod tests {
             pir.extern_fns[0].params[0].1,
             PirType::Buffer {
                 elem: Box::new(PirType::Scalar("uint8_t".into())),
-                len: 4
+                len: Some(4)
             }
         );
     }

@@ -280,3 +280,67 @@ fn ping_pong_processes_every_frame_in_order_from_alternating_buffers() {
         assert!(started < processed_prev, "frame {k}:\n{stdout}");
     }
 }
+
+#[test]
+fn multi_rate_passes_each_buffers_real_length_through_generic_helpers() {
+    let root = workspace_root();
+    let out = phase()
+        .current_dir(std::env::temp_dir())
+        .env_remove("PHASE_RUNTIME_DIR")
+        .arg("build")
+        .arg(root.join("examples/multi_rate.phase"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = Command::new(root.join("build/multi_rate"))
+        .output()
+        .unwrap();
+    assert!(run.status.success());
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    for line in [
+        "start_capture: 64 samples",
+        "summarize: 64 samples",
+        "start_capture: 256 samples",
+        "summarize: 256 samples",
+        "decode_control: 64-sample control frame",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?} in:\n{stdout}");
+    }
+}
+
+#[test]
+fn stub_externs_build_without_a_runtime_file() {
+    let dir = std::env::temp_dir().join("phase_cli_stubs");
+    std::fs::create_dir_all(dir.join("runtime")).unwrap();
+    let root = workspace_root();
+    for f in ["phase_runtime.h", "phase_runtime.c"] {
+        std::fs::copy(root.join("runtime").join(f), dir.join("runtime").join(f)).unwrap();
+    }
+    let file = dir.join("stubby.phase");
+    std::fs::write(
+        &file,
+        "extern fn flip() -> bool;\nextern fn fill(x: write buffer<u8, 4> @RAM);\nfn main() {\n    buffer<u8, 4> b @RAM;\n    let c: bool = flip();\n    if c {\n        fill(b);\n    }\n}\n",
+    )
+    .unwrap();
+    let without = phase().arg("build").arg(&file).output().unwrap();
+    assert!(!without.status.success());
+    assert!(String::from_utf8_lossy(&without.stderr).contains("--stub-externs"));
+    let with = phase()
+        .args(["build", "--stub-externs"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        with.status.success(),
+        "{}",
+        String::from_utf8_lossy(&with.stderr)
+    );
+    assert!(Command::new(dir.join("build/stubby"))
+        .status()
+        .unwrap()
+        .success());
+}

@@ -117,9 +117,21 @@ fn type_name(ty: &PirType) -> String {
 /// Emit a full C declaration for a named variable/field of the given PIR
 /// type, handling the array-declarator wrapping C requires for buffers
 /// (`Sample name[1024];`, not `buffer<Sample,1024> name;`).
+/// A buffer's element count as a C expression: the constant for a fixed
+/// length, or the `<name>_len` companion of a `buffer<T, _>` parameter (or
+/// of a borrow of one).
+fn len_expr(name: &str, len: Option<u64>) -> String {
+    match len {
+        Some(n) => n.to_string(),
+        None => format!("{name}_len"),
+    }
+}
+
 fn declare(name: &str, ty: &PirType) -> String {
     match ty {
-        PirType::Buffer { elem, len } => format!("{} {}[{}]", type_name(elem), name, len),
+        PirType::Buffer { elem, len: Some(n) } => format!("{} {}[{}]", type_name(elem), name, n),
+        // Only parameters have a run-time length; they are pointers.
+        PirType::Buffer { elem, len: None } => format!("{}* {}", type_name(elem), name),
         other => format!("{} {}", type_name(other), name),
     }
 }
@@ -520,6 +532,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
             let (mut s, storage) = match ty {
                 PirType::Buffer { elem, len } if cx.swapped.contains(name) => {
                     let elem = type_name(elem);
+                    let len = len.unwrap_or_default();
                     (
                         format!(
                             "{pad}{elem} {name}__storage[{len}];\n{pad}{elem}* {name} = {name}__storage; /* swappable: see `swap` */\n"
@@ -639,7 +652,9 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
             // A buffer parameter is a pointer in C, so `sizeof` would give the
             // pointer's size; use the compile-time length instead.
             let nbytes = match cx.locals.get(name) {
-                Some(PirType::Buffer { len, .. }) => format!("{len} * sizeof({name}[0])"),
+                Some(PirType::Buffer { len, .. }) => {
+                    format!("{} * sizeof({name}[0])", len_expr(name, *len))
+                }
                 _ => format!("sizeof({name})"),
             };
             let mut s = String::new();
@@ -664,10 +679,14 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
             let ptr_ty = format!("{const_kw}{elem_ty}*");
             cx.locals.insert(
                 name.clone(),
-                target_ty.unwrap_or(PirType::Scalar("void".into())),
+                target_ty.clone().unwrap_or(PirType::Scalar("void".into())),
             );
             if is_buffer {
                 let mut s = format!("{pad}{ptr_ty} {name} = {target}; /* borrow */\n");
+                // A borrow of a run-time-length buffer carries the length too.
+                if let Some(PirType::Buffer { len: None, .. }) = &target_ty {
+                    s.push_str(&format!("{pad}size_t {name}_len = {target}_len;\n"));
+                }
                 if cx.checked {
                     let write = if *mode == BorrowMode::Write { 1 } else { 0 };
                     s.push_str(&format!(
@@ -838,7 +857,7 @@ fn format_args(
                     .unwrap_or(false);
                 if param_is_buffer {
                     if let Some(PirType::Buffer { len, .. }) = locals.get(name) {
-                        parts.push(len.to_string());
+                        parts.push(len_expr(name, *len));
                     } else {
                         parts.push(format!("sizeof({name})/sizeof({name}[0])"));
                     }
@@ -863,6 +882,30 @@ fn format_literal(lit: &PirLiteral) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_length_parameters_pass_their_runtime_length_on() {
+        let src = r#"
+            extern fn cap(x: write buffer<u8, _> @RAM -> @DMA);
+            extern fn look(x: read buffer<u8, _> @RAM);
+            fn grab(b: write buffer<u8, _> @RAM) { cap(b); sync(b); let r = borrow b read; look(r); release r; }
+            fn main() { buffer<u8, 4> x @RAM; grab(x); }
+        "#;
+        let g = generate_src(src, "t");
+        // the helper passes along the length it was given...
+        assert!(g.source.contains("cap(b, b_len);"), "{}", g.source);
+        assert!(
+            g.source
+                .contains("sim_dma_wait(\"b\", b, b_len * sizeof(b[0]));"),
+            "{}",
+            g.source
+        );
+        // ...a borrow of it carries the same length...
+        assert!(g.source.contains("size_t r_len = b_len;"), "{}", g.source);
+        assert!(g.source.contains("look(r, r_len);"), "{}", g.source);
+        // ...and the caller passes the concrete one.
+        assert!(g.source.contains("grab(x, 4);"), "{}", g.source);
+    }
 
     #[test]
     fn early_return_from_main_returns_zero() {

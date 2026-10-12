@@ -1,0 +1,38 @@
+// v1.3 example: length-generic buffer parameters.
+//
+// Two captures of different sizes -- a short control frame and a long
+// data frame -- share one set of helpers. `buffer<Sample, _>` in a
+// parameter type accepts a buffer of any length; the real length travels
+// with it at run time (the `_len` argument every buffer parameter already
+// has in C), so helpers and kernels never assume a size they weren't
+// given. Fixed-length parameters are still checked exactly: passing the
+// 64-sample frame where 256 are expected is a compile error, not an
+// overflow (see bug_gallery/buffer_length_mismatch.phase).
+
+entity Sample : @RAM {
+    value: f32
+}
+
+extern fn start_capture(dst: write buffer<Sample, _> @RAM -> @DMA);
+extern fn summarize(x: read buffer<Sample, _> @RAM);
+extern fn decode_control(x: read buffer<Sample, 64> @RAM);
+
+fn wait_capture(b: buffer<Sample, _> @DMA -> @RAM) {
+    sync(b);
+}
+
+fn capture(b: write buffer<Sample, _> @RAM) {
+    start_capture(b);
+    wait_capture(b);
+    summarize(b);
+}
+
+fn main() {
+    buffer<Sample, 64> control @RAM;
+    buffer<Sample, 256> data @RAM;
+
+    capture(control);
+    capture(data);
+
+    decode_control(control);
+}

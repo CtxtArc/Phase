@@ -239,6 +239,7 @@ fn every_buildable_example_runs_clean_when_checked() {
         "sdr_session",
         "overlapped_capture",
         "ping_pong",
+        "multi_rate",
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_phase"))
             .args(["build", "--checked"])
