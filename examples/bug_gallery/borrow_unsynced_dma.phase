@@ -1,0 +1,16 @@
+// Bug gallery #15: taking a borrow as a back door around sync(). A
+// borrow is CPU access; the buffer still belongs to the DMA engine.
+// Expected: "entity 'raw' is owned by @DMA; sync(raw) before borrowing it"
+
+extern fn device_capture(dst: buffer<u8, 64> @DMA);
+
+fn main() {
+    buffer<u8, 64> raw @DMA;
+    device_capture(raw);
+
+    // BUG: the capture hasn't been synced -- the CPU can't look yet.
+    let peek = borrow raw read;
+    release peek;
+
+    sync(raw);
+}

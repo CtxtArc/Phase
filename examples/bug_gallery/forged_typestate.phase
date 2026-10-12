@@ -1,0 +1,18 @@
+// Bug gallery #8: claiming a typestate with an annotation instead of
+// earning it. The annotation says Validated; receive_packet() actually
+// returns Received. The "goto fail" shape: a verification step that the
+// code *says* happened but never ran.
+// Expected: "'p' is declared as Packet<Validated> but 'receive_packet' returns Packet<Received>"
+
+state Packet {
+    Received -> Decoded -> Validated
+}
+
+extern fn receive_packet() -> Packet<Received>;
+extern fn handle(p: Packet<Validated>);
+
+fn main() {
+    // BUG: no decode(), no validate() -- just an annotation that lies.
+    let p: Packet<Validated> = receive_packet();
+    handle(p);
+}

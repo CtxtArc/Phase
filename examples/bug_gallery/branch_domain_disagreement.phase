@@ -2,8 +2,11 @@
 // and the merge point after the `if` has no way to know which one holds.
 // Expected: "entity 'x' disagrees on domain across incoming branches"
 
+extern fn should_use_dma() -> bool;
+
 fn main() {
     buffer<u8, 16> x @RAM;
+    let use_dma: bool = should_use_dma();
 
     if use_dma {
         move x -> @DMA;

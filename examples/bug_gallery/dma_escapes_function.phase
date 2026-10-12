@@ -1,0 +1,17 @@
+// Bug gallery #11: a function returns while hardware still owns one of
+// its buffers. The buffer's storage goes out of scope with a transfer
+// still pointed at it, and no caller can ever sync it.
+// Expected: "entity 'scratch' is still owned by @DMA when 'arm_capture' returns"
+
+extern fn start_capture(dst: buffer<u8, 64> @DMA);
+
+fn arm_capture() {
+    buffer<u8, 64> scratch @RAM;
+    move scratch -> @DMA;
+    start_capture(scratch);
+    // BUG: returns without sync(scratch).
+}
+
+fn main() {
+    arm_capture();
+}

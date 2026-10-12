@@ -1,0 +1,15 @@
+// Bug gallery #16: redeclaring a name to hide an in-flight buffer. The
+// original `buf` is still owned by the DMA engine; the new declaration
+// would silently lose track of it.
+// Expected: "'buf' is already declared in fn 'main'"
+
+extern fn start_rx(dst: buffer<u8, 64> @DMA);
+
+fn main() {
+    buffer<u8, 64> buf @RAM;
+    move buf -> @DMA;
+    start_rx(buf);
+
+    // BUG: a fresh `buf` shadows the one still owned by @DMA.
+    buffer<u8, 64> buf @RAM;
+}

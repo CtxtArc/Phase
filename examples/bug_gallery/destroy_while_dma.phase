@@ -1,0 +1,15 @@
+// Bug gallery #10: freeing a buffer while the DMA engine still owns it.
+// The engine keeps writing into memory the host has already released --
+// the cross-domain use-after-free behind CVE-2024-43856.
+// Expected: "entity 'rx' is still owned by @DMA; sync(rx) before destroying it"
+
+extern fn start_rx(dst: buffer<u8, 64> @DMA);
+
+fn main() {
+    buffer<u8, 64> rx @RAM;
+    move rx -> @DMA;
+    start_rx(rx);
+
+    // BUG: the transfer may still be in flight -- no sync(rx) first.
+    destroy rx;
+}

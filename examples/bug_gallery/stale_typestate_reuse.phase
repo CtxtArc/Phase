@@ -1,0 +1,23 @@
+// Bug gallery #9: reusing a typestate value after it has moved on.
+// p1 was handed to decode(); its Received-state handle is dead. Using it
+// again would process the same raw packet twice down a second path.
+// Expected: "value 'p1' was already consumed (passed to 'decode')"
+
+state Packet {
+    Received -> Decoded -> Validated
+}
+
+extern fn receive_packet() -> Packet<Received>;
+extern fn decode(p: Packet<Received>) -> Packet<Decoded>;
+extern fn validate(p: Packet<Decoded>) -> Packet<Validated>;
+extern fn handle(p: Packet<Validated>);
+
+fn main() {
+    let p1 = receive_packet();
+    let p2 = decode(p1);
+    let p3 = validate(p2);
+    handle(p3);
+
+    // BUG: p1 was consumed by decode() above.
+    let again = decode(p1);
+}

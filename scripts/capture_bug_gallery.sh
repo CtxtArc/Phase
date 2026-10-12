@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Regenerates docs/bug_gallery_transcript.md by actually running `phase
-# check` against every file under examples/bug_gallery/ and the two happy
-# paths, and capturing the real output. This is never hand-typed -- run
+# check` against every file under examples/bug_gallery/ and every
+# happy-path example, and capturing the real output. This is never hand-typed -- run
 # this script again after any change to the analyzer and the transcript
 # stays truthful.
 #
@@ -9,6 +9,7 @@
 #   ./scripts/capture_bug_gallery.sh
 
 set -euo pipefail
+export LC_ALL=C   # stable glob order regardless of the caller's locale
 cd "$(dirname "$0")/.."   # phase/ project root
 
 OUT="docs/bug_gallery_transcript.md"
@@ -29,9 +30,7 @@ BIN="target/debug/phase"
   echo "## Happy paths (expected to pass)"
   echo
 
-  for f in examples/radio_pipeline.phase examples/packet_pipeline.phase \
-           examples/branching_pipeline.phase examples/mmio_registers.phase \
-           examples/sdr_session.phase; do
+  for f in examples/*.phase; do
     echo "### \`$f\`"
     echo
     echo '```'

@@ -1,0 +1,15 @@
+// Bug gallery #13: using a borrow handle after releasing it. After
+// `release`, the owner is free to move the buffer to a device, so the
+// handle may point at memory the CPU no longer owns.
+// Expected: "borrow 'view' of 'frame' was already released"
+
+extern fn inspect(src: buffer<u8, 32> @RAM);
+
+fn main() {
+    buffer<u8, 32> frame @RAM;
+    let view = borrow frame read;
+    release view;
+
+    // BUG: view is dead.
+    inspect(view);
+}

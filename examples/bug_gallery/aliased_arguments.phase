@@ -1,0 +1,13 @@
+// Bug gallery #14: passing the same buffer as both input and output of a
+// kernel. An FIR filter that reads x[n-k] after it has already
+// overwritten x[n-k] produces silently wrong output.
+// Expected: "entity 'samples' is passed to 'fir_filter' more than once"
+
+extern fn fir_filter(in_: buffer<f32, 256> @RAM, out: buffer<f32, 256> @RAM);
+
+fn main() {
+    buffer<f32, 256> samples @RAM;
+
+    // BUG: in-place call through two parameters that assume distinct memory.
+    fir_filter(samples, samples);
+}

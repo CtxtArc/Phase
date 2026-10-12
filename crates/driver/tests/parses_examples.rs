@@ -290,31 +290,56 @@ mod analysis_end_to_end {
         assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
     }
 
+    /// Pull the `// Expected: "..."` string out of a bug-gallery file's
+    /// header comment. The quoted text may wrap across comment lines.
+    fn expected_error(src: &str) -> Option<String> {
+        let header: Vec<&str> = src
+            .lines()
+            .take_while(|l| l.trim_start().starts_with("//"))
+            .map(|l| l.trim_start().trim_start_matches("//").trim())
+            .collect();
+        let joined = header.join(" ");
+        let after = joined.split_once("Expected:")?.1;
+        let start = after.find('"')? + 1;
+        let len = after[start..].find('"')?;
+        Some(after[start..start + len].to_string())
+    }
+
     #[test]
-    fn every_bug_gallery_file_is_actually_rejected() {
+    fn every_bug_gallery_file_is_rejected_with_its_documented_error() {
         // A blanket sweep, independent of the specific-message tests above:
-        // every single file under bug_gallery/ must fail analysis. If a new
-        // bug-gallery file were ever added without actually being broken
-        // (or a fix accidentally over-corrected an old one into passing),
-        // this catches it even without a dedicated test for that file.
+        // every file under bug_gallery/ must fail analysis, *and* fail with
+        // the exact error its own header comment promises. A gallery file
+        // that is accidentally accepted, or rejected for some unrelated
+        // reason, fails here even without a dedicated test.
         let dir = super::workspace_root().join("examples/bug_gallery");
         let mut checked = 0;
-        for entry in std::fs::read_dir(&dir).expect("bug_gallery dir must exist") {
-            let path = entry.unwrap().path();
-            if path.extension().and_then(|e| e.to_str()) != Some("phase") {
-                continue;
-            }
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .expect("bug_gallery dir must exist")
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("phase"))
+            .collect();
+        paths.sort();
+        for path in paths {
             let src = std::fs::read_to_string(&path).unwrap();
+            let expected = expected_error(&src).unwrap_or_else(|| {
+                panic!("{path:?} has no `// Expected: \"...\"` line in its header")
+            });
             let program = phase_parser::parse(&src)
                 .unwrap_or_else(|e| panic!("{path:?} failed to parse: {e}"));
-            let result = phase_analysis::analyze(&program);
+            let errs = match phase_analysis::analyze(&program) {
+                Ok(()) => panic!(
+                    "{path:?} is in bug_gallery/ but analysis accepted it -- \
+                     every file there must be a real rejection case"
+                ),
+                Err(errs) => errs,
+            };
             assert!(
-                result.is_err(),
-                "{path:?} is in bug_gallery/ but analysis accepted it -- \
-                 every file there must be a real rejection case"
+                errs.iter().any(|e| e.message.contains(&expected)),
+                "{path:?} was rejected, but not with its documented error {expected:?}; got {errs:?}"
             );
             checked += 1;
         }
-        assert!(checked >= 7, "expected at least 7 bug-gallery files, found {checked}");
+        assert!(checked >= 16, "expected at least 16 bug-gallery files, found {checked}");
     }
 }

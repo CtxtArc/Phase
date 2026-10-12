@@ -1,0 +1,18 @@
+// Bug gallery #12: bypassing a live write borrow by touching the owner
+// directly. `view` was promised exclusive write access; handing `frame`
+// itself to another writer breaks that promise.
+// Expected: "entity 'frame' is borrowed by 'view'; it cannot be used directly"
+
+extern fn fill(dst: buffer<u8, 32> @RAM);
+extern fn scramble(dst: buffer<u8, 32> @RAM);
+
+fn main() {
+    buffer<u8, 32> frame @RAM;
+    let view = borrow frame write;
+    fill(view);
+
+    // BUG: frame is exclusively lent to `view` right now.
+    scramble(frame);
+
+    release view;
+}
