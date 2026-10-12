@@ -47,12 +47,7 @@ fn radio_pipeline_builds_and_runs_end_to_end() {
     let binary_path = build_dir.join("radio_pipeline_test_bin");
 
     let cc_output = Command::new("cc")
-        .args([
-            "-std=c11",
-            "-Wall",
-            "-Werror",
-            "-I",
-        ])
+        .args(["-std=c11", "-Wall", "-Werror", "-I"])
         .arg(&build_dir)
         .args(["-I"])
         .arg(&runtime_dir)
@@ -92,26 +87,60 @@ fn radio_pipeline_builds_and_runs_end_to_end() {
     // The real pipeline actually ran, in the right order: capture, wait
     // for the DMA transfer, filter, play back computed statistics, wait
     // for the device transfer.
-    let capture_pos = stdout.find("device_capture: filling 1024 samples").expect("capture trace missing");
-    let dma_wait_pos = stdout.find("sim_dma_wait(\"raw\"): DMA transfer complete").expect("DMA wait trace missing");
-    let filter_pos = stdout.find("fir_filter: filtering 1024 -> 1024 samples").expect("filter trace missing");
-    let playback_pos = stdout.find("device_playback: streaming 1024 samples").expect("playback trace missing");
+    let capture_pos = stdout
+        .find("device_capture: filling 1024 samples")
+        .expect("capture trace missing");
+    let dma_wait_pos = stdout
+        .find("sim_dma_wait(\"raw\"): DMA transfer complete")
+        .expect("DMA wait trace missing");
+    let filter_pos = stdout
+        .find("fir_filter: filtering 1024 -> 1024 samples")
+        .expect("filter trace missing");
+    let playback_pos = stdout
+        .find("device_playback: streaming 1024 samples")
+        .expect("playback trace missing");
     let device_wait_pos = stdout
         .find("sim_device_wait(\"filtered\"): device transfer complete")
         .expect("device wait trace missing");
 
-    assert!(capture_pos < dma_wait_pos, "capture must happen before the DMA sync completes");
-    assert!(dma_wait_pos < filter_pos, "DMA sync must complete before filtering");
-    assert!(filter_pos < playback_pos, "filtering must happen before playback");
-    assert!(playback_pos < device_wait_pos, "playback must happen before the device sync completes");
+    assert!(
+        capture_pos < dma_wait_pos,
+        "capture must happen before the DMA sync completes"
+    );
+    assert!(
+        dma_wait_pos < filter_pos,
+        "DMA sync must complete before filtering"
+    );
+    assert!(
+        filter_pos < playback_pos,
+        "filtering must happen before playback"
+    );
+    assert!(
+        playback_pos < device_wait_pos,
+        "playback must happen before the device sync completes"
+    );
 
     // The filter actually ran on real data, not stub zeros: playback's
     // reported RMS should be a real, non-trivial nonzero number.
-    let playback_line = stdout.lines().find(|l| l.contains("device_playback")).unwrap();
-    assert!(playback_line.contains("rms="), "playback line missing rms stat: {playback_line}");
-    let rms_str = playback_line.split("rms=").nth(1).unwrap().trim_end_matches(')').trim();
+    let playback_line = stdout
+        .lines()
+        .find(|l| l.contains("device_playback"))
+        .unwrap();
+    assert!(
+        playback_line.contains("rms="),
+        "playback line missing rms stat: {playback_line}"
+    );
+    let rms_str = playback_line
+        .split("rms=")
+        .nth(1)
+        .unwrap()
+        .trim_end_matches(')')
+        .trim();
     let rms: f64 = rms_str.parse().expect("rms should be a parseable number");
-    assert!(rms > 0.01, "expected a real nonzero RMS from actual filtered signal data, got {rms}");
+    assert!(
+        rms > 0.01,
+        "expected a real nonzero RMS from actual filtered signal data, got {rms}"
+    );
 }
 
 /// M8 end-to-end test: `examples/branching_pipeline.phase` builds with
@@ -136,7 +165,9 @@ fn build_branching_pipeline(variant: &str, use_dma_env: Option<&str>) -> std::pr
     let pir = phase_pir::build(&program).expect("M8: control flow must now lower to PIR");
     let generated = phase_codegen_c::generate(&pir, "branching_pipeline");
 
-    let build_dir = root.join("build").join(format!("branching_pipeline_{variant}"));
+    let build_dir = root
+        .join("build")
+        .join(format!("branching_pipeline_{variant}"));
     std::fs::create_dir_all(&build_dir).unwrap();
     let header_path = build_dir.join("branching_pipeline.gen.h");
     let source_path = build_dir.join("branching_pipeline.gen.c");
@@ -271,8 +302,14 @@ fn counting_loop_builds_and_runs_exactly_five_iterations() {
 /// thing standalone with installation instructions if it's missing.
 #[test]
 fn hw_uart_echo_runs_on_a_real_arm_cortex_m3_target_under_qemu() {
-    if Command::new("arm-none-eabi-gcc").arg("--version").output().is_err()
-        || Command::new("qemu-system-arm").arg("--version").output().is_err()
+    if Command::new("arm-none-eabi-gcc")
+        .arg("--version")
+        .output()
+        .is_err()
+        || Command::new("qemu-system-arm")
+            .arg("--version")
+            .output()
+            .is_err()
     {
         eprintln!(
             "skipping hw_uart_echo_runs_on_a_real_arm_cortex_m3_target_under_qemu: \
@@ -337,7 +374,14 @@ fn hw_uart_echo_runs_on_a_real_arm_cortex_m3_target_under_qemu() {
     );
 
     let qemu_output = Command::new("timeout")
-        .args(["3", "qemu-system-arm", "-M", "mps2-an385", "-nographic", "-kernel"])
+        .args([
+            "3",
+            "qemu-system-arm",
+            "-M",
+            "mps2-an385",
+            "-nographic",
+            "-kernel",
+        ])
         .arg(&elf_path)
         .output()
         .expect("failed to invoke qemu-system-arm");
@@ -412,7 +456,10 @@ fn mmio_poll_polls_exactly_three_times_before_terminating() {
     // condition was genuinely false on entry) and terminated on its own
     // (not stuck forever) once the simulated hardware became ready.
     for call in 1..=3 {
-        assert!(stdout.contains(&format!("call #{call}")), "stdout: {stdout}");
+        assert!(
+            stdout.contains(&format!("call #{call}")),
+            "stdout: {stdout}"
+        );
     }
     assert!(!stdout.contains("call #4"), "stdout: {stdout}");
 }

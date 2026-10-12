@@ -46,7 +46,11 @@ fn check_exit_code_reflects_the_verdict() {
         .arg(root.join("examples/sdr_session.phase"))
         .output()
         .unwrap();
-    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
 
     let bad = phase()
         .arg("check")
@@ -54,13 +58,17 @@ fn check_exit_code_reflects_the_verdict() {
         .output()
         .unwrap();
     assert_eq!(bad.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&bad.stderr)
-        .contains("'p' is declared as Packet<Validated> but 'receive_packet' returns Packet<Received>"));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains(
+        "'p' is declared as Packet<Validated> but 'receive_packet' returns Packet<Received>"
+    ));
 }
 
 #[test]
 fn missing_file_is_a_clean_error() {
-    let out = phase().args(["check", "/definitely/not/here.phase"]).output().unwrap();
+    let out = phase()
+        .args(["check", "/definitely/not/here.phase"])
+        .output()
+        .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("could not read"));
 }
@@ -87,5 +95,9 @@ fn build_works_from_an_unrelated_working_directory() {
     let run = Command::new(&binary).output().unwrap();
     assert!(run.status.success());
     let stdout = String::from_utf8_lossy(&run.stdout);
-    assert_eq!(stdout.matches("tick").count(), 5, "expected 5 ticks, got:\n{stdout}");
+    assert_eq!(
+        stdout.matches("tick").count(),
+        5,
+        "expected 5 ticks, got:\n{stdout}"
+    );
 }

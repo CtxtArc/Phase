@@ -231,8 +231,14 @@ fn main() -> ExitCode {
                 eprintln!("error: could not create '{}': {e}", build_dir.display());
                 return ExitCode::FAILURE;
             }
-            let header_path = build_dir.join(format!("{stem}.gen.h")).display().to_string();
-            let source_path = build_dir.join(format!("{stem}.gen.c")).display().to_string();
+            let header_path = build_dir
+                .join(format!("{stem}.gen.h"))
+                .display()
+                .to_string();
+            let source_path = build_dir
+                .join(format!("{stem}.gen.c"))
+                .display()
+                .to_string();
             if let Err(e) = fs::write(&header_path, &generated.header) {
                 eprintln!("error: could not write '{header_path}': {e}");
                 return ExitCode::FAILURE;

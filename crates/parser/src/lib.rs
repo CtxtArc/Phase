@@ -258,7 +258,10 @@ impl Parser {
                 TokenKind::Int(n) if n >= 0 => n as u64,
                 other => {
                     return Err(ParseError {
-                        message: format!("expected non-negative integer buffer length, found {:?}", other),
+                        message: format!(
+                            "expected non-negative integer buffer length, found {:?}",
+                            other
+                        ),
                         span: len_span,
                     })
                 }
@@ -585,7 +588,10 @@ impl Parser {
                     TokenKind::KwWrite => BorrowMode::Write,
                     other => {
                         return Err(ParseError {
-                            message: format!("expected 'read' or 'write' after borrow target, found {:?}", other),
+                            message: format!(
+                                "expected 'read' or 'write' after borrow target, found {:?}",
+                                other
+                            ),
                             span: self.peek_span(),
                         })
                     }
@@ -783,12 +789,7 @@ mod tests {
                         to: Domain::Dma
                     }
                 );
-                assert_eq!(
-                    f.body.stmts[1],
-                    Stmt::Sync {
-                        name: "raw".into()
-                    }
-                );
+                assert_eq!(f.body.stmts[1], Stmt::Sync { name: "raw".into() });
                 assert_eq!(
                     f.body.stmts[2],
                     Stmt::VarDecl {
@@ -999,7 +1000,9 @@ mod tests {
                     let eb = else_block.as_ref().unwrap();
                     assert_eq!(eb.stmts.len(), 1);
                     match &eb.stmts[0] {
-                        Stmt::If { cond, else_block, .. } => {
+                        Stmt::If {
+                            cond, else_block, ..
+                        } => {
                             assert_eq!(*cond, Expr::Ident("b".into()));
                             assert!(else_block.is_some());
                         }

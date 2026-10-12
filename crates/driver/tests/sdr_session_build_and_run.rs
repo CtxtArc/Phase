@@ -79,7 +79,9 @@ fn sdr_session_builds_and_runs_end_to_end() {
     // filter/playback, then the full typestate chain.
     let capture_pos = stdout.find("device_capture").expect("capture missing");
     let playback_pos = stdout.find("device_playback").expect("playback missing");
-    let receive_pos = stdout.find("receive_packet").expect("receive_packet missing");
+    let receive_pos = stdout
+        .find("receive_packet")
+        .expect("receive_packet missing");
     let decode_pos = stdout.find("decode: sequence").expect("decode missing");
     let validate_pos = stdout.find("validate: sequence").expect("validate missing");
     let handle_pos = stdout.find("handle: sequence").expect("handle missing");
@@ -88,5 +90,8 @@ fn sdr_session_builds_and_runs_end_to_end() {
     assert!(receive_pos < decode_pos);
     assert!(decode_pos < validate_pos);
     assert!(validate_pos < handle_pos);
-    assert!(stdout.contains("accepted"), "expected the packet to reach the accepted/Validated stage");
+    assert!(
+        stdout.contains("accepted"),
+        "expected the packet to reach the accepted/Validated stage"
+    );
 }

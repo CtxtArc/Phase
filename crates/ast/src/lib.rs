@@ -44,10 +44,16 @@ impl Domain {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
     Named(String),
-    Buffer { elem: Box<TypeExpr>, len: u64 },
+    Buffer {
+        elem: Box<TypeExpr>,
+        len: u64,
+    },
     /// `Packet<Received>` — `name` is the `state`-declared machine name
     /// (`Packet`), `state` is the specific state (`Received`).
-    Stateful { name: String, state: String },
+    Stateful {
+        name: String,
+        state: String,
+    },
 }
 
 impl TypeExpr {
@@ -193,19 +199,31 @@ pub enum Expr {
     StringLit(String),
     BoolLit(bool),
     /// `fir_filter(raw, filtered)`
-    Call { callee: String, args: Vec<Expr> },
+    Call {
+        callee: String,
+        args: Vec<Expr>,
+    },
     /// `Sample { value: 0.0 }`
     StructLit {
         name: String,
         fields: Vec<(String, Expr)>,
     },
     /// `borrow radio_buf read`
-    Borrow { target: String, mode: BorrowMode },
+    Borrow {
+        target: String,
+        mode: BorrowMode,
+    },
     /// `UART_STATUS @MMIO` — a name tagged with an explicit domain,
     /// used as an argument to volatile_read/volatile_write.
-    DomainRef { name: String, domain: Domain },
+    DomainRef {
+        name: String,
+        domain: Domain,
+    },
     /// `a.b`
-    FieldAccess { base: Box<Expr>, field: String },
+    FieldAccess {
+        base: Box<Expr>,
+        field: String,
+    },
     /// `lhs op rhs`
     Binary {
         op: BinOp,

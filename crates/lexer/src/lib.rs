@@ -40,28 +40,28 @@ pub enum TokenKind {
     KwFalse,
 
     // Punctuation
-    LBrace,   // {
-    RBrace,   // }
-    LParen,   // (
-    RParen,   // )
-    LAngle,   // <
-    RAngle,   // >
-    Colon,    // :
-    Semi,     // ;
-    Comma,    // ,
-    Dot,      // .
-    Arrow,    // ->
-    At,       // @
-    Eq,       // =
-    EqEq,     // ==
-    NotEq,    // !=
-    LtEq,     // <=
-    GtEq,     // >=
-    Plus,     // +
-    Minus,    // -
-    Star,     // *
-    Slash,    // /
-    Bang,     // !
+    LBrace, // {
+    RBrace, // }
+    LParen, // (
+    RParen, // )
+    LAngle, // <
+    RAngle, // >
+    Colon,  // :
+    Semi,   // ;
+    Comma,  // ,
+    Dot,    // .
+    Arrow,  // ->
+    At,     // @
+    Eq,     // =
+    EqEq,   // ==
+    NotEq,  // !=
+    LtEq,   // <=
+    GtEq,   // >=
+    Plus,   // +
+    Minus,  // -
+    Star,   // *
+    Slash,  // /
+    Bang,   // !
 
     Eof,
 }
@@ -261,12 +261,10 @@ impl<'a> Lexer<'a> {
                     span: start,
                 })
         } else {
-            s.parse::<i64>()
-                .map(TokenKind::Int)
-                .map_err(|e| LexError {
-                    message: format!("invalid integer literal '{s}': {e}"),
-                    span: start,
-                })
+            s.parse::<i64>().map(TokenKind::Int).map_err(|e| LexError {
+                message: format!("invalid integer literal '{s}': {e}"),
+                span: start,
+            })
         }
     }
 
@@ -378,11 +376,7 @@ mod tests {
     use TokenKind::*;
 
     fn kinds(src: &str) -> Vec<TokenKind> {
-        tokenize(src)
-            .unwrap()
-            .into_iter()
-            .map(|t| t.kind)
-            .collect()
+        tokenize(src).unwrap().into_iter().map(|t| t.kind).collect()
     }
 
     #[test]
@@ -395,8 +389,7 @@ mod tests {
         assert_eq!(
             kinds("entity fn let move sync borrow release destroy state"),
             vec![
-                KwEntity, KwFn, KwLet, KwMove, KwSync, KwBorrow, KwRelease, KwDestroy, KwState,
-                Eof
+                KwEntity, KwFn, KwLet, KwMove, KwSync, KwBorrow, KwRelease, KwDestroy, KwState, Eof
             ]
         );
     }
@@ -450,7 +443,10 @@ mod tests {
 
     #[test]
     fn line_comment_is_skipped() {
-        assert_eq!(kinds("let x // comment\n= 1;"), vec![KwLet, Ident("x".into()), Eq, Int(1), Semi, Eof]);
+        assert_eq!(
+            kinds("let x // comment\n= 1;"),
+            vec![KwLet, Ident("x".into()), Eq, Int(1), Semi, Eof]
+        );
     }
 
     #[test]

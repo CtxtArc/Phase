@@ -117,7 +117,9 @@ pub fn analyze(program: &Program) -> Result<(), Vec<AnalysisError>> {
     for item in &program.items {
         if let Item::State(s) = item {
             if let Some(first) = s.states.first() {
-                initial_states.entry(s.name.as_str()).or_insert(first.as_str());
+                initial_states
+                    .entry(s.name.as_str())
+                    .or_insert(first.as_str());
             }
             if state_machines.contains_key(s.name.as_str()) {
                 errors.push(err(format!(
@@ -144,9 +146,9 @@ pub fn analyze(program: &Program) -> Result<(), Vec<AnalysisError>> {
     // re-validated at every call site.
     let mut fn_sigs: HashMap<&str, FnSig> = HashMap::new();
     let build_sig = |name: &str,
-                          params: &[phase_ast::Param],
-                          return_type: &Option<TypeExpr>,
-                          errors: &mut Vec<AnalysisError>|
+                     params: &[phase_ast::Param],
+                     return_type: &Option<TypeExpr>,
+                     errors: &mut Vec<AnalysisError>|
      -> FnSig {
         let _ = name;
         FnSig {
@@ -433,11 +435,15 @@ impl<'a> FnChecker<'a> {
             .get(fn_name.as_str())
             .and_then(|sig| sig.return_state.clone());
         let Some(var) = self.locals.get(name) else {
-            errors.push(err(format!("unknown name '{name}' in return from '{fn_name}'")));
+            errors.push(err(format!(
+                "unknown name '{name}' in return from '{fn_name}'"
+            )));
             return;
         };
         if var.destroyed {
-            errors.push(err(format!("entity '{name}' was destroyed; cannot return it")));
+            errors.push(err(format!(
+                "entity '{name}' was destroyed; cannot return it"
+            )));
             return;
         }
         if let Some(how) = &var.consumed {
@@ -475,12 +481,16 @@ impl<'a> FnChecker<'a> {
         // Returning a tracked value hands it to the caller: it leaves this
         // function's scope, so it no longer counts against exit obligations.
         if var.is_tracked() {
-            self.locals.get_mut(name).unwrap().consumed = Some(format!("returned from '{fn_name}'"));
+            self.locals.get_mut(name).unwrap().consumed =
+                Some(format!("returned from '{fn_name}'"));
         }
     }
 
     fn has_live_borrow(&self, name: &str) -> bool {
-        self.borrows.get(name).map(|b| !b.is_empty()).unwrap_or(false)
+        self.borrows
+            .get(name)
+            .map(|b| !b.is_empty())
+            .unwrap_or(false)
     }
 
     /// Shared preconditions for `move` / `sync` / `destroy`: the name must be
@@ -670,9 +680,7 @@ impl<'a> FnChecker<'a> {
                         "cannot assign to '{name}': it is domain-tracked (use move/sync instead)"
                     )));
                 } else if var.destroyed {
-                    errors.push(err(format!(
-                        "cannot assign to '{name}': it was destroyed"
-                    )));
+                    errors.push(err(format!("cannot assign to '{name}': it was destroyed")));
                 }
                 self.check_expr(value, errors);
             }
@@ -699,7 +707,11 @@ impl<'a> FnChecker<'a> {
         &mut self,
         block: Option<&phase_ast::Block>,
         errors: &mut Vec<AnalysisError>,
-    ) -> (HashMap<String, VarState>, HashMap<String, BorrowState>, bool) {
+    ) -> (
+        HashMap<String, VarState>,
+        HashMap<String, BorrowState>,
+        bool,
+    ) {
         let saved_locals = self.locals.clone();
         let saved_borrows = self.borrows.clone();
         let saved_diverged = self.diverged;
@@ -759,12 +771,20 @@ impl<'a> FnChecker<'a> {
 
         match (then_div, else_div) {
             (true, true) => self.diverged = true,
-            (true, false) => {
-                self.adopt_branch(&base_locals, &base_borrows, else_locals, else_borrows, errors)
-            }
-            (false, true) => {
-                self.adopt_branch(&base_locals, &base_borrows, then_locals, then_borrows, errors)
-            }
+            (true, false) => self.adopt_branch(
+                &base_locals,
+                &base_borrows,
+                else_locals,
+                else_borrows,
+                errors,
+            ),
+            (false, true) => self.adopt_branch(
+                &base_locals,
+                &base_borrows,
+                then_locals,
+                then_borrows,
+                errors,
+            ),
             (false, false) => self.merge_branches(
                 MergeKind::If,
                 &base_locals,
@@ -784,7 +804,12 @@ impl<'a> FnChecker<'a> {
     /// entity, the body must leave the state exactly as it found it — a
     /// loop invariant — so the single pass is a genuine fixed point and the
     /// result holds for any number of iterations.
-    fn check_while(&mut self, cond: &Expr, body: &phase_ast::Block, errors: &mut Vec<AnalysisError>) {
+    fn check_while(
+        &mut self,
+        cond: &Expr,
+        body: &phase_ast::Block,
+        errors: &mut Vec<AnalysisError>,
+    ) {
         self.check_expr(cond, errors);
 
         let base_locals = self.locals.clone();
@@ -867,8 +892,12 @@ impl<'a> FnChecker<'a> {
         let mut merged_locals = HashMap::new();
         for name in names {
             let base_var = &base_locals[name];
-            let a = a_locals.get(name).expect("pre-existing local must survive both branches");
-            let b = b_locals.get(name).expect("pre-existing local must survive both branches");
+            let a = a_locals
+                .get(name)
+                .expect("pre-existing local must survive both branches");
+            let b = b_locals
+                .get(name)
+                .expect("pre-existing local must survive both branches");
 
             let domain = if a.domain == b.domain {
                 a.domain
@@ -942,14 +971,17 @@ impl<'a> FnChecker<'a> {
         for target in targets {
             let a_bs = a_borrows.get(target).unwrap_or(&empty);
             let b_bs = b_borrows.get(target).unwrap_or(&empty);
-            let agrees =
-                a_bs.readers == b_bs.readers && a_bs.writer == b_bs.writer;
+            let agrees = a_bs.readers == b_bs.readers && a_bs.writer == b_bs.writer;
             if !agrees {
                 errors.push(err(format!(
                     "entity '{target}' disagrees on borrow state across incoming branches{loop_note}"
                 )));
             }
-            let chosen = if !a_bs.is_empty() { a_bs.clone() } else { b_bs.clone() };
+            let chosen = if !a_bs.is_empty() {
+                a_bs.clone()
+            } else {
+                b_bs.clone()
+            };
             merged_borrows.insert(target.clone(), chosen);
         }
         self.borrows = merged_borrows;
@@ -1252,7 +1284,9 @@ impl<'a> FnChecker<'a> {
             return false;
         };
         if var.destroyed {
-            errors.push(err(format!("entity '{name}' was destroyed; cannot {usage}")));
+            errors.push(err(format!(
+                "entity '{name}' was destroyed; cannot {usage}"
+            )));
             return false;
         }
         if let Some(how) = &var.consumed {
@@ -1352,7 +1386,11 @@ impl<'a> FnChecker<'a> {
             errors.push(err(format!(
                 "'{callee}' expects {} argument{}, found {}",
                 sig.param_domains.len(),
-                if sig.param_domains.len() == 1 { "" } else { "s" },
+                if sig.param_domains.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 args.len()
             )));
         }
@@ -1369,9 +1407,7 @@ impl<'a> FnChecker<'a> {
             match arg {
                 Expr::Ident(name) => {
                     let Some(var) = self.locals.get(name).cloned() else {
-                        errors.push(err(format!(
-                            "unknown entity '{name}' passed to '{callee}'"
-                        )));
+                        errors.push(err(format!("unknown entity '{name}' passed to '{callee}'")));
                         continue;
                     };
                     if !self.check_entity_access(
@@ -1657,10 +1693,7 @@ mod tests {
                 sync(x);
             }
         "#;
-        assert_single_error_containing(
-            src,
-            "no legal sync transition from @RAM",
-        );
+        assert_single_error_containing(src, "no legal sync transition from @RAM");
     }
 
     #[test]
@@ -1866,7 +1899,10 @@ mod tests {
             }
         "#;
         // then: x is @DMA, else: x is @DEVICE -- they disagree at the join.
-        assert_single_error_containing(src, "entity 'x' disagrees on domain across incoming branches");
+        assert_single_error_containing(
+            src,
+            "entity 'x' disagrees on domain across incoming branches",
+        );
     }
 
     #[test]
@@ -1883,7 +1919,10 @@ mod tests {
         "#;
         // No else means the implicit "else" is "x is still @RAM" -- which
         // disagrees with the then-branch's @DMA.
-        assert_single_error_containing(src, "entity 'x' disagrees on domain across incoming branches");
+        assert_single_error_containing(
+            src,
+            "entity 'x' disagrees on domain across incoming branches",
+        );
     }
 
     #[test]
@@ -1968,7 +2007,10 @@ mod tests {
                 }
             }
         "#;
-        assert_single_error_containing(src, "entity 'x' disagrees on borrow state across incoming branches");
+        assert_single_error_containing(
+            src,
+            "entity 'x' disagrees on borrow state across incoming branches",
+        );
     }
 
     #[test]
@@ -1987,7 +2029,10 @@ mod tests {
             }
         "#;
         // Inner branch already disagrees, regardless of the outer branch.
-        assert_single_error_containing(src, "entity 'x' disagrees on domain across incoming branches");
+        assert_single_error_containing(
+            src,
+            "entity 'x' disagrees on domain across incoming branches",
+        );
     }
 
     #[test]
@@ -2022,7 +2067,10 @@ mod tests {
         "#;
         // Body-exit state (@DMA) disagrees with pre-loop state (@RAM) --
         // unsound if the loop runs a variable number of times.
-        assert_single_error_containing(src, "entity 'x' disagrees on domain across incoming branches");
+        assert_single_error_containing(
+            src,
+            "entity 'x' disagrees on domain across incoming branches",
+        );
     }
 
     #[test]
@@ -2077,10 +2125,7 @@ mod tests {
                 let status: u32 = volatile_read(x);
             }
         "#;
-        assert_single_error_containing(
-            src,
-            "'volatile_read' requires an @MMIO register reference",
-        );
+        assert_single_error_containing(src, "'volatile_read' requires an @MMIO register reference");
     }
 
     #[test]
@@ -2297,7 +2342,9 @@ mod soundness_tests {
             "fn main() { let p: Packet<Received> = Packet { sequence: 1 }; let d = decode(p); let v = validate(d); handle(v); }",
         ));
         rejects(
-            &with_packet("fn main() { let p: Packet<Validated> = Packet { sequence: 1 }; handle(p); }"),
+            &with_packet(
+                "fn main() { let p: Packet<Validated> = Packet { sequence: 1 }; handle(p); }",
+            ),
             "cannot be created directly in state Packet<Validated>",
         );
     }
@@ -2443,7 +2490,9 @@ mod soundness_tests {
     #[test]
     fn destroy_while_device_owned_is_rejected() {
         rejects(
-            &with_buf("fn main() { buffer<u8, 16> x @RAM; move x -> @DEVICE; play(x); destroy x; }"),
+            &with_buf(
+                "fn main() { buffer<u8, 16> x @RAM; move x -> @DEVICE; play(x); destroy x; }",
+            ),
             "still owned by @DEVICE; sync(x) before destroying it",
         );
     }
@@ -2528,7 +2577,9 @@ mod soundness_tests {
 
     #[test]
     fn dma_parameter_left_in_dma_is_the_callers_to_sync() {
-        accepts(&with_buf("fn kick(b: buffer<u8, 16> @DMA) { cap(b); } fn main() { }"));
+        accepts(&with_buf(
+            "fn kick(b: buffer<u8, 16> @DMA) { cap(b); } fn main() { }",
+        ));
     }
 
     #[test]
@@ -2554,7 +2605,9 @@ mod soundness_tests {
     #[test]
     fn using_the_owner_during_a_read_borrow_is_rejected() {
         rejects(
-            &with_buf("fn main() { buffer<u8, 16> x @RAM; let r = borrow x read; peek(x); release r; }"),
+            &with_buf(
+                "fn main() { buffer<u8, 16> x @RAM; let r = borrow x read; peek(x); release r; }",
+            ),
             "entity 'x' is borrowed by 'r'",
         );
     }
@@ -2569,7 +2622,9 @@ mod soundness_tests {
     #[test]
     fn using_a_released_borrow_is_rejected() {
         rejects(
-            &with_buf("fn main() { buffer<u8, 16> x @RAM; let r = borrow x read; release r; peek(r); }"),
+            &with_buf(
+                "fn main() { buffer<u8, 16> x @RAM; let r = borrow x read; release r; peek(r); }",
+            ),
             "borrow 'r' of 'x' was already released",
         );
     }
@@ -2577,7 +2632,9 @@ mod soundness_tests {
     #[test]
     fn borrowing_a_dma_owned_buffer_is_rejected() {
         rejects(
-            &with_buf("fn main() { buffer<u8, 16> x @DMA; let r = borrow x read; release r; sync(x); }"),
+            &with_buf(
+                "fn main() { buffer<u8, 16> x @DMA; let r = borrow x read; release r; sync(x); }",
+            ),
             "entity 'x' is owned by @DMA; sync(x) before borrowing it",
         );
     }
@@ -2654,8 +2711,14 @@ mod soundness_tests {
 
     #[test]
     fn unknown_name_in_a_condition_is_rejected() {
-        rejects(&with_buf("fn main() { if nope { } }"), "unknown name 'nope'");
-        rejects(&with_buf("fn main() { while ghost < 3 { } }"), "unknown name 'ghost'");
+        rejects(
+            &with_buf("fn main() { if nope { } }"),
+            "unknown name 'nope'",
+        );
+        rejects(
+            &with_buf("fn main() { while ghost < 3 { } }"),
+            "unknown name 'ghost'",
+        );
     }
 
     #[test]
@@ -2676,12 +2739,18 @@ mod soundness_tests {
 
     #[test]
     fn duplicate_function_is_rejected() {
-        rejects("fn main() { } fn main() { }", "function 'main' is declared more than once");
+        rejects(
+            "fn main() { } fn main() { }",
+            "function 'main' is declared more than once",
+        );
     }
 
     #[test]
     fn identical_errors_are_reported_once() {
-        let errs = check(&with_buf("fn main() { buffer<u8, 16> x @DMA; fir(x, x); sync(x); }")).unwrap_err();
+        let errs = check(&with_buf(
+            "fn main() { buffer<u8, 16> x @DMA; fir(x, x); sync(x); }",
+        ))
+        .unwrap_err();
         let msgs: Vec<&str> = errs.iter().map(|e| e.message.as_str()).collect();
         let mut dedup = msgs.clone();
         dedup.dedup();

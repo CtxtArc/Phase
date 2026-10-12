@@ -25,7 +25,9 @@
 //! own `volatile` semantics every iteration, not memoized by mistake.
 
 use phase_ast::{BinOp, BorrowMode, Domain};
-use phase_pir::{CallArg, PirEntityDef, PirExpr, PirFn, PirFnSig, PirInst, PirLiteral, PirProgram, PirType};
+use phase_pir::{
+    CallArg, PirEntityDef, PirExpr, PirFn, PirFnSig, PirInst, PirLiteral, PirProgram, PirType,
+};
 use std::collections::HashMap;
 
 pub struct Generated {
@@ -87,7 +89,9 @@ fn generate_header(program: &PirProgram, stem: &str) -> String {
         out.push_str(" * PHASE `extern fn` declares a trusted, opaque operation implemented\n");
         out.push_str(" * elsewhere (e.g. runtime/phase_runtime.c for this demo) -- the compiler\n");
         out.push_str(" * only emits a matching prototype here, never a body.\n");
-        out.push_str(" * Convention: every `buffer<T,N>` argument gets a trailing `size_t ..._len`\n");
+        out.push_str(
+            " * Convention: every `buffer<T,N>` argument gets a trailing `size_t ..._len`\n",
+        );
         out.push_str(" * parameter carrying its compile-time-known element count.\n */\n\n");
         for f in &program.extern_fns {
             out.push_str(&format_fn_prototype(f));
@@ -581,10 +585,14 @@ mod tests {
         "#;
         let g = generate_src(src, "radio_pipeline");
         assert!(g.source.contains("device_capture(raw, 4);"));
-        assert!(g.source.contains("sim_dma_wait(\"raw\", raw, sizeof(raw));"));
+        assert!(g
+            .source
+            .contains("sim_dma_wait(\"raw\", raw, sizeof(raw));"));
         assert!(g.source.contains("fir_filter(raw, 4, filtered, 4);"));
         assert!(g.source.contains("device_playback(filtered, 4);"));
-        assert!(g.source.contains("sim_device_wait(\"filtered\", filtered, sizeof(filtered));"));
+        assert!(g
+            .source
+            .contains("sim_device_wait(\"filtered\", filtered, sizeof(filtered));"));
     }
 
     // ---- M6: volatile MMIO register access ---------------------------------
@@ -646,8 +654,14 @@ mod tests {
             }
         "#;
         let g = generate_src(src, "t");
-        let read_pos = g.source.find("uint32_t status = UART_STATUS;").expect("read missing");
-        let write_pos = g.source.find("UART_CONTROL = status;").expect("write missing");
+        let read_pos = g
+            .source
+            .find("uint32_t status = UART_STATUS;")
+            .expect("read missing");
+        let write_pos = g
+            .source
+            .find("UART_CONTROL = status;")
+            .expect("write missing");
         assert!(read_pos < write_pos);
     }
 

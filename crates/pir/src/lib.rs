@@ -76,7 +76,10 @@ pub enum PirType {
     Scalar(String),
     /// The name of a struct generated from a PHASE `entity` declaration.
     Named(String),
-    Buffer { elem: Box<PirType>, len: u64 },
+    Buffer {
+        elem: Box<PirType>,
+        len: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,7 +114,9 @@ pub enum PirExpr {
     /// every loop iteration with much less clear ordering/purity
     /// guarantees than a register read, which is a separate design
     /// question this milestone doesn't attempt to answer.
-    VolatileRead { register: String },
+    VolatileRead {
+        register: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -164,20 +169,35 @@ pub enum PirInst {
     /// (see spec §6.1/§7.4): everything lives in one address space, so
     /// there is nothing to physically move. Kept in PIR so codegen can at
     /// least emit a explanatory comment at the call site.
-    EntityMove { name: String, to: Domain },
+    EntityMove {
+        name: String,
+        to: Domain,
+    },
     /// `sync(name);` — `from` is the domain the entity was in going into
     /// the sync (always `Dma` or `Device`, enforced by the M2 analyzer),
     /// which determines which simulated wait function to call.
-    EntitySync { name: String, from: Domain },
+    EntitySync {
+        name: String,
+        from: Domain,
+    },
     EntityBorrow {
         name: String,
         target: String,
         mode: BorrowMode,
     },
-    EntityRelease { name: String },
-    EntityDestroy { name: String },
-    Call { callee: String, args: Vec<CallArg> },
-    Return { value: Option<String> },
+    EntityRelease {
+        name: String,
+    },
+    EntityDestroy {
+        name: String,
+    },
+    Call {
+        callee: String,
+        args: Vec<CallArg>,
+    },
+    Return {
+        value: Option<String>,
+    },
     /// `if cond { .. } else { .. }` (M8). `else_body` is empty, not
     /// absent, when there's no `else` clause -- codegen just emits a bare
     /// `if` block in that case.
@@ -189,10 +209,16 @@ pub enum PirInst {
     /// `while cond { .. }` (M8). Lowers to a real C `while`; see spec §10 /
     /// the M4 analyzer docs for why this is sound without a fixed-point
     /// loop analysis (bodies are checked as "ran zero or one times").
-    While { cond: PirExpr, body: Vec<PirInst> },
+    While {
+        cond: PirExpr,
+        body: Vec<PirInst>,
+    },
     /// `name = expr;` (M9). The real prerequisite for a `while` loop that
     /// can terminate on its own -- e.g. a counter incremented each pass.
-    Assign { name: String, value: PirExpr },
+    Assign {
+        name: String,
+        value: PirExpr,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -257,7 +283,9 @@ fn resolve_type(ty: &TypeExpr, known_entities: &HashMap<&str, ()>) -> Result<Pir
             }
         }
         // Typestate is erased at the PIR level -- resolve by base name only.
-        TypeExpr::Stateful { name, .. } => resolve_type(&TypeExpr::Named(name.clone()), known_entities),
+        TypeExpr::Stateful { name, .. } => {
+            resolve_type(&TypeExpr::Named(name.clone()), known_entities)
+        }
         TypeExpr::Buffer { elem, len } => Ok(PirType::Buffer {
             elem: Box::new(resolve_type(elem, known_entities)?),
             len: *len,
@@ -335,7 +363,11 @@ fn collect_mmio_registers(fns: &[PirFn]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
 
-    fn note_args(args: &[CallArg], seen: &mut std::collections::HashSet<String>, out: &mut Vec<String>) {
+    fn note_args(
+        args: &[CallArg],
+        seen: &mut std::collections::HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
         for a in args {
             if let CallArg::MmioRegister(name) = a {
                 if seen.insert(name.clone()) {
@@ -356,7 +388,8 @@ fn collect_mmio_registers(fns: &[PirFn]) -> Vec<String> {
                 note_expr(lhs, seen, out);
                 note_expr(rhs, seen, out);
             }
-            PirExpr::Ident(_) | PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => {}
+            PirExpr::Ident(_) | PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => {
+            }
         }
     }
 
@@ -421,7 +454,11 @@ struct Lowerer<'a> {
 }
 
 impl<'a> Lowerer<'a> {
-    fn lower_block(&mut self, block: &phase_ast::Block, fn_name: &str) -> Result<Vec<PirInst>, PirError> {
+    fn lower_block(
+        &mut self,
+        block: &phase_ast::Block,
+        fn_name: &str,
+    ) -> Result<Vec<PirInst>, PirError> {
         let mut out = Vec::new();
         for stmt in &block.stmts {
             self.lower_stmt(stmt, fn_name, &mut out)?;
@@ -508,7 +545,8 @@ impl<'a> Lowerer<'a> {
                 // for an absent else, since that's the "didn't run" path).
                 let domains_before = self.domains.clone();
                 let then_body = self.lower_block(then_block, fn_name)?;
-                let domains_after_then = std::mem::replace(&mut self.domains, domains_before.clone());
+                let domains_after_then =
+                    std::mem::replace(&mut self.domains, domains_before.clone());
                 let else_body = match else_block {
                     Some(b) => self.lower_block(b, fn_name)?,
                     None => {
@@ -609,7 +647,9 @@ impl<'a> Lowerer<'a> {
                 });
                 Ok(())
             }
-            Some(lit @ (Expr::IntLit(_) | Expr::FloatLit(_) | Expr::BoolLit(_) | Expr::StringLit(_))) => {
+            Some(
+                lit @ (Expr::IntLit(_) | Expr::FloatLit(_) | Expr::BoolLit(_) | Expr::StringLit(_)),
+            ) => {
                 let ty = ty.ok_or_else(|| PirError::MissingType {
                     context: format!("'{name}'"),
                 })?;
@@ -1143,11 +1183,17 @@ mod tests {
         // spot-check the sync-domain bookkeeping is correct for both syncs
         assert!(matches!(
             pir.fns[0].body[2],
-            PirInst::EntitySync { from: Domain::Dma, .. }
+            PirInst::EntitySync {
+                from: Domain::Dma,
+                ..
+            }
         ));
         assert!(matches!(
             pir.fns[0].body[7],
-            PirInst::EntitySync { from: Domain::Device, .. }
+            PirInst::EntitySync {
+                from: Domain::Device,
+                ..
+            }
         ));
     }
 
@@ -1203,7 +1249,10 @@ mod tests {
             }
         "#;
         let pir = build_src(src).unwrap();
-        assert_eq!(pir.mmio_registers, vec!["REG_A".to_string(), "REG_B".to_string()]);
+        assert_eq!(
+            pir.mmio_registers,
+            vec!["REG_A".to_string(), "REG_B".to_string()]
+        );
     }
 
     #[test]

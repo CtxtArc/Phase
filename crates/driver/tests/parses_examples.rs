@@ -173,23 +173,26 @@ mod analysis_end_to_end {
 
     fn analyze_example(path: &str) -> Result<(), Vec<phase_analysis::AnalysisError>> {
         let src = read_example(path);
-        let program = phase_parser::parse(&src)
-            .unwrap_or_else(|e| panic!("{path} failed to parse: {e}"));
+        let program =
+            phase_parser::parse(&src).unwrap_or_else(|e| panic!("{path} failed to parse: {e}"));
         phase_analysis::analyze(&program)
     }
 
     #[test]
     fn happy_path_pipeline_passes_analysis() {
         let result = analyze_example("radio_pipeline.phase");
-        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected no analysis errors, got: {result:?}"
+        );
     }
 
     #[test]
     fn bug_gallery_1_use_before_sync_is_rejected() {
         let errs = analyze_example("bug_gallery/use_before_sync.phase").unwrap_err();
-        assert!(errs
-            .iter()
-            .any(|e| e.message.contains("is in domain @DMA but 'fir_filter' expects @RAM")));
+        assert!(errs.iter().any(|e| e
+            .message
+            .contains("is in domain @DMA but 'fir_filter' expects @RAM")));
     }
 
     #[test]
@@ -219,7 +222,10 @@ mod analysis_end_to_end {
     #[test]
     fn typestate_pipeline_passes_analysis() {
         let result = analyze_example("packet_pipeline.phase");
-        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected no analysis errors, got: {result:?}"
+        );
     }
 
     #[test]
@@ -233,29 +239,35 @@ mod analysis_end_to_end {
     #[test]
     fn branching_pipeline_passes_analysis() {
         let result = analyze_example("branching_pipeline.phase");
-        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected no analysis errors, got: {result:?}"
+        );
     }
 
     #[test]
     fn bug_gallery_6_branch_domain_disagreement_is_rejected() {
         let errs = analyze_example("bug_gallery/branch_domain_disagreement.phase").unwrap_err();
-        assert!(errs
-            .iter()
-            .any(|e| e.message.contains("disagrees on domain across incoming branches")));
+        assert!(errs.iter().any(|e| e
+            .message
+            .contains("disagrees on domain across incoming branches")));
     }
 
     #[test]
     fn mmio_registers_example_passes_analysis() {
         let result = analyze_example("mmio_registers.phase");
-        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected no analysis errors, got: {result:?}"
+        );
     }
 
     #[test]
     fn volatile_wrong_domain_is_rejected() {
         let errs = analyze_example("bug_gallery/volatile_wrong_domain.phase").unwrap_err();
-        assert!(errs.iter().any(|e| e
-            .message
-            .contains("'volatile_read' requires an @MMIO register reference, but 'FAKE_REG' is tagged @RAM")));
+        assert!(errs.iter().any(|e| e.message.contains(
+            "'volatile_read' requires an @MMIO register reference, but 'FAKE_REG' is tagged @RAM"
+        )));
     }
 
     #[test]
@@ -263,14 +275,20 @@ mod analysis_end_to_end {
         // M7: the richer worked example exercising domain safety,
         // typestate, and MMIO together in one program.
         let result = analyze_example("sdr_session.phase");
-        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected no analysis errors, got: {result:?}"
+        );
     }
 
     #[test]
     fn counting_loop_example_passes_analysis() {
         // M9: a `while` loop with a real, assignment-driven counter.
         let result = analyze_example("counting_loop.phase");
-        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected no analysis errors, got: {result:?}"
+        );
     }
 
     #[test]
@@ -280,14 +298,20 @@ mod analysis_end_to_end {
         // crates/driver/tests/build_and_run.rs for the actual
         // cross-compile-and-run-under-QEMU end-to-end test.
         let result = analyze_example("hw_uart_echo.phase");
-        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected no analysis errors, got: {result:?}"
+        );
     }
 
     #[test]
     fn mmio_poll_example_passes_analysis() {
         // M11: `volatile_read` used directly inside a `while` condition.
         let result = analyze_example("mmio_poll.phase");
-        assert!(result.is_ok(), "expected no analysis errors, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected no analysis errors, got: {result:?}"
+        );
     }
 
     /// Pull the `// Expected: "..."` string out of a bug-gallery file's
@@ -340,6 +364,9 @@ mod analysis_end_to_end {
             );
             checked += 1;
         }
-        assert!(checked >= 16, "expected at least 16 bug-gallery files, found {checked}");
+        assert!(
+            checked >= 16,
+            "expected at least 16 bug-gallery files, found {checked}"
+        );
     }
 }
