@@ -26,3 +26,6 @@
 
 # Logs
 *.log
+
+# Saved by phase-fuzz when it finds something
+/fuzz-findings/

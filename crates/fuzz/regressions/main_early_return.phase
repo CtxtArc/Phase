@@ -1,0 +1,44 @@
+// Fuzzer finding (seed 1): an early `return;` in main was emitted as a bare
+// `return;` in C's int main, leaving the exit status undefined. Fixed in
+// codegen ("a bare return in main returns 0"). Must now run clean.
+
+extern fn flip() -> bool;
+extern fn count() -> u32;
+extern fn look(x: read buffer<u8, 8> @RAM);
+extern fn poke(x: write buffer<u8, 8> @RAM);
+extern fn mix(a: read buffer<u8, 8> @RAM, b: write buffer<u8, 8> @RAM);
+extern fn cmp(a: read buffer<u8, 8> @RAM, b: read buffer<u8, 8> @RAM);
+extern fn start(x: write buffer<u8, 8> @RAM -> @DMA);
+extern fn finish(x: buffer<u8, 8> @DMA -> @RAM);
+extern fn emit(x: write buffer<u8, 8> @RAM -> @DEVICE);
+extern fn kick(x: buffer<u8, 8> @DMA);
+
+fn main() {
+    let c1: bool = flip();
+    if c1 {
+        let c2: bool = flip();
+        if c2 {
+        } else {
+            let n3: u32 = 0;
+            let l4: u32 = count();
+            while n3 < l4 {
+                n3 = n3 + 1;
+            }
+            let n5: u32 = 0;
+            let l6: u32 = count();
+            while n5 < l6 {
+                buffer<u8, 8> b7 @RAM;
+                let h8 = borrow b7 write;
+                buffer<u8, 8> b9 @RAM;
+                move b9 -> @DMA;
+                release h8;
+                sync(b9);
+                n5 = n5 + 1;
+            }
+        }
+        return;
+    } else {
+        buffer<u8, 8> b10 @DMA;
+        sync(b10);
+    }
+}

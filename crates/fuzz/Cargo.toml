@@ -1,0 +1,16 @@
+[package]
+name = "phase_fuzz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Differential fuzzer: random PHASE programs, static analysis vs. runtime-checked execution"
+
+[[bin]]
+name = "phase-fuzz"
+path = "src/main.rs"
+
+[dependencies]
+phase_parser = { path = "../parser" }
+phase_analysis = { path = "../analysis" }
+phase_pir = { path = "../pir" }
+phase_codegen_c = { path = "../codegen_c" }

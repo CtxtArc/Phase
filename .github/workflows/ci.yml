@@ -41,6 +41,17 @@ jobs:
         run: cargo test --workspace
       - name: Volatile proof demo (naive C vs PHASE at -O2)
         run: ./demos/m6_volatile_proof/run_demo.sh
+      - name: Differential fuzzing (static analysis vs. runtime-checked runs)
+        # A different seed range every run, so CI keeps exploring new
+        # programs; any finding is saved with its seed and uploaded.
+        run: cargo run --release -p phase_fuzz -- --count 1500 --seed ${{ github.run_number }}000
+      - name: Upload fuzz findings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: fuzz-findings/
+          if-no-files-found: ignore
       - name: Bug-gallery transcript is up to date
         run: |
           ./scripts/capture_bug_gallery.sh

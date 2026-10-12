@@ -1,0 +1,51 @@
+// Fuzzer finding (seed 10307): a false alarm in the first runtime checker --
+// a helper using a parameter its caller had write-borrowed for it. Fixed in
+// the runtime checker (borrow checks are per call frame). Must be accepted
+// and run clean.
+
+extern fn flip() -> bool;
+extern fn count() -> u32;
+extern fn look(x: read buffer<u8, 8> @RAM);
+extern fn poke(x: write buffer<u8, 8> @RAM);
+extern fn mix(a: read buffer<u8, 8> @RAM, b: write buffer<u8, 8> @RAM);
+extern fn cmp(a: read buffer<u8, 8> @RAM, b: read buffer<u8, 8> @RAM);
+extern fn start(x: write buffer<u8, 8> @RAM -> @DMA);
+extern fn finish(x: buffer<u8, 8> @DMA -> @RAM);
+extern fn emit(x: write buffer<u8, 8> @RAM -> @DEVICE);
+extern fn kick(x: buffer<u8, 8> @DMA);
+
+fn helper0(p0: read buffer<u8, 8> @RAM) {
+    cmp(p0, p0);
+    let n1: u32 = 0;
+    let l2: u32 = count();
+    while n1 < l2 {
+        n1 = n1 + 1;
+    }
+    let h3 = borrow p0 read;
+    release h3;
+}
+
+fn helper1(p0: buffer<u8, 8> @RAM) {
+    poke(p0);
+    cmp(p0, p0);
+    buffer<u8, 8> b1 @RAM;
+}
+
+fn main() {
+    let n1: u32 = 0;
+    let l2: u32 = count();
+    while n1 < l2 {
+        let c3: bool = flip();
+        if c3 {
+        } else {
+            buffer<u8, 8> b4 @RAM;
+            let h5 = borrow b4 write;
+            buffer<u8, 8> b6 @RAM;
+            helper0(h5);
+            move b6 -> @DEVICE;
+            release h5;
+            sync(b6);
+        }
+        n1 = n1 + 1;
+    }
+}

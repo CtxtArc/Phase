@@ -1,0 +1,29 @@
+// Fuzzer finding (seed 1618): swapping an outer buffer with one declared in
+// an inner block left the outer name pointing at storage that dies with the
+// block. Fixed in the analyzer (swap requires the same block).
+// Must now be rejected.
+
+extern fn flip() -> bool;
+extern fn count() -> u32;
+extern fn look(x: read buffer<u8, 8> @RAM);
+extern fn poke(x: write buffer<u8, 8> @RAM);
+extern fn mix(a: read buffer<u8, 8> @RAM, b: write buffer<u8, 8> @RAM);
+extern fn cmp(a: read buffer<u8, 8> @RAM, b: read buffer<u8, 8> @RAM);
+extern fn start(x: write buffer<u8, 8> @RAM -> @DMA);
+extern fn finish(x: buffer<u8, 8> @DMA -> @RAM);
+extern fn emit(x: write buffer<u8, 8> @RAM -> @DEVICE);
+extern fn kick(x: buffer<u8, 8> @DMA);
+
+fn main() {
+    buffer<u8, 8> b1 @RAM;
+    let c2: bool = flip();
+    if c2 {
+        buffer<u8, 8> b3 @RAM;
+        move b3 -> @DMA;
+        swap b3, b1;
+        finish(b1);
+    } else {
+        return;
+    }
+    look(b1);
+}

@@ -37,6 +37,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "phase_fuzz"
+version = "1.2.0"
+dependencies = [
+ "phase_analysis",
+ "phase_codegen_c",
+ "phase_parser",
+ "phase_pir",
+]
+
+[[package]]
 name = "phase_lexer"
 version = "1.2.0"
 dependencies = [

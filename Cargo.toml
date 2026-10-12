@@ -8,6 +8,7 @@ members = [
     "crates/pir",
     "crates/codegen_c",
     "crates/driver",
+    "crates/fuzz",
 ]
 
 [workspace.package]

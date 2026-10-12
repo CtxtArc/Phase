@@ -1,0 +1,49 @@
+// Fuzzer finding (seed 2255): same root cause as swap_inner_block_a, via a
+// deeper nesting. Must now be rejected.
+
+extern fn flip() -> bool;
+extern fn count() -> u32;
+extern fn look(x: read buffer<u8, 8> @RAM);
+extern fn poke(x: write buffer<u8, 8> @RAM);
+extern fn mix(a: read buffer<u8, 8> @RAM, b: write buffer<u8, 8> @RAM);
+extern fn cmp(a: read buffer<u8, 8> @RAM, b: read buffer<u8, 8> @RAM);
+extern fn start(x: write buffer<u8, 8> @RAM -> @DMA);
+extern fn finish(x: buffer<u8, 8> @DMA -> @RAM);
+extern fn emit(x: write buffer<u8, 8> @RAM -> @DEVICE);
+extern fn kick(x: buffer<u8, 8> @DMA);
+
+fn helper0(p0: buffer<u8, 8> @DMA) {
+    buffer<u8, 8> b1 @RAM;
+    move b1 -> @DEVICE;
+    buffer<u8, 8> b2 @RAM;
+    buffer<u8, 8> b3 @RAM;
+    sync(b1);
+}
+
+fn main() {
+    buffer<u8, 8> b1 @DMA;
+    let c2: bool = flip();
+    if c2 {
+        buffer<u8, 8> b3 @RAM;
+        swap b1, b3;
+        let c4: bool = flip();
+        if c4 {
+            let h5 = borrow b1 read;
+            release h5;
+            sync(b3);
+            return;
+        } else {
+            buffer<u8, 8> b6 @DMA;
+            buffer<u8, 8> b7 @DMA;
+            swap b6, b1;
+            sync(b7);
+        }
+        sync(b3);
+    }
+    let n8: u32 = 0;
+    let l9: u32 = count();
+    while n8 < l9 {
+        n8 = n8 + 1;
+    }
+    sync(b1);
+}
