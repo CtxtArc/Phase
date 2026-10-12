@@ -39,7 +39,7 @@ void device_capture(Sample *dst, size_t dst_len) {
  * exists for (spec §3.9): PHASE proves the buffer handoff around it is
  * safe, and has no opinion on what the kernel itself computes.
  */
-void fir_filter(Sample *in_, size_t in_len, Sample *out, size_t out_len) {
+void fir_filter(const Sample *in_, size_t in_len, Sample *out, size_t out_len) {
     printf("[sim] fir_filter: filtering %zu -> %zu samples\n", in_len, out_len);
     const int taps = 5;
     size_t n = in_len < out_len ? in_len : out_len;
@@ -63,7 +63,7 @@ void fir_filter(Sample *in_, size_t in_len, Sample *out, size_t out_len) {
  * standing in for "the signal was streamed out," which is enough to prove
  * the whole pipeline actually ran end to end on real data.
  */
-void device_playback(Sample *src, size_t src_len) {
+void device_playback(const Sample *src, size_t src_len) {
     float min = src_len > 0 ? src[0].value : 0.0f;
     float max = min;
     double sum_sq = 0.0;

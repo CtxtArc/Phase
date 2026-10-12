@@ -25,6 +25,8 @@ pub enum ErrorFormat {
 /// produced it.
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
+    /// `"error"` or `"warning"`.
+    pub severity: &'static str,
     pub message: String,
     pub span: Option<Span>,
     pub subject: Option<String>,
@@ -34,6 +36,10 @@ pub struct Diagnostic {
 impl From<&phase_analysis::AnalysisError> for Diagnostic {
     fn from(e: &phase_analysis::AnalysisError) -> Self {
         Diagnostic {
+            severity: match e.severity {
+                phase_analysis::Severity::Error => "error",
+                phase_analysis::Severity::Warning => "warning",
+            },
             message: e.message.clone(),
             span: e.span,
             subject: e.subject.clone(),
@@ -49,6 +55,7 @@ impl From<&phase_analysis::AnalysisError> for Diagnostic {
 impl From<&phase_parser::ParseError> for Diagnostic {
     fn from(e: &phase_parser::ParseError) -> Self {
         Diagnostic {
+            severity: "error",
             message: e.message.clone(),
             span: Some(e.span),
             subject: None,
@@ -72,6 +79,17 @@ impl Style {
     }
     fn error(&self, t: &str) -> String {
         self.paint("1;31", t)
+    }
+    fn warning(&self, t: &str) -> String {
+        self.paint("1;33", t)
+    }
+    /// The severity label and the primary underline share a color.
+    fn severity(&self, sev: &str, t: &str) -> String {
+        if sev == "warning" {
+            self.warning(t)
+        } else {
+            self.error(t)
+        }
     }
     fn note(&self, t: &str) -> String {
         self.paint("1;36", t)
@@ -112,12 +130,13 @@ fn render_short(diag: &Diagnostic, path: &str, src: &str) -> String {
     match diag.span {
         Some(s) => writeln!(
             out,
-            "{path}:{}:{}: error: {}",
+            "{path}:{}:{}: {}: {}",
             s.line,
             reported_col(s, src, diag.subject.as_deref()),
+            diag.severity,
             diag.message
         ),
-        None => writeln!(out, "{path}: error: {}", diag.message),
+        None => writeln!(out, "{path}: {}: {}", diag.severity, diag.message),
     }
     .unwrap();
     for (span, msg) in &diag.notes {
@@ -139,7 +158,7 @@ fn render_human(diag: &Diagnostic, path: &str, src: &str, st: &Style) -> String 
     writeln!(
         out,
         "{}{}",
-        st.error("error"),
+        st.severity(diag.severity, diag.severity),
         st.bold(&format!(": {}", diag.message))
     )
     .unwrap();
@@ -153,13 +172,13 @@ fn render_human(diag: &Diagnostic, path: &str, src: &str, st: &Style) -> String 
             '^',
             width,
             st,
-            true,
+            Some(diag.severity),
         ),
         None => writeln!(out, "{} {path}", st.gutter(&format!("{:>width$}-->", ""))).unwrap(),
     }
     for (span, msg) in &diag.notes {
         writeln!(out, "{}{}", st.note("note"), st.bold(&format!(": {msg}"))).unwrap();
-        snippet(&mut out, path, &lines, *span, None, '-', width, st, false);
+        snippet(&mut out, path, &lines, *span, None, '-', width, st, None);
     }
     out
 }
@@ -218,7 +237,8 @@ fn snippet(
     mark: char,
     width: usize,
     st: &Style,
-    primary: bool,
+    // `Some(severity)` for the primary location, `None` for a note.
+    primary: Option<&str>,
 ) {
     let blank = st.gutter(&format!("{:>width$} |", ""));
     let arrow = st.gutter(&format!("{:>width$}-->", ""));
@@ -235,10 +255,9 @@ fn snippet(
         .map(|c| if c == '\t' { '\t' } else { ' ' })
         .collect();
     let marks: String = std::iter::repeat_n(mark, end - start).collect();
-    let marks = if primary {
-        st.error(&marks)
-    } else {
-        st.note(&marks)
+    let marks = match primary {
+        Some(sev) => st.severity(sev, &marks),
+        None => st.note(&marks),
     };
     writeln!(out, "{blank}").unwrap();
     writeln!(
@@ -267,6 +286,7 @@ mod tests {
 
     fn diag(subject: Option<&str>) -> Diagnostic {
         Diagnostic {
+            severity: "error",
             message: "entity 'raw' is in domain @DMA".into(),
             span: Some(span(2, 5, 2, 31)),
             subject: subject.map(str::to_string),

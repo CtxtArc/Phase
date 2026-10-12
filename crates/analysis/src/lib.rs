@@ -33,9 +33,27 @@
 use phase_ast::{BorrowMode, Domain, Expr, FnDecl, Item, Program, Span, Stmt, TypeExpr};
 use std::collections::{HashMap, HashSet};
 
-/// One safety violation.
+/// How serious a diagnostic is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// A safety violation: the program is rejected.
+    Error,
+    /// Accepted, but relies on something PHASE can't check (e.g. an
+    /// unannotated parameter); expected to become an error in 2.0.
+    Warning,
+}
+
+/// The full result of analysis: errors reject the program, warnings don't.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Report {
+    pub errors: Vec<AnalysisError>,
+    pub warnings: Vec<AnalysisError>,
+}
+
+/// One safety violation (or, with [`Severity::Warning`], a concern).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalysisError {
+    pub severity: Severity,
     pub message: String,
     /// Where the violation happens: the statement (or declaration) that
     /// breaks the rule. `None` only for errors with no single location.
@@ -89,10 +107,18 @@ impl std::fmt::Display for AnalysisError {
 
 fn err(msg: impl Into<String>) -> AnalysisError {
     AnalysisError {
+        severity: Severity::Error,
         message: msg.into(),
         span: None,
         subject: None,
         notes: Vec::new(),
+    }
+}
+
+fn warn(msg: impl Into<String>) -> AnalysisError {
+    AnalysisError {
+        severity: Severity::Warning,
+        ..err(msg)
     }
 }
 
@@ -103,6 +129,9 @@ type Typestate = (String, String);
 /// the resolved return typestate (if the return type is stateful).
 #[derive(Debug, Clone)]
 struct FnSig {
+    param_names: Vec<String>,
+    /// Declared `read` / `write` access per parameter (`None`: no mode).
+    param_access: Vec<Option<BorrowMode>>,
     param_domains: Vec<Option<Domain>>,
     /// `Some(to)` where a parameter is declared `@FROM -> @TO`: the call
     /// leaves the argument in `to`.
@@ -148,6 +177,17 @@ fn resolve_stateful(
 /// erroring statement as a no-op, so one mistake doesn't cascade into a
 /// wall of unrelated-looking follow-on errors).
 pub fn analyze(program: &Program) -> Result<(), Vec<AnalysisError>> {
+    let report = analyze_full(program);
+    if report.errors.is_empty() {
+        Ok(())
+    } else {
+        Err(report.errors)
+    }
+}
+
+/// Like [`analyze`], but also returns warnings (which never reject a
+/// program).
+pub fn analyze_full(program: &Program) -> Report {
     let mut errors = Vec::new();
 
     let entity_domains: HashMap<&str, Option<Domain>> = program
@@ -228,7 +268,38 @@ pub fn analyze(program: &Program) -> Result<(), Vec<AnalysisError>> {
                 }
             }
         }
+        for p in params {
+            let Some(mode) = p.access else { continue };
+            let word = if mode == BorrowMode::Read {
+                "read"
+            } else {
+                "write"
+            };
+            let is_entity_type = match &p.ty {
+                TypeExpr::Buffer { .. } | TypeExpr::Stateful { .. } => true,
+                TypeExpr::Named(n) => entity_domains.contains_key(n.as_str()),
+            };
+            if !is_entity_type {
+                errors.push(
+                    err(format!(
+                        "parameter '{}' of '{name}' is declared `{word}`, but access modes only apply to buffers and entities",
+                        p.name
+                    ))
+                    .at(p.span),
+                );
+            } else if mode == BorrowMode::Read && p.domain_after.is_some() {
+                errors.push(
+                    err(format!(
+                        "parameter '{}' of '{name}' is declared `read` but also hands the buffer to hardware (`-> @..`), which may write it; drop `read`",
+                        p.name
+                    ))
+                    .at(p.span),
+                );
+            }
+        }
         FnSig {
+            param_names: params.iter().map(|p| p.name.clone()).collect(),
+            param_access: params.iter().map(|p| p.access).collect(),
             param_domains: params.iter().map(|p| p.domain).collect(),
             param_domains_after: params.iter().map(|p| p.domain_after).collect(),
             param_states: params
@@ -291,11 +362,10 @@ pub fn analyze(program: &Program) -> Result<(), Vec<AnalysisError>> {
     let mut seen = HashSet::new();
     errors.retain(|e| seen.insert(e.message.clone()));
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
+    let (warnings, errors) = errors
+        .into_iter()
+        .partition(|e| e.severity == Severity::Warning);
+    Report { errors, warnings }
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +397,10 @@ struct VarState {
     /// Kept as a name so later lines get no "unknown entity" noise, and its
     /// `release` is accepted silently.
     rejected_borrow: bool,
+    /// A parameter declared `read`: its contents may only be read, so it
+    /// can't be moved, synced, destroyed, write-borrowed, or passed where
+    /// a callee may write.
+    read_only: bool,
 
     // ---- where things happened, for diagnostics ----------------------
     /// Where this name was declared (for a borrow handle: the borrow).
@@ -354,6 +428,7 @@ impl VarState {
             consumed: None,
             param_exit: None,
             rejected_borrow: false,
+            read_only: false,
         }
     }
 
@@ -361,6 +436,11 @@ impl VarState {
     /// (as opposed to a plain scalar).
     fn is_tracked(&self) -> bool {
         self.domain.is_some() || self.typestate.is_some() || self.borrow_of.is_some()
+    }
+
+    /// Read-only access: a `read` parameter or a read borrow.
+    fn is_read_only(&self) -> bool {
+        self.read_only || matches!(self.borrow_of, Some((_, BorrowMode::Read)))
     }
 
     fn is_param(&self) -> bool {
@@ -483,6 +563,8 @@ impl<'a> FnChecker<'a> {
                 let domain = sig.param_domains.get(i).copied().flatten();
                 let mut var =
                     VarState::local(domain, sig.param_states.get(i).cloned().flatten(), p.span);
+                var.read_only =
+                    sig.param_access.get(i).copied().flatten() == Some(BorrowMode::Read);
                 let after = sig.param_domains_after.get(i).copied().flatten();
                 var.param_exit = Some((after.or(domain), after.and(domain)));
                 if let Some(d) = domain {
@@ -693,6 +775,17 @@ impl<'a> FnChecker<'a> {
                 ))
                 .about(name)
                 .note(var.origin, format!("'{name}' borrows '{target}' here")),
+            );
+            return None;
+        }
+        if var.read_only {
+            errors.push(
+                err(format!(
+                    "'{name}' is a `read` parameter of '{}'; cannot {verb} it",
+                    self.fn_name
+                ))
+                .about(name)
+                .note(var.origin, format!("'{name}' is declared `read` here")),
             );
             return None;
         }
@@ -1201,6 +1294,7 @@ impl<'a> FnChecker<'a> {
                     released: a.released || b.released,
                     consumed,
                     param_exit: base_var.param_exit,
+                    read_only: base_var.read_only,
                     rejected_borrow: base_var.rejected_borrow,
                     origin: base_var.origin,
                     domain_since: a.domain_since.clone().or_else(|| b.domain_since.clone()),
@@ -1423,6 +1517,11 @@ impl<'a> FnChecker<'a> {
             Some(format!(
                 "'{target}' is itself a borrow of '{owner}'; borrow '{owner}' directly instead"
             ))
+        } else if target_var.read_only && mode == BorrowMode::Write {
+            Some(format!(
+                "'{target}' is a `read` parameter of '{}'; it can only be borrowed `read`",
+                self.fn_name
+            ))
         } else {
             target_var.domain.filter(|d| is_device_owned(*d)).map(|d| {
                 format!(
@@ -1574,10 +1673,13 @@ impl<'a> FnChecker<'a> {
     /// Shared access check for using an entity's *contents* directly
     /// (call argument, field read): it must be live, owned by the CPU, and
     /// not currently lent out through a borrow.
+    /// `read_access`: the use only reads the contents (a `read` parameter,
+    /// a field read), which is compatible with outstanding read borrows.
     fn check_entity_access(
         &self,
         name: &str,
         usage: &str,
+        read_access: bool,
         errors: &mut Vec<AnalysisError>,
     ) -> bool {
         let Some(var) = self.locals.get(name) else {
@@ -1613,7 +1715,11 @@ impl<'a> FnChecker<'a> {
                 );
                 return false;
             }
-        } else if let Some(bs) = self.borrows.get(name).filter(|b| !b.is_empty()) {
+        } else if let Some(bs) = self
+            .borrows
+            .get(name)
+            .filter(|b| !b.is_empty() && !(read_access && b.writer.is_none()))
+        {
             errors.push(
                 err(format!(
                     "entity '{name}' is borrowed by '{}'; it cannot be used directly until that borrow is released",
@@ -1637,7 +1743,7 @@ impl<'a> FnChecker<'a> {
                     Some(var) => {
                         let domain = var.domain;
                         let since = var.domain_since.clone();
-                        if self.check_entity_access(name, "read its fields", errors) {
+                        if self.check_entity_access(name, "read its fields", true, errors) {
                             if let Some(d) = domain.filter(|d| is_device_owned(*d)) {
                                 errors.push(
                                     err(format!(
@@ -1718,8 +1824,9 @@ impl<'a> FnChecker<'a> {
         // Aliasing: every argument that names an entity is resolved to the
         // storage it refers to (a borrow handle resolves to its target).
         // The same storage may appear more than once only if every
-        // occurrence is a read-only borrow -- otherwise the callee would
-        // see two names for memory at least one of them may write.
+        // occurrence is read-only -- a `read` parameter or a read borrow --
+        // otherwise the callee would see two names for memory at least one
+        // of them may write.
         let mut roots: Vec<(String, bool)> = Vec::new(); // (root, read_only)
         let mut to_consume: Vec<String> = Vec::new();
         // (name, new domain) for arguments to `@FROM -> @TO` parameters.
@@ -1735,12 +1842,42 @@ impl<'a> FnChecker<'a> {
                         );
                         continue;
                     };
+                    let access = sig.param_access.get(i).copied().flatten();
+                    let pname = sig.param_names.get(i).cloned().unwrap_or_default();
                     if !self.check_entity_access(
                         name,
                         &format!("use as argument to '{callee}'"),
+                        access == Some(BorrowMode::Read),
                         errors,
                     ) {
                         continue;
+                    }
+
+                    // Read-only data (a read borrow or a `read` parameter)
+                    // may only go where the callee promises not to write.
+                    if var.is_tracked() && var.is_read_only() {
+                        let what = if var.read_only {
+                            format!("'{name}' is declared `read` here")
+                        } else {
+                            format!("'{name}' is a read borrow taken here")
+                        };
+                        match access {
+                            Some(BorrowMode::Write) => errors.push(
+                                err(format!(
+                                    "'{callee}' may write its parameter '{pname}', but '{name}' is read-only"
+                                ))
+                                .about(name)
+                                .note(var.origin, what),
+                            ),
+                            None => errors.push(
+                                warn(format!(
+                                    "'{callee}' doesn't declare whether it writes its parameter '{pname}', but '{name}' is read-only; mark the parameter `read` if '{callee}' only reads it"
+                                ))
+                                .about(name)
+                                .note(var.origin, what),
+                            ),
+                            Some(BorrowMode::Read) => {}
+                        }
                     }
 
                     let mut domain_ok = true;
@@ -1765,7 +1902,16 @@ impl<'a> FnChecker<'a> {
                     // argument's domain. Only an owner can be handed over
                     // that way -- a borrow can't move the storage it views.
                     if let Some(Some(after)) = sig.param_domains_after.get(i) {
-                        if var.borrow_of.is_some() {
+                        if var.read_only {
+                            errors.push(
+                                err(format!(
+                                    "'{callee}' moves its argument to @{}, but '{name}' is a `read` parameter",
+                                    after.name()
+                                ))
+                                .about(name)
+                                .note(var.origin, format!("'{name}' is declared `read` here")),
+                            );
+                        } else if var.borrow_of.is_some() {
                             errors.push(
                                 err(format!(
                                     "'{callee}' moves its argument to @{}, but '{name}' is only a borrow",
@@ -1814,9 +1960,12 @@ impl<'a> FnChecker<'a> {
                             ),
                         }
                         // Linear: handing a value to a state-requiring
-                        // parameter consumes it. A borrow handle cannot be
-                        // consumed (it doesn't own the value).
-                        if var.borrow_of.is_some() {
+                        // parameter consumes it -- unless the parameter is
+                        // `read`, which only inspects it. A borrow handle
+                        // cannot be consumed (it doesn't own the value).
+                        if access == Some(BorrowMode::Read) {
+                            // inspected, not consumed
+                        } else if var.borrow_of.is_some() || var.read_only {
                             errors.push(
                                 err(format!(
                                     "'{callee}' takes ownership of a {} value, but '{name}' is only a borrow",
@@ -1830,10 +1979,11 @@ impl<'a> FnChecker<'a> {
                     }
 
                     if var.is_tracked() {
-                        let (root, read_only) = match &var.borrow_of {
-                            Some((target, mode)) => (target.clone(), *mode == BorrowMode::Read),
-                            None => (name.clone(), false),
+                        let root = match &var.borrow_of {
+                            Some((target, _)) => target.clone(),
+                            None => name.clone(),
                         };
+                        let read_only = access == Some(BorrowMode::Read) || var.is_read_only();
                         roots.push((root, read_only));
                     }
                 }
@@ -1851,7 +2001,7 @@ impl<'a> FnChecker<'a> {
             {
                 errors.push(
                     err(format!(
-                        "entity '{root}' is passed to '{callee}' more than once; aliased arguments are only allowed through read borrows"
+                        "entity '{root}' is passed to '{callee}' more than once; aliased arguments are only allowed when every use is read-only (`read` parameters or read borrows)"
                     ))
                     .about(root),
                 );
@@ -3489,6 +3639,248 @@ mod domain_change_tests {
                 "fn main() { let n: u32 = 0; buffer<u8, 16> x @RAM; while n < 4 { start(x); n = n + 1; } sync(x); }",
             ),
             "a `while` body must leave every entity exactly as it found it",
+        );
+    }
+}
+
+/// v1.2: `read` / `write` access modes on parameters.
+#[cfg(test)]
+mod access_mode_tests {
+    use super::*;
+
+    fn full(src: &str) -> Report {
+        analyze_full(&phase_parser::parse(src).expect("fixture must parse"))
+    }
+
+    #[track_caller]
+    fn rejects(src: &str, needle: &str) {
+        let r = full(src);
+        assert!(
+            r.errors.iter().any(|e| e.message.contains(needle)),
+            "expected an error containing {needle:?}, got {:?}",
+            r.errors
+        );
+    }
+
+    #[track_caller]
+    fn accepts(src: &str) {
+        let r = full(src);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(
+            r.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            r.warnings
+        );
+    }
+
+    #[track_caller]
+    fn warns(src: &str, needle: &str) {
+        let r = full(src);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(
+            r.warnings.iter().any(|w| w.message.contains(needle)),
+            "expected a warning containing {needle:?}, got {:?}",
+            r.warnings
+        );
+    }
+
+    const SIGS: &str = r#"
+        extern fn fir(in_: read buffer<u8, 8> @RAM, out: write buffer<u8, 8> @RAM);
+        extern fn cmp(a: read buffer<u8, 8> @RAM, b: read buffer<u8, 8> @RAM);
+        extern fn look(x: read buffer<u8, 8> @RAM);
+        extern fn poke(x: write buffer<u8, 8> @RAM);
+        extern fn legacy(x: buffer<u8, 8> @RAM);
+    "#;
+
+    fn with(body: &str) -> String {
+        format!("{SIGS}\n{body}")
+    }
+
+    // ---- aliasing ----------------------------------------------------------
+
+    #[test]
+    fn same_buffer_to_two_read_params_is_accepted() {
+        accepts(&with("fn main() { buffer<u8, 8> x @RAM; cmp(x, x); }"));
+    }
+
+    #[test]
+    fn same_buffer_as_read_input_and_write_output_is_rejected() {
+        rejects(
+            &with("fn main() { buffer<u8, 8> x @RAM; fir(x, x); }"),
+            "entity 'x' is passed to 'fir' more than once",
+        );
+    }
+
+    // ---- owner access during borrows -------------------------------------
+
+    #[test]
+    fn owner_may_be_read_while_only_read_borrows_are_live() {
+        accepts(&with(
+            "fn main() { buffer<u8, 8> x @RAM; let r = borrow x read; look(x); look(r); release r; }",
+        ));
+    }
+
+    #[test]
+    fn owner_may_not_be_written_while_read_borrowed() {
+        rejects(
+            &with("fn main() { buffer<u8, 8> x @RAM; let r = borrow x read; poke(x); release r; }"),
+            "entity 'x' is borrowed by 'r'",
+        );
+    }
+
+    #[test]
+    fn owner_may_not_even_be_read_while_write_borrowed() {
+        rejects(
+            &with(
+                "fn main() { buffer<u8, 8> x @RAM; let w = borrow x write; look(x); release w; }",
+            ),
+            "entity 'x' is borrowed by 'w'",
+        );
+    }
+
+    // ---- read-only arguments ---------------------------------------------
+
+    #[test]
+    fn read_borrow_to_a_write_param_is_rejected() {
+        rejects(
+            &with("fn main() { buffer<u8, 8> x @RAM; let r = borrow x read; poke(r); release r; }"),
+            "'poke' may write its parameter 'x', but 'r' is read-only",
+        );
+    }
+
+    #[test]
+    fn read_borrow_to_an_unannotated_param_is_a_warning_not_an_error() {
+        let src = with(
+            "fn main() { buffer<u8, 8> x @RAM; let r = borrow x read; legacy(r); release r; }",
+        );
+        warns(
+            &src,
+            "'legacy' doesn't declare whether it writes its parameter 'x'",
+        );
+        // ...and the plain `analyze` entry point still accepts it.
+        assert_eq!(analyze(&phase_parser::parse(&src).unwrap()), Ok(()));
+    }
+
+    #[test]
+    fn write_borrow_may_go_anywhere() {
+        accepts(&with(
+            "fn main() { buffer<u8, 8> x @RAM; let w = borrow x write; poke(w); look(w); release w; }",
+        ));
+    }
+
+    // ---- `read` parameters inside PHASE functions -------------------------
+
+    #[test]
+    fn read_param_can_be_read_and_read_borrowed() {
+        accepts(&with(
+            "fn show(b: read buffer<u8, 8> @RAM) { look(b); let r = borrow b read; cmp(b, r); release r; } fn main() { }",
+        ));
+    }
+
+    #[test]
+    fn read_param_cannot_be_written() {
+        rejects(
+            &with("fn f(b: read buffer<u8, 8> @RAM) { poke(b); } fn main() { }"),
+            "'poke' may write its parameter 'x', but 'b' is read-only",
+        );
+        warns(
+            &with("fn f(b: read buffer<u8, 8> @RAM) { legacy(b); } fn main() { }"),
+            "'b' is read-only",
+        );
+    }
+
+    #[test]
+    fn read_param_cannot_be_moved_destroyed_or_write_borrowed() {
+        rejects(
+            &with("fn f(b: read buffer<u8, 8> @RAM) { move b -> @DMA; } fn main() { }"),
+            "'b' is a `read` parameter of 'f'; cannot move it",
+        );
+        rejects(
+            &with("fn f(b: read buffer<u8, 8> @RAM) { destroy b; } fn main() { }"),
+            "'b' is a `read` parameter of 'f'; cannot destroy it",
+        );
+        rejects(
+            &with("fn f(b: read buffer<u8, 8> @RAM) { let w = borrow b write; release w; } fn main() { }"),
+            "it can only be borrowed `read`",
+        );
+    }
+
+    #[test]
+    fn caller_may_pass_an_owner_to_a_read_param_during_a_read_borrow() {
+        accepts(&with(
+            r#"
+            fn show(b: read buffer<u8, 8> @RAM) { look(b); }
+            fn main() { buffer<u8, 8> x @RAM; let r = borrow x read; show(x); show(r); release r; }
+            "#,
+        ));
+    }
+
+    // ---- typestate: `read` inspects without consuming ----------------------
+
+    const PKT: &str = r#"
+        state Packet { Received -> Validated }
+        extern fn recv() -> Packet<Received>;
+        extern fn check(p: Packet<Received>) -> Packet<Validated>;
+        extern fn inspect(p: read Packet<Validated>);
+        extern fn handle(p: Packet<Validated>);
+    "#;
+
+    #[test]
+    fn read_typestate_param_inspects_without_consuming() {
+        accepts(&format!(
+            "{PKT} fn main() {{ let p = recv(); let v = check(p); inspect(v); inspect(v); handle(v); }}"
+        ));
+    }
+
+    #[test]
+    fn read_typestate_param_still_checks_the_state() {
+        rejects(
+            &format!(
+                "{PKT} fn main() {{ let p = recv(); inspect(p); let v = check(p); handle(v); }}"
+            ),
+            "expected state Validated, found Received",
+        );
+    }
+
+    #[test]
+    fn consumed_value_cannot_be_inspected() {
+        rejects(
+            &format!(
+                "{PKT} fn main() {{ let p = recv(); let v = check(p); handle(v); inspect(v); }}"
+            ),
+            "value 'v' was already consumed",
+        );
+    }
+
+    // ---- signatures ------------------------------------------------------
+
+    #[test]
+    fn read_with_a_domain_change_is_rejected() {
+        rejects(
+            "extern fn start(b: read buffer<u8, 8> @RAM -> @DMA); fn main() { }",
+            "is declared `read` but also hands the buffer to hardware",
+        );
+    }
+
+    #[test]
+    fn write_with_a_domain_change_is_fine() {
+        accepts(
+            "extern fn start(b: write buffer<u8, 8> @RAM -> @DMA); fn main() { buffer<u8, 8> x @RAM; start(x); sync(x); }",
+        );
+    }
+
+    #[test]
+    fn access_mode_on_a_scalar_is_rejected() {
+        rejects(
+            "extern fn f(n: read u32); fn main() { }",
+            "access modes only apply to buffers and entities",
+        );
+    }
+
+    #[test]
+    fn field_read_is_allowed_during_a_read_borrow() {
+        accepts(
+            "entity S : @RAM { v: u32 } fn main() { let s: S @RAM = S { v: 1 }; let r = borrow s read; if s.v == 1 { } release r; }",
         );
     }
 }

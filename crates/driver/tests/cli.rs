@@ -212,3 +212,31 @@ fn overlapped_capture_builds_and_overlaps_cpu_work_with_the_transfer() {
         "256 f32 samples:\n{stdout}"
     );
 }
+
+#[test]
+fn warnings_are_printed_but_do_not_fail_the_check() {
+    let dir = std::env::temp_dir().join("phase_cli_warning");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("warn.phase");
+    std::fs::write(
+        &file,
+        "extern fn legacy(x: buffer<u8, 4> @RAM);\nfn main() {\n    buffer<u8, 4> x @RAM;\n    let r = borrow x read;\n    legacy(r);\n    release r;\n}\n",
+    )
+    .unwrap();
+
+    let human = phase()
+        .args(["--color=never", "check"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    assert!(String::from_utf8_lossy(&human.stderr).starts_with("warning: 'legacy' doesn't declare"));
+    assert!(String::from_utf8_lossy(&human.stdout).contains("1 warning)"));
+
+    let short = phase()
+        .args(["--error-format=short", "check"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&short.stderr).contains("warn.phase:5:12: warning: "));
+}

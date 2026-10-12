@@ -1,0 +1,21 @@
+// Bug gallery #20: writing through a read borrow. `view` promises that
+// nothing changes `frame` while it is live -- but `scale` declares that it
+// writes its argument, so handing it `view` would break that promise.
+// Expected: "'scale' may write its parameter 'x', but 'view' is read-only"
+
+extern fn fill(dst: write buffer<f32, 64> @RAM);
+extern fn scale(x: write buffer<f32, 64> @RAM);
+extern fn plot(x: read buffer<f32, 64> @RAM);
+
+fn main() {
+    buffer<f32, 64> frame @RAM;
+    fill(frame);
+
+    let view = borrow frame read;
+    plot(view);
+
+    // BUG: a read borrow handed to a kernel that writes.
+    scale(view);
+
+    release view;
+}

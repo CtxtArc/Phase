@@ -71,7 +71,7 @@ OK: examples/sdr_session.phase parsed and passed domain/ownership analysis (2 en
 Bug gallery #14: passing the same buffer as both input and output of a
 
 ```
-error: entity 'samples' is passed to 'fir_filter' more than once; aliased arguments are only allowed through read borrows
+error: entity 'samples' is passed to 'fir_filter' more than once; aliased arguments are only allowed when every use is read-only (`read` parameters or read borrows)
   --> examples/bug_gallery/aliased_arguments.phase:12:16
    |
 12 |     fir_filter(samples, samples);
@@ -247,6 +247,25 @@ note: 'x' is borrowed by 'view' here
   |     -------------------------
 
 examples/bug_gallery/move_while_borrowed.phase: 1 error found
+```
+
+### `examples/bug_gallery/read_param_handed_to_writer.phase`
+
+Bug gallery #21: a helper that promises (`read`) not to modify its
+
+```
+error: 'normalize' may write its parameter 'x', but 'samples' is read-only
+  --> examples/bug_gallery/read_param_handed_to_writer.phase:13:15
+   |
+13 |     normalize(samples);
+   |               ^^^^^^^
+note: 'samples' is declared `read` here
+  --> examples/bug_gallery/read_param_handed_to_writer.phase:11:14
+   |
+11 | fn summarize(samples: read buffer<f32, 64> @RAM) {
+   |              ----------------------------------
+
+examples/bug_gallery/read_param_handed_to_writer.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/read_while_capture_in_flight.phase`
@@ -454,5 +473,24 @@ note: 'x' is borrowed by 'a' here
   |     -----------------------
 
 examples/bug_gallery/write_borrow_conflict.phase: 1 error found
+```
+
+### `examples/bug_gallery/write_through_read_borrow.phase`
+
+Bug gallery #20: writing through a read borrow. `view` promises that
+
+```
+error: 'scale' may write its parameter 'x', but 'view' is read-only
+  --> examples/bug_gallery/write_through_read_borrow.phase:18:11
+   |
+18 |     scale(view);
+   |           ^^^^
+note: 'view' is a read borrow taken here
+  --> examples/bug_gallery/write_through_read_borrow.phase:14:5
+   |
+14 |     let view = borrow frame read;
+   |     -----------------------------
+
+examples/bug_gallery/write_through_read_borrow.phase: 1 error found
 ```
 

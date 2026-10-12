@@ -231,6 +231,8 @@ pub struct PirEntityDef {
 pub struct PirFnSig {
     pub name: String,
     pub params: Vec<(String, PirType)>,
+    /// Per parameter: declared `read` (lowered to a `const` pointer).
+    pub read_only: Vec<bool>,
     pub return_type: Option<PirType>,
 }
 
@@ -456,6 +458,10 @@ fn lower_fn_sig(
     Ok(PirFnSig {
         name: name.to_string(),
         params: lowered_params,
+        read_only: params
+            .iter()
+            .map(|p| p.access == Some(BorrowMode::Read))
+            .collect(),
         return_type: lowered_return,
     })
 }

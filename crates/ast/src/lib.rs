@@ -131,6 +131,9 @@ pub struct FieldDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
+    /// `read` / `write` before the type: how the function may access the
+    /// argument's contents. `None` (no mode) is the pre-1.2 default.
+    pub access: Option<BorrowMode>,
     pub ty: TypeExpr,
     /// The domain the argument must be in when the function is called.
     pub domain: Option<Domain>,

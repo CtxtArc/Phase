@@ -62,25 +62,30 @@ impl Reporter {
         );
     }
 
-    /// Print every analysis error plus a count. Returns the exit code.
-    fn analysis_errors(
-        &self,
-        errors: &[phase_analysis::AnalysisError],
-        path: &str,
-        src: &str,
-    ) -> ExitCode {
-        for e in errors {
+    /// Print every warning and error, and a count when there are errors.
+    /// Returns whether the program was rejected.
+    fn report(&self, report: &phase_analysis::Report, path: &str, src: &str) -> bool {
+        for e in report.warnings.iter().chain(&report.errors) {
             self.emit(&Diagnostic::from(e), path, src);
             if self.format == ErrorFormat::Human {
                 eprintln!();
             }
         }
-        eprintln!(
-            "{path}: {} error{} found",
-            errors.len(),
-            if errors.len() == 1 { "" } else { "s" }
-        );
-        ExitCode::FAILURE
+        if report.errors.is_empty() {
+            return false;
+        }
+        let (e, w) = (report.errors.len(), report.warnings.len());
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        if w == 0 {
+            eprintln!("{path}: {e} error{} found", plural(e));
+        } else {
+            eprintln!(
+                "{path}: {e} error{} and {w} warning{} found",
+                plural(e),
+                plural(w)
+            );
+        }
+        true
     }
 
     fn parse_error(&self, e: &phase_parser::ParseError, path: &str, src: &str) -> ExitCode {
@@ -121,12 +126,11 @@ fn parse_and_analyze(path: &str, src: &str, rep: &Reporter) -> Option<phase_ast:
             return None;
         }
     };
-    match phase_analysis::analyze(&program) {
-        Ok(()) => Some(program),
-        Err(errors) => {
-            rep.analysis_errors(&errors, path, src);
-            None
-        }
+    let report = phase_analysis::analyze_full(&program);
+    if rep.report(&report, path, src) {
+        None
+    } else {
+        Some(program)
     }
 }
 
@@ -219,17 +223,21 @@ fn main() -> ExitCode {
                     .filter(|i| matches!(i, phase_ast::Item::Fn(_)))
                     .count();
 
-                match phase_analysis::analyze(&program) {
-                    Ok(()) => {
-                        println!(
-                            "OK: {path} parsed and passed domain/ownership analysis ({entities} entit{}, {fns} fn{})",
-                            if entities == 1 { "y" } else { "ies" },
-                            if fns == 1 { "" } else { "s" },
-                        );
-                        ExitCode::SUCCESS
-                    }
-                    Err(errors) => rep.analysis_errors(&errors, path, &src),
+                let report = phase_analysis::analyze_full(&program);
+                if rep.report(&report, path, &src) {
+                    return ExitCode::FAILURE;
                 }
+                let warnings = match report.warnings.len() {
+                    0 => String::new(),
+                    1 => ", 1 warning".to_string(),
+                    n => format!(", {n} warnings"),
+                };
+                println!(
+                    "OK: {path} parsed and passed domain/ownership analysis ({entities} entit{}, {fns} fn{}{warnings})",
+                    if entities == 1 { "y" } else { "ies" },
+                    if fns == 1 { "" } else { "s" },
+                );
+                ExitCode::SUCCESS
             }
             Err(e) => rep.parse_error(&e, path, &src),
         },

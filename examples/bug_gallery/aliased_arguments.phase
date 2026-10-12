@@ -3,7 +3,7 @@
 // overwritten x[n-k] produces silently wrong output.
 // Expected: "entity 'samples' is passed to 'fir_filter' more than once"
 
-extern fn fir_filter(in_: buffer<f32, 256> @RAM, out: buffer<f32, 256> @RAM);
+extern fn fir_filter(in_: read buffer<f32, 256> @RAM, out: write buffer<f32, 256> @RAM);
 
 fn main() {
     buffer<f32, 256> samples @RAM;

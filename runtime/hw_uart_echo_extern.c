@@ -16,7 +16,7 @@ void hw_fill(uint8_t *dst, size_t dst_len) {
     }
 }
 
-void uart_send(uint8_t *src, size_t src_len) {
+void uart_send(const uint8_t *src, size_t src_len) {
     for (size_t i = 0; i < src_len; i++) {
         while (UART0->STATE & UART_STATE_TXFULL) {
             /* real hardware poll: wait for FIFO space */

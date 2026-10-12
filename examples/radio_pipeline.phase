@@ -9,11 +9,11 @@ state Packet {
     Received -> Decoded -> Validated
 }
 
-extern fn fir_filter(in_: buffer<Sample, 1024> @RAM,
-                      out: buffer<Sample, 1024> @RAM);
+extern fn fir_filter(in_: read buffer<Sample, 1024> @RAM,
+                      out: write buffer<Sample, 1024> @RAM);
 
-extern fn device_capture(dst: buffer<Sample, 1024> @DMA);
-extern fn device_playback(src: buffer<Sample, 1024> @DEVICE);
+extern fn device_capture(dst: write buffer<Sample, 1024> @DMA);
+extern fn device_playback(src: read buffer<Sample, 1024> @DEVICE);
 
 fn main() {
     buffer<Sample, 1024> raw @DMA;

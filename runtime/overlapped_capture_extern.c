@@ -32,7 +32,7 @@ void make_window(Sample *w, size_t w_len) {
     }
 }
 
-void apply_window(Sample *x, size_t x_len, Sample *w, size_t w_len) {
+void apply_window(Sample *x, size_t x_len, const Sample *w, size_t w_len) {
     size_t n = x_len < w_len ? x_len : w_len;
     printf("[sim] apply_window: windowing %zu samples\n", n);
     for (size_t i = 0; i < n; i++) {
@@ -40,7 +40,7 @@ void apply_window(Sample *x, size_t x_len, Sample *w, size_t w_len) {
     }
 }
 
-void report(Sample *x, size_t x_len) {
+void report(const Sample *x, size_t x_len) {
     float peak = 0.0f, energy = 0.0f;
     for (size_t i = 0; i < x_len; i++) {
         float v = fabsf(x[i].value);

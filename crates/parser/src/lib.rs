@@ -201,6 +201,17 @@ impl Parser {
             let start = self.peek_span();
             let name = self.expect_ident()?;
             self.expect(TokenKind::Colon)?;
+            let access = match self.peek() {
+                TokenKind::KwRead => {
+                    self.bump();
+                    Some(BorrowMode::Read)
+                }
+                TokenKind::KwWrite => {
+                    self.bump();
+                    Some(BorrowMode::Write)
+                }
+                _ => None,
+            };
             let ty = self.parse_type_expr()?;
             let domain = self.opt_domain()?;
             // `@FROM -> @TO`: a domain change the function performs on this
@@ -222,6 +233,7 @@ impl Parser {
             };
             params.push(Param {
                 name,
+                access,
                 ty,
                 domain,
                 domain_after,
@@ -710,6 +722,22 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameter_access_modes_are_parsed() {
+        let p = parse(
+            "extern fn f(a: read buffer<u8, 4> @RAM, b: write buffer<u8, 4> @RAM, c: buffer<u8, 4> @RAM); fn main() {}",
+        )
+        .unwrap();
+        let Item::ExternFn(f) = &p.items[0] else {
+            panic!("expected extern fn")
+        };
+        let modes: Vec<_> = f.params.iter().map(|p| p.access).collect();
+        assert_eq!(
+            modes,
+            vec![Some(BorrowMode::Read), Some(BorrowMode::Write), None]
+        );
+    }
 
     #[test]
     fn parameter_domain_change_is_parsed() {

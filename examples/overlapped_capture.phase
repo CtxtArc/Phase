@@ -22,9 +22,9 @@ entity Sample : @RAM {
 // Trusted C: program the DMA engine to fill `dst`, and return immediately.
 extern fn start_capture(dst: buffer<Sample, 256> @RAM -> @DMA);
 
-extern fn make_window(w: buffer<Sample, 256> @RAM);
-extern fn apply_window(x: buffer<Sample, 256> @RAM, w: buffer<Sample, 256> @RAM);
-extern fn report(x: buffer<Sample, 256> @RAM);
+extern fn make_window(w: write buffer<Sample, 256> @RAM);
+extern fn apply_window(x: write buffer<Sample, 256> @RAM, w: read buffer<Sample, 256> @RAM);
+extern fn report(x: read buffer<Sample, 256> @RAM);
 
 // A PHASE helper: the checker verifies its body really does leave `b` in
 // @RAM on every path, as the signature promises.

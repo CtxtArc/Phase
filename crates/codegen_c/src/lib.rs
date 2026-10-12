@@ -136,19 +136,26 @@ fn format_fn_prototype(sig: &PirFnSig) -> String {
         .as_ref()
         .map(type_name)
         .unwrap_or_else(|| "void".to_string());
-    let params = format_params(&sig.params);
+    let params = format_params(sig);
     format!("{ret} {}({params})", sig.name)
 }
 
-fn format_params(params: &[(String, PirType)]) -> String {
-    if params.is_empty() {
+fn format_params(sig: &PirFnSig) -> String {
+    if sig.params.is_empty() {
         return "void".to_string();
     }
     let mut parts = Vec::new();
-    for (name, ty) in params {
+    for (i, (name, ty)) in sig.params.iter().enumerate() {
         match ty {
             PirType::Buffer { elem, .. } => {
-                parts.push(format!("{}* {}", type_name(elem), name));
+                // `read` parameters are `const`, so the C compiler itself
+                // rejects an extern body that writes through one.
+                let const_kw = if sig.read_only.get(i).copied().unwrap_or(false) {
+                    "const "
+                } else {
+                    ""
+                };
+                parts.push(format!("{const_kw}{}* {}", type_name(elem), name));
                 parts.push(format!("size_t {}_len", name));
             }
             other => parts.push(declare(name, other)),
@@ -202,7 +209,7 @@ fn format_fn(f: &PirFn, sigs: &HashMap<&str, &PirFnSig>) -> String {
             .as_ref()
             .map(type_name)
             .unwrap_or_else(|| "void".to_string());
-        (ret, f.sig.name.clone(), format_params(&f.sig.params))
+        (ret, f.sig.name.clone(), format_params(&f.sig))
     };
 
     let mut out = format!("{ret} {name}({params}) {{\n");
@@ -473,6 +480,22 @@ fn format_literal(lit: &PirLiteral) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_buffer_parameters_are_const_pointers() {
+        let src = r#"
+            extern fn fir(in_: read buffer<f32, 8> @RAM, out: write buffer<f32, 8> @RAM);
+            fn main() { }
+        "#;
+        let g = generate_src(src, "t");
+        assert!(
+            g.header.contains(
+                "void fir(const float* in_, size_t in__len, float* out, size_t out_len);"
+            ),
+            "{}",
+            g.header
+        );
+    }
 
     fn generate_src(src: &str, stem: &str) -> Generated {
         let program = phase_parser::parse(src).expect("fixture must parse");

@@ -1,0 +1,21 @@
+// Bug gallery #21: a helper that promises (`read`) not to modify its
+// buffer, then passes it to a kernel that does. Callers rely on the
+// promise -- e.g. by keeping a read borrow of the same buffer -- so the
+// checker holds the helper's body to it.
+// Expected: "'normalize' may write its parameter 'x', but 'samples' is read-only"
+
+extern fn normalize(x: write buffer<f32, 64> @RAM);
+extern fn peak(x: read buffer<f32, 64> @RAM) -> f32;
+extern fn fill(dst: write buffer<f32, 64> @RAM);
+
+fn summarize(samples: read buffer<f32, 64> @RAM) {
+    // BUG: `samples` is read-only here.
+    normalize(samples);
+    let p: f32 = peak(samples);
+}
+
+fn main() {
+    buffer<f32, 64> data @RAM;
+    fill(data);
+    summarize(data);
+}
