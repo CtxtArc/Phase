@@ -288,7 +288,13 @@ fn format_inst(
                 // program that passed analysis, but fall back safely.
                 _ => "sim_device_wait",
             };
-            format!("{pad}{wait_fn}(\"{name}\", {name}, sizeof({name}));\n")
+            // A buffer parameter is a pointer in C, so `sizeof` would give the
+            // pointer's size; use the compile-time length instead.
+            let nbytes = match locals.get(name) {
+                Some(PirType::Buffer { len, .. }) => format!("{len} * sizeof({name}[0])"),
+                _ => format!("sizeof({name})"),
+            };
+            format!("{pad}{wait_fn}(\"{name}\", {name}, {nbytes});\n")
         }
 
         PirInst::EntityBorrow { name, target, mode } => {
@@ -522,7 +528,22 @@ mod tests {
             }
         "#;
         let g = generate_src(src, "t");
-        assert!(g.source.contains("sim_dma_wait(\"x\", x, sizeof(x));"));
+        assert!(g.source.contains("sim_dma_wait(\"x\", x, 4 * sizeof(x[0]));"));
+    }
+
+    #[test]
+    fn sync_of_a_buffer_parameter_counts_elements_not_the_pointer() {
+        let src = r#"
+            extern fn cap(x: buffer<u16, 8> @DMA);
+            fn grab(b: buffer<u16, 8> @RAM) { move b -> @DMA; cap(b); sync(b); }
+            fn main() { }
+        "#;
+        let g = generate_src(src, "t");
+        assert!(
+            g.source.contains("sim_dma_wait(\"b\", b, 8 * sizeof(b[0]));"),
+            "{}",
+            g.source
+        );
     }
 
     #[test]
@@ -537,7 +558,7 @@ mod tests {
             }
         "#;
         let g = generate_src(src, "t");
-        assert!(g.source.contains("sim_device_wait(\"x\", x, sizeof(x));"));
+        assert!(g.source.contains("sim_device_wait(\"x\", x, 4 * sizeof(x[0]));"));
     }
 
     #[test]
@@ -589,12 +610,12 @@ mod tests {
         assert!(g.source.contains("device_capture(raw, 4);"));
         assert!(g
             .source
-            .contains("sim_dma_wait(\"raw\", raw, sizeof(raw));"));
+            .contains("sim_dma_wait(\"raw\", raw, 4 * sizeof(raw[0]));"));
         assert!(g.source.contains("fir_filter(raw, 4, filtered, 4);"));
         assert!(g.source.contains("device_playback(filtered, 4);"));
         assert!(g
             .source
-            .contains("sim_device_wait(\"filtered\", filtered, sizeof(filtered));"));
+            .contains("sim_device_wait(\"filtered\", filtered, 4 * sizeof(filtered[0]));"));
     }
 
     // ---- M6: volatile MMIO register access ---------------------------------
