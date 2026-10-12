@@ -1,22 +1,62 @@
-//! PHASE compiler driver (M1 scope).
+//! `phase` -- the PHASE compiler driver.
 //!
 //! Usage:
-//!   phase check <file>          parse the file, report success/failure
-//!   phase --dump-ast <file>     parse and pretty-print the AST
+//!   phase check <file>          parse + run every safety analysis
+//!   phase build <file>          check, lower to C, compile with `cc`
 //!   phase --dump-tokens <file>  lex and print the token stream
+//!   phase --dump-ast <file>     parse and pretty-print the AST
+//!   phase --dump-pir <file>     check and pretty-print the PIR
+//!   phase --version | --help
 
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn usage() -> String {
+    format!(
+        "phase {VERSION} -- physical-domain safety compiler
+
+usage:
+  phase check <file>          parse and run every safety analysis
+  phase build <file>          check, lower to C, and compile with `cc`
+  phase --dump-tokens <file>  print the token stream
+  phase --dump-ast <file>     print the parsed AST
+  phase --dump-pir <file>     check, then print the lowered PIR
+  phase --version             print the version
+  phase --help                print this message
+
+`build` writes <project>/build/<stem>.gen.{{c,h}} and <project>/build/<stem>,
+where <project> is the nearest directory at or above <file> that contains a
+`runtime/` directory (override with PHASE_RUNTIME_DIR=<dir>)."
+    )
+}
+
 fn print_usage() {
-    eprintln!("usage:");
-    eprintln!("  phase check <file>");
-    eprintln!("  phase build <file>          (run from the phase/ project root)");
-    eprintln!("  phase --dump-ast <file>");
-    eprintln!("  phase --dump-tokens <file>");
-    eprintln!("  phase --dump-pir <file>");
+    eprintln!("{}", usage());
+}
+
+/// Locate the runtime directory for `source`: `$PHASE_RUNTIME_DIR` if set,
+/// otherwise the nearest `runtime/` at or above the source file, otherwise
+/// the nearest one at or above the current directory.
+fn find_runtime_dir(source: &Path) -> Option<PathBuf> {
+    if let Some(dir) = env::var_os("PHASE_RUNTIME_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    let search_from = |start: PathBuf| {
+        start
+            .ancestors()
+            .map(|a| a.join("runtime"))
+            .find(|r| r.join("phase_runtime.h").is_file())
+    };
+    let source_dir = fs::canonicalize(source)
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    source_dir
+        .and_then(search_from)
+        .or_else(|| env::current_dir().ok().and_then(search_from))
 }
 
 /// Parse and analyze `src`, printing errors to stderr (prefixed with
@@ -48,6 +88,17 @@ fn parse_and_analyze(path: &str, src: &str) -> Option<phase_ast::Program> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("--version" | "-V") if args.len() == 2 => {
+            println!("phase {VERSION}");
+            return ExitCode::SUCCESS;
+        }
+        Some("--help" | "-h" | "help") if args.len() == 2 => {
+            println!("{}", usage());
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
     if args.len() != 3 {
         print_usage();
         return ExitCode::FAILURE;
@@ -162,12 +213,26 @@ fn main() -> ExitCode {
 
             let generated = phase_codegen_c::generate(&pir, &stem);
 
-            if let Err(e) = fs::create_dir_all("build") {
-                eprintln!("error: could not create 'build' directory: {e}");
+            let Some(runtime_dir) = find_runtime_dir(Path::new(path)) else {
+                eprintln!(
+                    "error: could not find a PHASE `runtime/` directory (containing \
+                     phase_runtime.h) at or above '{path}' or the current directory; \
+                     set PHASE_RUNTIME_DIR to point at one"
+                );
+                return ExitCode::FAILURE;
+            };
+            let project_dir = runtime_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let build_dir = project_dir.join("build");
+
+            if let Err(e) = fs::create_dir_all(&build_dir) {
+                eprintln!("error: could not create '{}': {e}", build_dir.display());
                 return ExitCode::FAILURE;
             }
-            let header_path = format!("build/{stem}.gen.h");
-            let source_path = format!("build/{stem}.gen.c");
+            let header_path = build_dir.join(format!("{stem}.gen.h")).display().to_string();
+            let source_path = build_dir.join(format!("{stem}.gen.c")).display().to_string();
             if let Err(e) = fs::write(&header_path, &generated.header) {
                 eprintln!("error: could not write '{header_path}': {e}");
                 return ExitCode::FAILURE;
@@ -187,38 +252,38 @@ fn main() -> ExitCode {
             //     never bodies -- spec §3.9). Only linked if the program
             //     actually declares any `extern fn`, and only if a
             //     matching file exists.
-            let generic_runtime_c = "runtime/phase_runtime.c";
-            let extern_runtime_c = format!("runtime/{stem}_extern.c");
+            let generic_runtime_c = runtime_dir.join("phase_runtime.c");
+            let extern_runtime_c = runtime_dir.join(format!("{stem}_extern.c"));
             let needs_extern_runtime = !pir.extern_fns.is_empty();
 
-            if needs_extern_runtime && !Path::new(&extern_runtime_c).exists() {
+            if needs_extern_runtime && !extern_runtime_c.exists() {
                 eprintln!(
-                    "error: this program declares {} extern fn(s) but '{extern_runtime_c}' \
+                    "error: this program declares {} extern fn(s) but '{}' \
                      was not found -- `phase build` needs a hand-written runtime file \
-                     implementing them (see runtime/radio_pipeline_extern.c for an example), \
-                     and must be run from the phase/ project root",
-                    pir.extern_fns.len()
+                     implementing them (see runtime/radio_pipeline_extern.c for an example)",
+                    pir.extern_fns.len(),
+                    extern_runtime_c.display()
                 );
                 return ExitCode::FAILURE;
             }
 
-            let binary_path = format!("build/{stem}");
+            let binary_path = build_dir.join(&stem).display().to_string();
             let mut cc_args = vec![
                 "-std=c11".to_string(),
                 "-Wall".to_string(),
                 "-I".to_string(),
-                "build".to_string(),
+                build_dir.display().to_string(),
                 "-I".to_string(),
-                "runtime".to_string(),
+                runtime_dir.display().to_string(),
                 "-o".to_string(),
                 binary_path.clone(),
                 source_path.clone(),
             ];
-            if Path::new(generic_runtime_c).exists() {
-                cc_args.push(generic_runtime_c.to_string());
+            if generic_runtime_c.exists() {
+                cc_args.push(generic_runtime_c.display().to_string());
             }
             if needs_extern_runtime {
-                cc_args.push(extern_runtime_c);
+                cc_args.push(extern_runtime_c.display().to_string());
             }
             cc_args.push("-lm".to_string());
 
