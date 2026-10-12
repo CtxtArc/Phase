@@ -1,0 +1,22 @@
+// Bug gallery #26: swapping a buffer with one declared in an inner block.
+// `swap` exchanges storage, so after it `frame` points at `tmp`'s storage
+// -- which dies at the end of the `if` block, leaving `frame` dangling.
+// Found by the differential fuzzer (crates/fuzz).
+// Expected: "cannot swap 'tmp' with 'frame': 'tmp' is declared in an inner block"
+
+extern fn should_refresh() -> bool;
+extern fn fill(dst: write buffer<u8, 64> @RAM);
+extern fn report(x: read buffer<u8, 64> @RAM);
+
+fn main() {
+    buffer<u8, 64> frame @RAM;
+    let refresh: bool = should_refresh();
+    if refresh {
+        buffer<u8, 64> tmp @RAM;
+        fill(tmp);
+        // BUG: `frame` would now point into `tmp`'s storage...
+        swap tmp, frame;
+    }
+    // ...which no longer exists here.
+    report(frame);
+}

@@ -471,6 +471,25 @@ note: 'p1' is consumed here
 examples/bug_gallery/stale_typestate_reuse.phase: 1 error found
 ```
 
+### `examples/bug_gallery/swap_across_blocks.phase`
+
+Bug gallery #26: swapping a buffer with one declared in an inner block.
+
+```
+error: cannot swap 'tmp' with 'frame': 'tmp' is declared in an inner block, so 'frame' would be left pointing at storage that dies when that block ends
+  --> examples/bug_gallery/swap_across_blocks.phase:18:14
+   |
+18 |         swap tmp, frame;
+   |              ^^^
+note: 'tmp' is declared here
+  --> examples/bug_gallery/swap_across_blocks.phase:15:9
+   |
+15 |         buffer<u8, 64> tmp @RAM;
+   |         ------------------------
+
+examples/bug_gallery/swap_across_blocks.phase: 1 error found
+```
+
 ### `examples/bug_gallery/swap_while_borrowed.phase`
 
 Bug gallery #24: swapping a buffer while a borrow of it is live. After

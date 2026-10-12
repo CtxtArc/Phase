@@ -403,6 +403,8 @@ struct VarState {
     read_only: bool,
     /// The declared type, where known (used by `swap`).
     ty: Option<TypeExpr>,
+    /// Block nesting depth of the declaration (0 = function body).
+    block: usize,
 
     // ---- where things happened, for diagnostics ----------------------
     /// Where this name was declared (for a borrow handle: the borrow).
@@ -432,6 +434,7 @@ impl VarState {
             rejected_borrow: false,
             read_only: false,
             ty: None,
+            block: 0,
         }
     }
 
@@ -484,6 +487,8 @@ struct FnChecker<'a> {
     borrows: HashMap<String, BorrowState>,
     /// Span of the statement currently being checked.
     cur_span: Span,
+    /// Current block nesting depth (0 = function body).
+    block_depth: usize,
     /// Set once every path through the statements checked so far has hit a
     /// `return`. Code after that point is unreachable, and the state at that
     /// point must not be merged into the fall-through state of a branch.
@@ -548,6 +553,7 @@ impl<'a> FnChecker<'a> {
             locals: HashMap::new(),
             borrows: HashMap::new(),
             cur_span: Span::default(),
+            block_depth: 0,
             diverged: false,
         }
     }
@@ -785,6 +791,24 @@ impl<'a> FnChecker<'a> {
                 );
                 return;
             }
+        }
+        // Swapping exchanges storage, so both storages must live exactly as
+        // long: a name declared outside a block must not end up pointing at
+        // storage that dies with the block.
+        if va.block != vb.block {
+            let (inner, outer, iv) = if va.block > vb.block {
+                (a, b, &va)
+            } else {
+                (b, a, &vb)
+            };
+            errors.push(
+                err(format!(
+                    "cannot swap '{a}' with '{b}': '{inner}' is declared in an inner block, so '{outer}' would be left pointing at storage that dies when that block ends"
+                ))
+                .about(inner)
+                .note(iv.origin, format!("'{inner}' is declared here")),
+            );
+            return;
         }
         if va.ty != vb.ty {
             let show = |t: &Option<TypeExpr>| t.as_ref().map(fmt_type).unwrap_or_default();
@@ -1119,7 +1143,9 @@ impl<'a> FnChecker<'a> {
         let saved_borrows = self.borrows.clone();
         let saved_diverged = self.diverged;
         if let Some(b) = block {
+            self.block_depth += 1;
             self.check_block(b, errors);
+            self.block_depth -= 1;
             if !self.diverged {
                 self.check_block_scope_exit(&saved_locals, b.close, errors);
             }
@@ -1418,6 +1444,7 @@ impl<'a> FnChecker<'a> {
                     param_exit: base_var.param_exit,
                     read_only: base_var.read_only,
                     ty: base_var.ty.clone(),
+                    block: base_var.block,
                     rejected_borrow: base_var.rejected_borrow,
                     origin: base_var.origin,
                     domain_since: a.domain_since.clone().or_else(|| b.domain_since.clone()),
@@ -1611,6 +1638,7 @@ impl<'a> FnChecker<'a> {
 
         let mut var = VarState::local(resolved_domain, resolved_typestate, self.cur_span);
         var.ty = ty.cloned();
+        var.block = self.block_depth;
         if let Some(d) = resolved_domain {
             var.domain_since = Some((
                 self.cur_span,
@@ -1721,6 +1749,7 @@ impl<'a> FnChecker<'a> {
         let (domain, typestate) = (target_var.domain, target_var.typestate.clone());
         let mut var = VarState::local(domain, typestate, self.cur_span);
         var.ty = target_var.ty.clone();
+        var.block = self.block_depth;
         if ok {
             var.borrow_of = Some((target.to_string(), mode));
         } else {
@@ -4208,5 +4237,50 @@ mod block_scope_tests {
         ))
         .unwrap_err();
         assert!(errs[0].message.contains("when 'main' returns"), "{errs:?}");
+    }
+}
+
+/// v1.3: `swap` only between buffers declared in the same block.
+#[cfg(test)]
+mod swap_scope_tests {
+    use super::*;
+
+    fn check(src: &str) -> Result<(), Vec<AnalysisError>> {
+        analyze(&phase_parser::parse(src).expect("fixture must parse"))
+    }
+
+    #[test]
+    fn swap_with_an_inner_block_buffer_is_rejected() {
+        let errs = check(
+            "extern fn flip() -> bool; fn main() { buffer<u8, 8> outer @RAM; let c: bool = flip(); if c { buffer<u8, 8> inner @RAM; swap outer, inner; } }",
+        )
+        .unwrap_err();
+        assert!(
+            errs[0].message.contains(
+                "cannot swap 'outer' with 'inner': 'inner' is declared in an inner block"
+            ),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn swap_of_two_buffers_from_the_same_inner_block_is_fine() {
+        assert_eq!(
+            check(
+                "extern fn flip() -> bool; fn main() { let c: bool = flip(); if c { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; swap a, b; } }",
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn swap_of_outer_buffers_inside_a_block_is_fine() {
+        // Both storages outlive the block, so swapping them inside it is safe.
+        assert_eq!(
+            check(
+                "extern fn flip() -> bool; fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; let c: bool = flip(); if c { swap a, b; } }",
+            ),
+            Ok(())
+        );
     }
 }
