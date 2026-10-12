@@ -734,6 +734,9 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
             };
             match value {
                 Some(v) => format!("{checks}{pad}return {v};\n"),
+                // PHASE's `main` is C's `int main(void)`: a bare `return;`
+                // there would leave the exit status undefined.
+                None if cx.sig.name == "main" => format!("{checks}{pad}return 0;\n"),
                 None => format!("{checks}{pad}return;\n"),
             }
         }
@@ -854,6 +857,17 @@ fn format_literal(lit: &PirLiteral) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn early_return_from_main_returns_zero() {
+        let src = r#"
+            extern fn flip() -> bool;
+            fn main() { let c: bool = flip(); if c { return; } }
+        "#;
+        let g = generate_src(src, "t");
+        assert!(g.source.contains("        return 0;\n"), "{}", g.source);
+        assert!(!g.source.contains("return;"), "{}", g.source);
+    }
 
     #[test]
     fn swapped_buffers_are_pointer_backed_and_swap_exchanges_pointers() {
