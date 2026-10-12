@@ -238,6 +238,12 @@ pub struct PirFnSig {
     pub params: Vec<(String, PirType)>,
     /// Per parameter: declared `read` (lowered to a `const` pointer).
     pub read_only: Vec<bool>,
+    /// Per parameter: declared access mode (`None`: no mode).
+    pub param_access: Vec<Option<BorrowMode>>,
+    /// Per parameter: required domain at the call.
+    pub param_domains: Vec<Option<Domain>>,
+    /// Per parameter: the `@TO` of a declared `@FROM -> @TO` change.
+    pub param_domains_after: Vec<Option<Domain>>,
     pub return_type: Option<PirType>,
 }
 
@@ -467,6 +473,9 @@ fn lower_fn_sig(
             .iter()
             .map(|p| p.access == Some(BorrowMode::Read))
             .collect(),
+        param_access: params.iter().map(|p| p.access).collect(),
+        param_domains: params.iter().map(|p| p.domain).collect(),
+        param_domains_after: params.iter().map(|p| p.domain_after).collect(),
         return_type: lowered_return,
     })
 }

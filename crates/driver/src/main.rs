@@ -37,6 +37,13 @@ options:
                                `file:line:col: error: message` line each
   --color=auto|always|never    color for human errors (default: auto, which
                                respects NO_COLOR and only colors a terminal)
+  --checked                    (build) instrument the program with runtime
+                               ownership checks; writes <stem>.checked.gen.c
+                               and the binary <stem>-checked
+  --stub-externs               (build) generate placeholder bodies for the
+                               program's extern fns instead of requiring
+                               runtime/<stem>_extern.c; scalar results come
+                               from a PRNG seeded by PHASE_STUB_SEED
 
 `build` writes <project>/build/<stem>.gen.{{c,h}} and <project>/build/<stem>,
 where <project> is the nearest directory at or above <file> that contains a
@@ -137,6 +144,8 @@ fn parse_and_analyze(path: &str, src: &str, rep: &Reporter) -> Option<phase_ast:
 fn main() -> ExitCode {
     let mut format = ErrorFormat::Human;
     let mut color_mode = "auto".to_string();
+    let mut checked = false;
+    let mut stub_externs = false;
     let mut positional: Vec<String> = Vec::new();
     for arg in env::args().skip(1) {
         if let Some(v) = arg.strip_prefix("--error-format=") {
@@ -148,6 +157,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+        } else if arg == "--checked" {
+            checked = true;
+        } else if arg == "--stub-externs" {
+            stub_externs = true;
         } else if let Some(v) = arg.strip_prefix("--color=") {
             if !matches!(v, "auto" | "always" | "never") {
                 eprintln!("error: unknown --color '{v}' (expected auto, always, or never)");
@@ -274,7 +287,18 @@ fn main() -> ExitCode {
                 .unwrap_or("out")
                 .to_string();
 
-            let generated = phase_codegen_c::generate(&pir, &stem);
+            let generated = if checked {
+                phase_codegen_c::generate_checked(&pir, &stem)
+            } else {
+                phase_codegen_c::generate(&pir, &stem)
+            };
+            // A checked build gets its own source and binary names so it
+            // never silently replaces the normal one.
+            let (source_name, binary_name) = if checked {
+                (format!("{stem}.checked.gen.c"), format!("{stem}-checked"))
+            } else {
+                (format!("{stem}.gen.c"), stem.clone())
+            };
 
             let Some(runtime_dir) = find_runtime_dir(Path::new(path)) else {
                 eprintln!(
@@ -298,10 +322,7 @@ fn main() -> ExitCode {
                 .join(format!("{stem}.gen.h"))
                 .display()
                 .to_string();
-            let source_path = build_dir
-                .join(format!("{stem}.gen.c"))
-                .display()
-                .to_string();
+            let source_path = build_dir.join(&source_name).display().to_string();
             if let Err(e) = fs::write(&header_path, &generated.header) {
                 eprintln!("error: could not write '{header_path}': {e}");
                 return ExitCode::FAILURE;
@@ -322,21 +343,40 @@ fn main() -> ExitCode {
             //     actually declares any `extern fn`, and only if a
             //     matching file exists.
             let generic_runtime_c = runtime_dir.join("phase_runtime.c");
-            let extern_runtime_c = runtime_dir.join(format!("{stem}_extern.c"));
             let needs_extern_runtime = !pir.extern_fns.is_empty();
+            let extern_runtime_c = if stub_externs {
+                let stubs = build_dir.join(format!("{stem}.stubs.c"));
+                if let Err(e) = fs::write(&stubs, phase_codegen_c::generate_stubs(&pir, &stem)) {
+                    eprintln!("error: could not write '{}': {e}", stubs.display());
+                    return ExitCode::FAILURE;
+                }
+                stubs
+            } else {
+                runtime_dir.join(format!("{stem}_extern.c"))
+            };
 
             if needs_extern_runtime && !extern_runtime_c.exists() {
                 eprintln!(
                     "error: this program declares {} extern fn(s) but '{}' \
                      was not found -- `phase build` needs a hand-written runtime file \
-                     implementing them (see runtime/radio_pipeline_extern.c for an example)",
+                     implementing them (see runtime/radio_pipeline_extern.c for an example), \
+                     or --stub-externs to generate placeholders",
                     pir.extern_fns.len(),
                     extern_runtime_c.display()
                 );
                 return ExitCode::FAILURE;
             }
 
-            let binary_path = build_dir.join(&stem).display().to_string();
+            let check_runtime_c = runtime_dir.join("phase_check.c");
+            if checked && !check_runtime_c.exists() {
+                eprintln!(
+                    "error: --checked needs '{}', which was not found",
+                    check_runtime_c.display()
+                );
+                return ExitCode::FAILURE;
+            }
+
+            let binary_path = build_dir.join(&binary_name).display().to_string();
             let mut cc_args = vec![
                 "-std=c11".to_string(),
                 "-Wall".to_string(),
@@ -350,6 +390,9 @@ fn main() -> ExitCode {
             ];
             if generic_runtime_c.exists() {
                 cc_args.push(generic_runtime_c.display().to_string());
+            }
+            if checked {
+                cc_args.push(check_runtime_c.display().to_string());
             }
             if needs_extern_runtime {
                 cc_args.push(extern_runtime_c.display().to_string());
