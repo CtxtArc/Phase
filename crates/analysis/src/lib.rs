@@ -1120,11 +1120,49 @@ impl<'a> FnChecker<'a> {
         let saved_diverged = self.diverged;
         if let Some(b) = block {
             self.check_block(b, errors);
+            if !self.diverged {
+                self.check_block_scope_exit(&saved_locals, b.close, errors);
+            }
         }
         let out_locals = std::mem::replace(&mut self.locals, saved_locals);
         let out_borrows = std::mem::replace(&mut self.borrows, saved_borrows);
         let out_diverged = std::mem::replace(&mut self.diverged, saved_diverged);
         (out_locals, out_borrows, out_diverged)
+    }
+
+    /// Names declared inside a block go out of scope when it falls through
+    /// to its closing brace: none may still be owned by hardware (the
+    /// storage is gone while a transfer may still target it). Borrows taken
+    /// in the block are checked at the join. Reported at the `}`.
+    fn check_block_scope_exit(
+        &self,
+        outer: &HashMap<String, VarState>,
+        close: Span,
+        errors: &mut Vec<AnalysisError>,
+    ) {
+        let mut names: Vec<&String> = self
+            .locals
+            .keys()
+            .filter(|n| !outer.contains_key(*n))
+            .collect();
+        names.sort();
+        for name in names {
+            let var = &self.locals[name];
+            if var.borrow_of.is_some() || var.destroyed || var.consumed.is_some() {
+                continue;
+            }
+            if let Some(d) = var.domain.filter(|d| is_device_owned(*d)) {
+                errors.push(
+                    err(format!(
+                        "entity '{name}' is still owned by @{} when its block ends; sync({name}) before it goes out of scope",
+                        d.name()
+                    ))
+                    .at(close)
+                    .about(name)
+                    .note_opt(var.domain_since.as_ref()),
+                );
+            }
+        }
     }
 
     /// Adopt one branch's end state wholesale (the other branch returned,
@@ -4115,5 +4153,60 @@ mod swap_tests {
             &with("fn main() { let n: u32 = get_n(); buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; start(b); if n == 1 { swap a, b; } sync(b); }"),
             "disagrees on domain across incoming branches",
         );
+    }
+}
+
+/// v1.3: names declared inside a block are checked when the block ends.
+#[cfg(test)]
+mod block_scope_tests {
+    use super::*;
+
+    fn check(src: &str) -> Result<(), Vec<AnalysisError>> {
+        analyze(&phase_parser::parse(src).expect("fixture must parse"))
+    }
+
+    const SIGS: &str = r#"
+        extern fn flip() -> bool;
+        extern fn count() -> u32;
+        extern fn start(x: write buffer<u8, 8> @RAM -> @DMA);
+    "#;
+
+    #[test]
+    fn hardware_owned_buffer_leaving_an_if_block_is_rejected() {
+        let errs = check(&format!(
+            "{SIGS} fn main() {{ let c: bool = flip(); if c {{ buffer<u8, 8> t @RAM; start(t); }} }}"
+        ))
+        .unwrap_err();
+        assert!(
+            errs[0]
+                .message
+                .contains("entity 't' is still owned by @DMA when its block ends"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn hardware_owned_buffer_leaving_a_loop_body_is_rejected() {
+        let errs = check(&format!(
+            "{SIGS} fn main() {{ let n: u32 = 0; let l: u32 = count(); while n < l {{ buffer<u8, 8> t @DMA; n = n + 1; }} }}"
+        ))
+        .unwrap_err();
+        assert!(errs[0].message.contains("when its block ends"), "{errs:?}");
+    }
+
+    #[test]
+    fn synced_block_local_and_returning_branches_are_fine() {
+        assert_eq!(
+            check(&format!(
+                "{SIGS} fn main() {{ let c: bool = flip(); if c {{ buffer<u8, 8> t @RAM; start(t); sync(t); }} }}"
+            )),
+            Ok(())
+        );
+        // A branch that returns is checked by the return, not the block end.
+        let errs = check(&format!(
+            "{SIGS} fn main() {{ let c: bool = flip(); if c {{ buffer<u8, 8> t @RAM; start(t); return; }} }}"
+        ))
+        .unwrap_err();
+        assert!(errs[0].message.contains("when 'main' returns"), "{errs:?}");
     }
 }

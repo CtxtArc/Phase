@@ -1,0 +1,18 @@
+// Bug gallery #25: a buffer declared inside a block, handed to the DMA
+// engine, and abandoned when the block ends. The stack storage is reused
+// while the transfer is still writing into it. Found by the differential
+// fuzzer (crates/fuzz): v1.2 checked this at function exit but not at the
+// end of an `if`/`while` block.
+// Expected: "entity 'scratch' is still owned by @DMA when its block ends"
+
+extern fn should_capture() -> bool;
+extern fn start_capture(dst: write buffer<u8, 64> @RAM -> @DMA);
+
+fn main() {
+    let go: bool = should_capture();
+    if go {
+        buffer<u8, 64> scratch @RAM;
+        start_capture(scratch);
+        // BUG: `scratch` dies here while the DMA engine still owns it.
+    }
+}

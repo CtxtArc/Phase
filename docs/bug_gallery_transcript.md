@@ -197,6 +197,25 @@ note: 'scratch' is moved to @DMA here
 examples/bug_gallery/dma_escapes_function.phase: 1 error found
 ```
 
+### `examples/bug_gallery/dma_into_dead_block.phase`
+
+Bug gallery #25: a buffer declared inside a block, handed to the DMA
+
+```
+error: entity 'scratch' is still owned by @DMA when its block ends; sync(scratch) before it goes out of scope
+  --> examples/bug_gallery/dma_into_dead_block.phase:17:5
+   |
+17 |     }
+   |     ^
+note: 'scratch' is moved to @DMA by 'start_capture' here
+  --> examples/bug_gallery/dma_into_dead_block.phase:15:9
+   |
+15 |         start_capture(scratch);
+   |         -----------------------
+
+examples/bug_gallery/dma_into_dead_block.phase: 1 error found
+```
+
 ### `examples/bug_gallery/forged_typestate.phase`
 
 Bug gallery #8: claiming a typestate with an annotation instead of
