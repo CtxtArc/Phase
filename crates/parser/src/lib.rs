@@ -1,4 +1,4 @@
-//! Recursive-descent parser for PHASE (v0.1, M1 scope: no `if`/`while` yet).
+//! Hand-written recursive-descent parser for PHASE: tokens -> AST.
 
 use phase_ast::*;
 use phase_lexer::{tokenize, LexError, Span, Token, TokenKind};
@@ -319,7 +319,7 @@ impl Parser {
 
     /// `name = expr;` (M9) -- reassigns an already-declared scalar local.
     /// Deliberately just `Ident = Expr`, not general lvalues (no field or
-    /// index targets in v0.1) -- see `phase_specification.md` §9,
+    /// index targets) -- see `phase_specification.md` §9,
     /// Milestone M9.
     fn parse_assign_stmt(&mut self) -> Result<Stmt, ParseError> {
         let name = self.expect_ident()?;
@@ -535,7 +535,7 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
-        // v0.1 has no unary operators in the AST yet beyond literals/primary;
+        // PHASE has no unary operators in the AST yet beyond literals/primary;
         // reserved for future work (e.g. unary `-`). Fall straight through.
         self.parse_postfix()
     }

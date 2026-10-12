@@ -165,7 +165,7 @@ pub enum PirInst {
         callee: String,
         args: Vec<CallArg>,
     },
-    /// `move name -> to;` — compile-time-only in the v0.1 simulation model
+    /// `move name -> to;` — compile-time-only in the simulation model
     /// (see spec §6.1/§7.4): everything lives in one address space, so
     /// there is nothing to physically move. Kept in PIR so codegen can at
     /// least emit a explanatory comment at the call site.

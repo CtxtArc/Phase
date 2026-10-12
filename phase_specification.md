@@ -2,7 +2,7 @@
 
 **A physical-domain safety language for signal, RF, and embedded pipelines**
 
-Version 0.1 — Draft
+Version 1.0
 
 ---
 
@@ -63,9 +63,9 @@ class a compile-time error instead of a runtime incident.
 - Not a GPU/FPGA compiler. Accelerators are modeled as a generic `DEVICE`
   domain with the same handoff rules as everything else; specialized
   GPU/FPGA support is explicitly future work.
-- Not targeting real silicon in v0.1. The first target is simulated hardware
+- Not tied to real silicon. The default target is simulated hardware
   running on the host, so the project is fully testable without an SDR or a
-  microcontroller.
+  microcontroller; a real ARM Cortex-M3 runtime exists alongside it (§5.3).
 
 ### 1.4 Why this is a good portfolio compiler project
 
@@ -77,7 +77,7 @@ class a compile-time error instead of a runtime incident.
 - It is scoped so every milestone produces something runnable and
   demoable, rather than requiring the whole system to exist before anything
   works.
-- Compiling to readable C (not LLVM) for v0.1 keeps 100% of the engineering
+- Compiling to readable C (not LLVM) for v1 keeps 100% of the engineering
   effort on the actually-novel part of the project (the physical analysis)
   instead of backend plumbing.
 
@@ -86,9 +86,9 @@ class a compile-time error instead of a runtime incident.
 <a name="part-2-physical-domain-model"></a>
 ## Part 2: Physical Domain Model
 
-### 2.1 Domains (v0.1 fixed set)
+### 2.1 Domains (v1 fixed set)
 
-PHASE v0.1 supports exactly four domains. This is intentionally small — the
+PHASE v1 supports exactly five domains. This is intentionally small — the
 whole point is depth, not breadth.
 
 | Domain    | Meaning                                             | CPU-readable by default? |
@@ -99,7 +99,7 @@ whole point is depth, not breadth.
 | `@MMIO`   | Memory-mapped hardware register                       | yes, but every access is an observable side effect |
 | `@DEVICE` | Generic external domain (ADC, DAC, radio front end, accelerator, network interface) | no — requires `sync` or explicit handoff |
 
-`@DEVICE` is deliberately generic in v0.1. A real ADC, a real GPU, and a real
+`@DEVICE` is deliberately generic in v1. A real ADC, a real GPU, and a real
 network card all behave the same way from the *safety* point of view: you
 hand them a buffer, they own it for a while, you get it back after a
 synchronization point. Specializing `@DEVICE` into named subtypes
@@ -128,7 +128,7 @@ DeviceOwned    -- handed to @DMA or @DEVICE; host cannot access until synced
 Destroyed      -- lifetime ended; any further access is an error
 ```
 
-### 2.4 Legal transitions (v0.1 table)
+### 2.4 Legal transitions (v1 table)
 
 ```
 @STACK  --move-->        @RAM
@@ -142,13 +142,13 @@ Destroyed      -- lifetime ended; any further access is an error
 ```
 
 Everything not in this table is a compile error: **"no legal transition from
-X to Y."** This table is intentionally a flat, hardcoded structure in v0.1
+X to Y."** This table is intentionally a flat, hardcoded structure in v1
 (see §6.5) — not a plugin system yet. Making it pluggable is future work.
 
 ### 2.5 Costs and observability
 
 Every transition has a declared cost class used only for diagnostics/tracing
-in v0.1 (not for optimization yet):
+in v1 (not for optimization yet):
 
 ```
 move            -- cheap, same-domain-family
@@ -311,12 +311,48 @@ on the branch that's missing one). This is the direct analogue of KAIROS's
 `ENTITY_PHI` (Part 6, §10 of the KAIROS doc) and is the single hardest piece
 of the analyzer — flagged explicitly as its own milestone (§9, Milestone 4).
 
-### 4.4 What the type system guarantees (design goal)
+### 4.4 What the type system guarantees
 
-No use of a `DeviceOwned` buffer by the host without a `sync`; no write-borrow
-that overlaps a read-borrow or another write-borrow; no access after
-`destroy`; no call requiring typestate `S` on a value not proven to be in
-state `S`; no elimination/reordering of `@MMIO` accesses.
+For every program `phase check` accepts, within a function body:
+
+- **Domains.** No use, borrow, field read, or `destroy` of a `@DMA`/
+  `@DEVICE`-owned entity by the host without a `sync`; every `move`/`sync`
+  follows §2.4.
+- **Borrows.** Many readers or one writer, never both. While any borrow
+  of an entity is live, the entity is reachable only through its borrows
+  (the owner cannot be used, moved, synced, or destroyed). A released
+  handle is dead. Handles cannot be moved, synced, destroyed, or
+  re-borrowed.
+- **Aliasing.** One storage location appears at most once among a call's
+  arguments, unless every occurrence is a read borrow. Entities cannot be
+  copied with `let`, and names cannot be redeclared, so one location never
+  has two independently tracked names.
+- **Lifetimes.** No access after `destroy`. At every `return` (explicit or
+  falling off the end): no local is still `@DMA`/`@DEVICE`-owned, no borrow
+  is live, and every parameter is in the domain it arrived in. Parameters
+  cannot be destroyed (the caller owns them).
+- **Typestate.** A value's state is established only by a function's
+  declared return state, or — for a newly constructed value — the
+  machine's initial state; a type annotation is checked against that and
+  never trusted on its own. Typestate values are linear: passing one to a
+  state-requiring parameter, or returning it, consumes it.
+- **Control flow.** At an `if` join every incoming path agrees on each
+  pre-existing entity's domain, typestate, destroyed-ness, and borrows
+  (paths that `return` do not reach the join; a value consumed on one path
+  only is unusable after it). A `while` body leaves every pre-existing
+  entity exactly as it found it, so the single-pass check is a loop
+  invariant and holds for any iteration count.
+- **MMIO.** Every `volatile_read`/`volatile_write` targets an `@MMIO`
+  register reference and is lowered to a `volatile` access, so the C
+  compiler cannot eliminate or reorder it.
+
+**Trust boundary.** `extern fn` bodies are not analyzed (§3.9): PHASE
+trusts that a kernel does only what its signature says — touches only the
+buffers it is passed, does not retain them past the call, and really
+performs the state transition its return type claims. A buggy or
+malicious extern can violate any guarantee above. Likewise the analysis is
+per-function and assumes the hardware honors the ownership model (e.g.
+that a transfer is complete when `sync` returns).
 
 ---
 
@@ -325,28 +361,36 @@ state `S`; no elimination/reordering of `@MMIO` accesses.
 
 ### 5.1 Why simulated hardware
 
-v0.1 targets host-only execution so the whole project is testable and
-demoable without real RF/embedded hardware. Every "device" is a small C
+`phase build` targets host execution by default so the whole project is
+testable and demoable without real RF/embedded hardware. Every "device" is a small C
 runtime component with realistic *timing and ownership* behavior, not real
 signal behavior.
 
-### 5.2 Simulated components (v0.1)
+### 5.2 Simulated components
 
-- `sim_dma` — models a transfer engine: `start_transfer`, background delay,
-  `is_done`, `wait`. Used to back `move -> @DMA` / `sync`.
-- `sim_adc` / `sim_dac` — generic `@DEVICE` capture/playback stand-ins;
-  `sim_adc` can optionally fill a buffer with a synthetic signal (sine +
-  noise) so the demo pipeline has something real to filter.
-- `sim_mmio` — a fake register file in a struct, with a hook to log every
-  volatile access (used to prove volatile accesses aren't dropped by
-  codegen).
+- `runtime/phase_runtime.c` — `sim_dma_wait` / `sim_device_wait`, the two
+  functions every `sync` lowers to. Everything shares one address space;
+  what is simulated is the *timing*: capture/playback externs record a
+  transfer delay, and the wait functions block until it has elapsed, so
+  `sync` has observable sequencing behavior.
+- `runtime/<program>_extern.c` — hand-written bodies for a program's
+  `extern fn`s, e.g. a capture stand-in that fills a buffer with a
+  synthetic signal (sine + deterministic noise) so the demo pipeline has
+  something real to filter.
+- `@MMIO` registers — generated as `volatile` globals; demo externs that
+  play the hardware's role read and write the same globals, which is how
+  `examples/mmio_poll.phase` observes a register changing under it.
 
-### 5.3 Real hardware (future work, not v0.1)
+### 5.3 Real hardware
 
-The runtime interface (`start_transfer`, `wait`, `volatile_read/write`) is
-written so a real backend (Linux DMA-API, an SDR driver, a microcontroller
-HAL) could implement the same interface later without changing the compiler.
-Not attempted in v0.1.
+The runtime interface (`sim_dma_wait`, `sim_device_wait`, and `volatile`
+register globals) is written so a real backend (Linux DMA-API, an SDR
+driver, a microcontroller HAL) can implement it without changing the
+compiler. `runtime/hw/` is one such backend: an ARM Cortex-M3 (MPS2 AN385)
+startup file, linker script, register map, and wait functions that poll a
+real peripheral register, validated under QEMU (see M10 in §9).
+`phase build` links the simulated runtime; the hardware build is the
+separate `scripts/build_hw_demo.sh` step.
 
 ---
 
@@ -356,12 +400,12 @@ Not attempted in v0.1.
 ### 6.1 Pipeline
 
 ```
-Source -> Lexer -> Parser -> AST -> Name Resolution -> Type Checker
-       -> Domain/Ownership/State/Lifetime Analyzer -> PIR Generator
-       -> PIR Optimizer (minimal, v0.1) -> C Codegen -> cc -> Binary
+Source -> Lexer -> Parser -> AST
+       -> Analyzer (names, domains, ownership, typestate, lifetimes, merges)
+       -> PIR Generator -> C Codegen -> cc -> Binary
 ```
 
-### 6.2 Why C, not LLVM, for v0.1
+### 6.2 Why C, not LLVM, for v1
 
 Compiling to readable C keeps 100% of engineering time on the analyzer (the
 actually novel part). LLVM backend is explicitly deferred (§10).
@@ -371,41 +415,47 @@ actually novel part). LLVM backend is explicitly deferred (§10).
 ```
 phase/
   crates/
+    ast/            -- AST type definitions (shared)
     lexer/          -- tokens
     parser/         -- AST construction
-    ast/            -- AST type definitions (shared)
-    sema/            -- name resolution + type checker
-    analysis/        -- domain, ownership, state, lifetime analyzers
-    pir/             -- Phase IR data structures + builder
-    codegen_c/        -- PIR -> C source
-    driver/          -- CLI: phase build, phase check, phase --dump-pir
+    analysis/       -- name, domain, ownership, typestate, lifetime and
+                       control-flow analyzers (one pass over each fn body)
+    pir/            -- Phase IR data structures + builder
+    codegen_c/      -- PIR -> C source
+    driver/         -- the `phase` CLI
   runtime/
-    sim_dma.c / .h
-    sim_adc.c / .h
-    sim_dac.c / .h
-    sim_mmio.c / .h
+    phase_runtime.c / .h   -- sim_dma_wait / sim_device_wait (host)
+    <program>_extern.c     -- hand-written bodies for a program's extern fns
+    hw/                    -- ARM Cortex-M3 backend (§5.3)
   examples/
-    radio_pipeline.phase
-    bug_gallery/
-      use_before_sync.phase
-      write_borrow_conflict.phase
-      use_after_destroy.phase
-      missing_state_transition.phase
+    *.phase                -- programs that pass analysis
+    bug_gallery/*.phase    -- one rejected program per bug class (§8)
 ```
 
-### 6.4 CLI (v0.1)
+Name resolution and type checking happen inside `analysis` rather than a
+separate `sema` crate: the language has no user-defined generics or
+overloading, so a separate pass would only duplicate the symbol tables the
+analyzer already builds.
+
+### 6.4 CLI
 
 ```
 phase check <file>        -- run all analysis passes, report errors, no codegen
 phase build <file>        -- full pipeline, emits a native binary
+phase --dump-tokens <file>
 phase --dump-ast <file>
 phase --dump-pir <file>
-phase --trace-entity <name> <file>   -- print full history of one entity
+phase --version | --help
 ```
+
+`build` locates the runtime by walking up from the source file to the
+nearest `runtime/` directory (override: `PHASE_RUNTIME_DIR`) and writes
+into a `build/` directory beside it. Exit status is 0 on success and 1 on
+any error.
 
 ### 6.5 Transition table representation
 
-v0.1 keeps the domain-transition table (§2.4) as a hardcoded Rust `match` /
+v1 keeps the domain-transition table (§2.4) as a hardcoded Rust `match` /
 static table inside `analysis`, not a plugin/config file. This is a
 deliberate scope cut versus KAIROS's `.hardware` file idea — making it
 data-driven is easy future work once the core analyzer is proven correct.
@@ -469,13 +519,25 @@ for the analyzer and as the security narrative for the portfolio write-up.
 
 | # | Program pattern | Real-world analogue | Compiler must report |
 |---|---|---|---|
-| 1 | CPU reads a `@DMA` buffer with no prior `sync` | Reading a transfer buffer before DMA completion | "entity `X` is DeviceOwned; access requires sync" |
+| 1 | CPU reads a `@DMA` buffer with no prior `sync` | Reading a transfer buffer before DMA completion | "entity `X` is in domain @DMA but `f` expects @RAM" |
 | 2 | `move` or `destroy` while a `borrow` is live | Freeing a buffer another part of the code still references | "entity `X` has a live borrow; cannot move/destroy" |
 | 3 | Two concurrent `write` borrows | Data race on a shared buffer | "entity `X` already has an exclusive write borrow" |
-| 4 | Access after `destroy` | Use-after-free | "entity `X` was destroyed at line N" |
+| 4 | Access after `destroy` | Use-after-free | "entity `X` was destroyed; cannot use as argument to `f`" |
 | 5 | Calling a function requiring `Packet<Decoded>` with a `Packet<Received>` | Parsing/validating a packet in the wrong order (TOCTOU) | "expected state Decoded, found Received" |
 | 6 | Branch merges with mismatched domain/state on the two paths | Missing sync on an error path | "entity `X` disagrees on domain/state across incoming branches" |
 | 7 | Reordering/eliding a `volatile_read`/`volatile_write` sequence | Compiler "optimizing away" a hardware side effect | (verified negatively — codegen test asserts both accesses appear in emitted C, in order) |
+| 8 | Annotating a value with a state it was never given | Asserting verification instead of performing it | "`p` is declared as Packet<Validated> but `f` returns Packet<Received>" |
+| 9 | Reusing a typestate value after passing it on | Double-processing / replay | "value `p` was already consumed (passed to `f`)" |
+| 10 | `destroy` while `@DMA`/`@DEVICE`-owned | Freeing memory a device is still writing | "entity `X` is still owned by @DMA; sync(X) before destroying it" |
+| 11 | Returning while a local is `@DMA`/`@DEVICE`-owned | DMA into an out-of-scope buffer | "entity `X` is still owned by @DMA when `f` returns" |
+| 12 | Using the owner while it is borrowed | Bypassing exclusive access | "entity `X` is borrowed by `v`; it cannot be used directly" |
+| 13 | Using a borrow after `release` | Dangling reference | "borrow `v` of `X` was already released" |
+| 14 | Same buffer passed twice to one call | In-place call of a non-aliasing kernel | "entity `X` is passed to `f` more than once" |
+| 15 | Borrowing a `@DMA`-owned buffer | CPU access before transfer completion | "entity `X` is owned by @DMA; sync(X) before borrowing it" |
+| 16 | Redeclaring a name over a live entity | Losing track of an in-flight buffer | "`X` is already declared in fn `f`" |
+
+Every file in `examples/bug_gallery/` carries its expected error in an
+`// Expected: "..."` header, and a test asserts the analyzer produces it.
 
 ---
 
@@ -598,7 +660,18 @@ call) never actually got its domain/arity validation run -- confirmed via
 `docs/bug_gallery_transcript.md` regeneration that this fix doesn't
 change any existing accept/reject outcome.
 
-**M12 — LLVM backend** *(not yet started, documented non-goal for v0.1)*
+**v1.0 — Soundness hardening**
+An audit of the M1–M11 analyzer found accepted programs that violated the
+very rules the bug gallery documents (a typestate forged by annotation,
+reuse of consumed values, `destroy` of a DMA-owned buffer, hardware-owned
+buffers escaping a function, owner use during a write borrow, use after
+`release`, aliased arguments, borrowing unsynced DMA, shadowing, and
+unchecked names in conditions). v1.0 closes each one (§4.4 states the
+resulting guarantees), adds bug-gallery entries #8–#16, and pins each
+gallery file to its documented error in the test suite. It also makes
+`phase build` independent of the working directory and adds CI.
+
+**M12 — LLVM backend** *(not yet started)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead
 of C, avoiding a dependency on an external `cc`. See §10 for why this was
 deliberately deferred rather than attempted first.
@@ -615,12 +688,16 @@ immediately as the language grows.
 ## Part 10: Non-Goals
 
 - Not a replacement for C, Rust, or CUDA.
-- No LLVM backend in v0.1 (documented future work).
-- No real hardware target in v0.1 (documented future work).
+- No LLVM backend (documented future work, M12).
+- `phase build` targets the host simulation; the real-hardware runtime
+  (§5.3) is a separate build step, not a CLI target switch.
+- No interprocedural analysis: each function is checked against the
+  signatures of the functions it calls, and `extern fn` bodies are trusted
+  (§4.4).
 - No GPU kernel compilation — accelerators are just another `@DEVICE`.
 - No garbage collector; no automatic parallelism; no distributed/NUMA
   domains.
-- No plugin/config-file-driven hardware description in v0.1 — the
-  transition table is fixed and hardcoded (§6.5), matching v0.1 scope.
+- No plugin/config-file-driven hardware description in v1 — the
+  transition table is fixed and hardcoded (§6.5), matching v1 scope.
 - Not attempting to be a general-purpose language: `if`/`while`/functions
   exist only to the extent the pipeline-safety demos need them.

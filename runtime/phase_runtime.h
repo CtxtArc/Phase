@@ -6,7 +6,7 @@
 /* Wait for a simulated DMA/device transfer associated with the named
  * entity to complete.
  *
- * In this v0.1 simulation model everything lives in one address space --
+ * In this simulation model everything lives in one address space --
  * there's no real separate DMA/device memory to wait on. What's real is
  * the *timing*: device_capture()/device_playback() (see
  * radio_pipeline_extern.c) record a short simulated transfer delay when

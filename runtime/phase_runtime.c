@@ -16,7 +16,7 @@
 #include <stdio.h>
 #include <time.h>
 
-/* v0.1 keeps everything in one address space (spec §5.1), so there is no
+/* The simulation keeps everything in one address space (spec §5.1), so there is no
  * real separate memory to wait on -- a program's extern fns already
  * finish their work synchronously before returning. What these functions
  * simulate is the *timing*: a short, visible delay plus a trace message,

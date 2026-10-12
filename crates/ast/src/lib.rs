@@ -1,11 +1,8 @@
-//! Abstract Syntax Tree definitions for PHASE (v0.1, M1 scope).
-//!
-//! M1 covers: entity declarations, functions (incl. `extern fn`), typestate
-//! declarations (parsed but not yet analyzed), and straight-line statements
-//! (`let`, buffer decls, `move`, `sync`, `borrow`/`release`, expression
-//! statements, `return`). No `if`/`while` yet — that's M4.
+//! Abstract Syntax Tree definitions for PHASE: entities, typestate
+//! machines, functions and `extern fn` signatures, and the statement and
+//! expression forms (including `if`/`while` and scalar assignment).
 
-/// The four physical domains supported in v0.1.
+/// The five physical domains (spec §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Domain {
     Ram,
@@ -173,7 +170,7 @@ pub enum Stmt {
     /// `while cond { .. }`
     While { cond: Expr, body: Block },
     /// `name = expr;` (M9) -- reassigns an already-declared scalar local.
-    /// Only a bare identifier target; no field/index lvalues in v0.1.
+    /// Only a bare identifier target; no field/index lvalues.
     Assign { name: String, value: Expr },
 }
 

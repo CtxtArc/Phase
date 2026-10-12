@@ -169,6 +169,160 @@ has to remember to check for.
 
 ---
 
+## v1.0 additions
+
+The entries below were added after an audit of the v0.1 analyzer found
+programs it accepted that each of the rules above was supposed to reject.
+Each is the same bug class as an earlier entry, reached by a route the
+v0.1 checker did not close.
+
+## #8 — Forging a typestate with an annotation
+
+**`examples/bug_gallery/forged_typestate.phase`**
+
+**Category:** [CWE-696](https://cwe.mitre.org/data/definitions/696.html) —
+Incorrect Behavior Order.
+
+**Real-world precedent:** the same "goto fail" shape as #5
+(CVE-2014-1266), and arguably closer to it: the code *asserts* that
+verification happened rather than calling the verifier out of order.
+In v0.1, `let p: Packet<Validated> = receive_packet();` was accepted —
+the annotation overrode the call's declared return state.
+
+**What PHASE does now:** an annotation is a claim checked against
+evidence, never a source of it. A state can only come from a function's
+declared return state, or — for a freshly constructed value — the state
+machine's initial state.
+
+---
+
+## #9 — Reusing a stale typestate value
+
+**`examples/bug_gallery/stale_typestate_reuse.phase`**
+
+**Category:** [CWE-672](https://cwe.mitre.org/data/definitions/672.html) —
+Operation on a Resource after Expiration or Release.
+
+**Real-world precedent:** the general replay/double-processing pattern —
+an object that has already advanced through a protocol is processed again
+through a second path from its old state (e.g. a packet decoded twice, a
+one-time token accepted twice).
+
+**What PHASE does now:** typestate values are linear. Passing one to a
+parameter that requires a state, or returning it, consumes it; the old
+name is dead. A value consumed on only one branch of an `if` cannot be
+used after the join, and consuming a value created outside a `while` loop
+inside its body is rejected (the next iteration would reuse it).
+
+---
+
+## #10 — Destroying a buffer the DMA engine still owns
+
+**`examples/bug_gallery/destroy_while_dma.phase`**
+
+**Category:** [CWE-416](https://cwe.mitre.org/data/definitions/416.html) —
+Use After Free (the device is the user).
+
+**Real-world precedent:** this is the most direct match for
+CVE-2024-43856 (#2/#4 above): DMA memory released while the device side
+still holds it. v0.1 only blocked `destroy` while a *CPU* borrow was
+live; a buffer owned by `@DMA`/`@DEVICE` could be destroyed freely.
+
+**What PHASE does now:** `destroy` requires the entity to be CPU-owned
+(`sync` first).
+
+---
+
+## #11 — A hardware-owned buffer escaping its function
+
+**`examples/bug_gallery/dma_escapes_function.phase`**
+
+**Category:** [CWE-416](https://cwe.mitre.org/data/definitions/416.html)
+and [CWE-825](https://cwe.mitre.org/data/definitions/825.html) — Expired
+Pointer Dereference.
+
+**Real-world precedent:** a transfer started on function-local storage
+that outlives the function — the classic embedded bug of pointing a DMA
+channel at a stack buffer and returning. Same "freed while the device
+still uses it" class as #10, reached by scope exit instead of `destroy`.
+
+**What PHASE does now:** every `return` (including the implicit one at the
+end of a body) checks exit obligations (spec §4.2, lifetime checker): no
+local may still be `@DMA`/`@DEVICE`-owned, no borrow may be live, and
+parameters must be back in the domain the caller handed them over in.
+
+---
+
+## #12 — Using the owner while it is borrowed, #13 — use after release
+
+**`examples/bug_gallery/use_owner_while_borrowed.phase`**,
+**`examples/bug_gallery/use_after_release.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html)
+(#12) and [CWE-672](https://cwe.mitre.org/data/definitions/672.html) (#13).
+
+**Real-world precedent:** the same exclusivity discipline as #3. v0.1
+checked borrow-vs-borrow conflicts but let the owner be passed to a call
+while a write borrow was live, and let a released handle keep being used
+— so the "one writer" guarantee could be bypassed without ever taking a
+second borrow.
+
+**What PHASE does now:** while any borrow of an entity is live, the entity
+is only accessible through its borrows; a released handle cannot be used,
+moved, synced, destroyed, or re-borrowed.
+
+---
+
+## #14 — Aliased arguments
+
+**`examples/bug_gallery/aliased_arguments.phase`**
+
+**Category:** [CWE-758](https://cwe.mitre.org/data/definitions/758.html) —
+Reliance on Undefined, Unspecified, or Implementation-Defined Behavior.
+
+**Real-world precedent:** passing one buffer as both input and output of
+a DSP kernel. A kernel written for distinct buffers (and especially one
+whose C prototype uses `restrict`, where aliasing is undefined behavior)
+silently produces wrong output in place.
+
+**What PHASE does now:** the same storage may appear more than once in a
+single call only when every occurrence is a read borrow.
+
+---
+
+## #15 — Borrowing a DMA-owned buffer
+
+**`examples/bug_gallery/borrow_unsynced_dma.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html),
+[CWE-367](https://cwe.mitre.org/data/definitions/367.html).
+
+**Real-world precedent:** identical to #1 — CPU access before the
+transfer is synchronized — but reached through `borrow` instead of a
+direct call, which v0.1 did not check.
+
+**What PHASE does now:** a `@DMA`/`@DEVICE`-owned entity cannot be
+borrowed.
+
+---
+
+## #16 — Shadowing an in-flight buffer
+
+**`examples/bug_gallery/shadowed_dma_buffer.phase`**
+
+**Category:** [CWE-416](https://cwe.mitre.org/data/definitions/416.html)
+via lost tracking (the hazard of #11).
+
+**Real-world precedent:** redeclaring a name hides the original entity
+from the checker. In v0.1 a second `buffer<..> buf` silently replaced a
+`buf` still owned by `@DMA`, after which nothing could ever sync it.
+`let y = x;` had the same effect for any entity.
+
+**What PHASE does now:** names cannot be redeclared or shadowed within a
+function, and entities cannot be copied with `let`.
+
+---
+
 ## Summary table
 
 | # | Bug-gallery file | CWE | Named real-world precedent |
@@ -180,3 +334,12 @@ has to remember to check for.
 | 5 | `skipped_state_transition.phase` | CWE-696 | CVE-2014-1266 (Apple "goto fail") |
 | 6 | `branch_domain_disagreement.phase` | CWE-696, CWE-691 | general branch-inconsistent-state pattern |
 | 7 | volatile MMIO (`mmio_registers.phase`) | CWE-758 | documented in ARM's own compiler docs |
+| 8 | `forged_typestate.phase` | CWE-696 | CVE-2014-1266 (Apple "goto fail") |
+| 9 | `stale_typestate_reuse.phase` | CWE-672 | general replay/double-processing pattern |
+| 10 | `destroy_while_dma.phase` | CWE-416 | CVE-2024-43856 |
+| 11 | `dma_escapes_function.phase` | CWE-416, CWE-825 | DMA into an out-of-scope stack buffer |
+| 12 | `use_owner_while_borrowed.phase` | CWE-362 | general shared-buffer race pattern |
+| 13 | `use_after_release.phase` | CWE-672 | general use-after-release pattern |
+| 14 | `aliased_arguments.phase` | CWE-758 | in-place call of a non-aliasing (`restrict`) kernel |
+| 15 | `borrow_unsynced_dma.phase` | CWE-362, CWE-367 | same as #1 |
+| 16 | `shadowed_dma_buffer.phase` | CWE-416 | lost tracking of an in-flight buffer |

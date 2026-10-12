@@ -102,12 +102,12 @@ fn generate_header(program: &PirProgram, stem: &str) -> String {
 
     if !program.mmio_registers.is_empty() {
         out.push_str("/* --- simulated MMIO registers (M6) ---\n");
-        out.push_str(" * v0.1 has no real memory-mapped hardware, so each distinct register\n");
+        out.push_str(" * The host simulation has no real memory-mapped hardware, so each register\n");
         out.push_str(" * name used with `volatile_read`/`volatile_write` becomes one `volatile`\n");
         out.push_str(" * global. `volatile` is what makes the compiler's own \"never reordered\n");
         out.push_str(" * or eliminated\" guarantee (spec bug-gallery #7) real rather than a\n");
         out.push_str(" * documentation-only claim -- it's enforced by the C standard itself.\n");
-        out.push_str(" * v0.1 keeps every simulated register the same width (uint32_t); see\n");
+        out.push_str(" * Every simulated register has the same width (uint32_t); see\n");
         out.push_str(" * phase_specification.md for why.\n */\n\n");
         for reg in &program.mmio_registers {
             out.push_str(&format!("extern volatile uint32_t {reg};\n"));
@@ -273,7 +273,7 @@ fn format_inst(
         }
 
         PirInst::EntityMove { name, to } => format!(
-            "{pad}/* move {name} -> @{} (compile-time only; the v0.1 simulation model keeps everything in one address space, so there is nothing to physically move) */\n",
+            "{pad}/* move {name} -> @{} (compile-time only; the simulation model keeps everything in one address space, so there is nothing to physically move) */\n",
             to.name()
         ),
 
@@ -314,7 +314,7 @@ fn format_inst(
         }
 
         PirInst::EntityDestroy { name } => format!(
-            "{pad}/* destroy {name} (compile-time only; buffers are stack-allocated in v0.1, so there is no separate deallocation step) */\n"
+            "{pad}/* destroy {name} (compile-time only; buffers are stack-allocated, so there is no separate deallocation step) */\n"
         ),
 
         PirInst::Call { callee, args } => {
