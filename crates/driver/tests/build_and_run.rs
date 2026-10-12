@@ -300,6 +300,9 @@ fn counting_loop_builds_and_runs_exactly_five_iterations() {
 /// unlike every other test here, a missing tool here means "skip with a
 /// clear message," not "fail." `./scripts/build_hw_demo.sh` runs the same
 /// thing standalone with installation instructions if it's missing.
+///
+/// CI sets `PHASE_REQUIRE_HW_TOOLS=1`, which turns that skip into a hard
+/// failure so a broken toolchain install can't make the job silently green.
 #[test]
 fn hw_uart_echo_runs_on_a_real_arm_cortex_m3_target_under_qemu() {
     if Command::new("arm-none-eabi-gcc")
@@ -311,6 +314,11 @@ fn hw_uart_echo_runs_on_a_real_arm_cortex_m3_target_under_qemu() {
             .output()
             .is_err()
     {
+        assert!(
+            std::env::var_os("PHASE_REQUIRE_HW_TOOLS").is_none(),
+            "PHASE_REQUIRE_HW_TOOLS is set but arm-none-eabi-gcc and/or \
+             qemu-system-arm is not installed"
+        );
         eprintln!(
             "skipping hw_uart_echo_runs_on_a_real_arm_cortex_m3_target_under_qemu: \
              arm-none-eabi-gcc and/or qemu-system-arm not installed \
