@@ -118,6 +118,9 @@ fn err(msg: impl Into<String>) -> AnalysisError {
     }
 }
 
+/// No rule warns at the moment (the last warning became an error in 2.0);
+/// the severity stays, as does its rendering in every output format.
+#[allow(dead_code)]
 fn warn(msg: impl Into<String>) -> AnalysisError {
     AnalysisError {
         severity: Severity::Warning,
@@ -2742,9 +2745,11 @@ impl<'a> FnChecker<'a> {
                                 .about(name)
                                 .note(var.origin, what),
                             ),
+                            // A warning in 1.x, so 1.1 code kept compiling;
+                            // an error since 2.0.
                             None => errors.push(
-                                warn(format!(
-                                    "'{callee}' doesn't declare whether it writes its parameter '{pname}', but '{name}' is read-only; mark the parameter `read` if '{callee}' only reads it"
+                                err(format!(
+                                    "'{callee}' doesn't declare whether it writes its parameter '{pname}', but '{name}' is read-only; mark the parameter `read` if '{callee}' only reads it (or `write` if it writes, and pass it data it may write)"
                                 ))
                                 .about(name)
                                 .note(var.origin, what),
@@ -4097,8 +4102,13 @@ mod soundness_tests {
     #[test]
     fn two_read_borrows_of_one_buffer_may_alias() {
         accepts(&with_buf(
-            "fn main() { buffer<u8, 16> x @RAM; let a = borrow x read; let b = borrow x read; fir(a, b); release a; release b; }",
+            "extern fn cmp2(a: read buffer<u8, 16> @RAM, b: read buffer<u8, 16> @RAM); fn main() { buffer<u8, 16> x @RAM; let a = borrow x read; let b = borrow x read; cmp2(a, b); release a; release b; }",
         ));
+        // Read-only data cannot go to `fir`, which doesn't say it only reads.
+        rejects(
+            &with_buf("fn main() { buffer<u8, 16> x @RAM; let a = borrow x read; let b = borrow x read; fir(a, b); release a; release b; }"),
+            "'fir' doesn't declare whether it writes its parameter",
+        );
     }
 
     // ---- names -----------------------------------------------------------
@@ -4549,17 +4559,6 @@ mod access_mode_tests {
         );
     }
 
-    #[track_caller]
-    fn warns(src: &str, needle: &str) {
-        let r = full(src);
-        assert!(r.errors.is_empty(), "{:?}", r.errors);
-        assert!(
-            r.warnings.iter().any(|w| w.message.contains(needle)),
-            "expected a warning containing {needle:?}, got {:?}",
-            r.warnings
-        );
-    }
-
     const SIGS: &str = r#"
         extern fn fir(in_: read buffer<u8, 8> @RAM, out: write buffer<u8, 8> @RAM);
         extern fn cmp(a: read buffer<u8, 8> @RAM, b: read buffer<u8, 8> @RAM);
@@ -4625,16 +4624,20 @@ mod access_mode_tests {
     }
 
     #[test]
-    fn read_borrow_to_an_unannotated_param_is_a_warning_not_an_error() {
-        let src = with(
-            "fn main() { buffer<u8, 8> x @RAM; let r = borrow x read; legacy(r); release r; }",
+    fn read_only_data_to_an_unannotated_param_is_an_error_since_2_0() {
+        rejects(
+            &with(
+                "fn main() { buffer<u8, 8> x @RAM; let r = borrow x read; legacy(r); release r; }",
+            ),
+            "'legacy' doesn't declare whether it writes its parameter 'x', but 'r' is read-only",
         );
-        warns(
-            &src,
-            "'legacy' doesn't declare whether it writes its parameter 'x'",
+        rejects(
+            &with("fn f(b: read buffer<u8, 8> @RAM) { legacy(b); } fn main() { }"),
+            "'legacy' doesn't declare whether it writes its parameter 'x', but 'b' is read-only",
         );
-        // ...and the plain `analyze` entry point still accepts it.
-        assert_eq!(analyze(&phase_parser::parse(&src).unwrap()), Ok(()));
+        // Data the caller may write can still go to an unannotated
+        // parameter, which is assumed to write.
+        accepts(&with("fn main() { buffer<u8, 8> x @RAM; legacy(x); let w = borrow x write; legacy(w); release w; }"));
     }
 
     #[test]
@@ -4659,7 +4662,7 @@ mod access_mode_tests {
             &with("fn f(b: read buffer<u8, 8> @RAM) { poke(b); } fn main() { }"),
             "'poke' may write its parameter 'x', but 'b' is read-only",
         );
-        warns(
+        rejects(
             &with("fn f(b: read buffer<u8, 8> @RAM) { legacy(b); } fn main() { }"),
             "'b' is read-only",
         );

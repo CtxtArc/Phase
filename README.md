@@ -3,7 +3,7 @@
 **A compiler that statically checks memory safety for hardware pipelines — DMA, MMIO, and zero-copy devices — before the code ever runs.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.4.0-success" alt="Version 1.4.0">
+  <img src="https://img.shields.io/badge/version-2.0.0-success" alt="Version 2.0.0">
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
 </p>
@@ -37,7 +37,8 @@ compiler guarantees:
 1. **Domain safety** — the CPU never reads, borrows, or frees a buffer
    owned by hardware (`@DMA`, `@DEVICE`) without an explicit `sync()` first.
 2. **Ownership/borrow safety** — many readers or one writer; read-only data
-   (a read borrow, a `read` parameter) is never handed to code that writes;
+   (a read borrow, a `read` parameter) is never handed to code that writes
+   or doesn't say it only reads;
    while a buffer is borrowed it can't be written, moved, or freed;
    released borrows are dead; one buffer is never passed twice to a call
    unless every use is read-only.
@@ -56,8 +57,12 @@ compiler guarantees:
    as it found it — with `swap` and `rotate` to trade buffers for
    ping-pong and triple-buffered DMA, and `split`/`join` to give the
    halves of a circular DMA buffer their own ownership.
-6. **Volatile MMIO semantics** — hardware control registers are never
-   silently reordered or eliminated by C compiler optimization.
+6. **Register safety** — a peripheral's register map is declared once
+   (`device Uart0 @ 0x40004000 { .. }`), and every access is checked
+   against it: no misspelled register or field, no write to a read-only
+   register or read of a write-only one, no field value wider than its
+   field. Register accesses are `volatile`, so the C compiler never
+   reorders or eliminates them.
 
 The precise rules, and the trust boundary they hold within, are in
 [`phase_specification.md`](phase_specification.md) §4.4.
@@ -141,6 +146,42 @@ error: 'p' is declared as Packet<Validated> but 'receive_packet' returns Packet<
    |         ^
 ```
 
+Hardware registers get the same treatment. Declare the register map once
+and the compiler holds every access to it:
+
+```phase
+device Uart0 @ 0x40004000 {
+    DATA:  read write u32 @ 0x00;
+    STATE: read u32 @ 0x04 { TXFULL: bit 0, RXFULL: bit 1 }
+    CTRL:  read write u32 @ 0x08 = 0 { TX_EN: bit 0, RX_EN: bit 1 }
+}
+
+fn send_byte(c: u32) {
+    while volatile_read(Uart0.STATE.TXFULL) == 1 {
+    }
+    volatile_write(Uart0.DATA, c);
+}
+```
+
+```
+$ phase check examples/bug_gallery/field_value_too_wide.phase
+error: 16 does not fit in 'Timer.CTRL.PRESCALE' (4 bits, at most 15)
+  --> examples/bug_gallery/field_value_too_wide.phase:14:5
+   |
+14 |     volatile_write(Timer.CTRL.PRESCALE, 16);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: 'Timer.CTRL.PRESCALE' is declared here
+  --> examples/bug_gallery/field_value_too_wide.phase:8:39
+   |
+ 8 |     CTRL: read write u32 @ 0x04 = 0 { PRESCALE: bits 0..=3, ENABLE: bit 4 }
+   |                                       --------
+```
+
+`phase build --target=mps2-an385 --run examples/uart_hello.phase` compiles
+a UART driver written entirely in PHASE for an ARM Cortex-M3 board and
+runs it on QEMU's model of it — `Hello from PHASE` comes out of the real
+UART0 data register.
+
 And the compiler doesn't just *claim* its volatile guarantee holds —
 `demos/m6_volatile_proof/run_demo.sh` compiles the same register-write
 pattern by hand (no `volatile`) and with PHASE, both at `-O2`, and inspects
@@ -163,9 +204,10 @@ deliberately broken program per rule, each rejected at compile time:
 - **[CWE-362/672] Broken exclusivity** — [`write_borrow_conflict.phase`](examples/bug_gallery/write_borrow_conflict.phase), [`use_owner_while_borrowed.phase`](examples/bug_gallery/use_owner_while_borrowed.phase), [`use_after_release.phase`](examples/bug_gallery/use_after_release.phase): two writers at once, writing behind a borrow's back, or using a borrow after giving it up.
 - **[CWE-696/672] Typestate skipping and replay** — [`skipped_state_transition.phase`](examples/bug_gallery/skipped_state_transition.phase), [`forged_typestate.phase`](examples/bug_gallery/forged_typestate.phase), [`stale_typestate_reuse.phase`](examples/bug_gallery/stale_typestate_reuse.phase): a packet reaching a "validated" stage without being validated, or being processed twice — the same bug shape as Apple's 2014 "goto fail" (CVE-2014-1266), where a required verification step was silently skipped.
 - **[CWE-696/691] Inconsistent paths** — [`branch_domain_disagreement.phase`](examples/bug_gallery/branch_domain_disagreement.phase): two branches leaving a buffer in different domains.
-- **[CWE-362] Writing through read-only views** — [`write_through_read_borrow.phase`](examples/bug_gallery/write_through_read_borrow.phase), [`read_param_handed_to_writer.phase`](examples/bug_gallery/read_param_handed_to_writer.phase): a read borrow or a `read` parameter handed to a kernel that writes.
+- **[CWE-362] Writing through read-only views** — [`write_through_read_borrow.phase`](examples/bug_gallery/write_through_read_borrow.phase), [`read_param_handed_to_writer.phase`](examples/bug_gallery/read_param_handed_to_writer.phase), [`read_only_to_unannotated_param.phase`](examples/bug_gallery/read_only_to_unannotated_param.phase): a read borrow or a `read` parameter handed to a kernel that writes, or to one that never said it only reads.
 - **[CWE-362/367] Broken double buffering** — [`refill_while_processing.phase`](examples/bug_gallery/refill_while_processing.phase), [`ping_pong_without_swap.phase`](examples/bug_gallery/ping_pong_without_swap.phase), [`swap_while_borrowed.phase`](examples/bug_gallery/swap_while_borrowed.phase): refilling the buffer the CPU is processing (a torn frame), forgetting to trade buffers, or swapping one out from under a live view.
 - **[CWE-362/367] Ring buffers and circular DMA** — [`process_half_in_flight.phase`](examples/bug_gallery/process_half_in_flight.phase), [`use_ring_while_split.phase`](examples/bug_gallery/use_ring_while_split.phase), [`join_with_half_in_flight.phase`](examples/bug_gallery/join_with_half_in_flight.phase), [`rotate_wrong_direction.phase`](examples/bug_gallery/rotate_wrong_direction.phase): processing the half the engine is still filling (the classic off-by-one-half in circular ADC drivers), using the whole buffer while half of it is in flight, treating it as whole again with one half still streaming, or rotating a triple-buffer ring the wrong way.
+- **[CWE-684/908/197] Hardware register misuse** — [`write_read_only_register.phase`](examples/bug_gallery/write_read_only_register.phase), [`read_write_only_register.phase`](examples/bug_gallery/read_write_only_register.phase), [`field_write_on_write_only_register.phase`](examples/bug_gallery/field_write_on_write_only_register.phase), [`field_value_too_wide.phase`](examples/bug_gallery/field_value_too_wide.phase), [`overlapping_registers.phase`](examples/bug_gallery/overlapping_registers.phase): clearing a flag through a read-only status register, trusting what a write-only register reads back as, `CMD |= START` on a write-only register, a prescaler value spilling into the enable bit, and a copy-pasted register map with two registers at one address.
 - **[CWE-416/825] Found by the fuzzer** — [`dma_into_dead_block.phase`](examples/bug_gallery/dma_into_dead_block.phase), [`swap_across_blocks.phase`](examples/bug_gallery/swap_across_blocks.phase): a buffer abandoned to the DMA engine at the end of an `if` block, or swapped with one from an inner block and left dangling.
 - **[CWE-787/843] Wrong buffer type** — [`buffer_length_mismatch.phase`](examples/bug_gallery/buffer_length_mismatch.phase), [`buffer_element_mismatch.phase`](examples/bug_gallery/buffer_element_mismatch.phase), [`runtime_length_to_fixed.phase`](examples/bug_gallery/runtime_length_to_fixed.phase): a shorter buffer where a longer one is required (a real overflow), bytes where samples are expected, or a run-time length where an exact one is assumed.
 - **[CWE-758] Aliasing and silent MMIO optimization** — [`aliased_arguments.phase`](examples/bug_gallery/aliased_arguments.phase) passes one buffer as both input and output of a kernel; [`volatile_wrong_domain.phase`](examples/bug_gallery/volatile_wrong_domain.phase) points a register access at RAM. `@MMIO` registers always lower to `volatile` C globals, so the C standard itself — not convention or code review — forbids the compiler from deleting or reordering the access.
@@ -198,10 +240,10 @@ rationale.
 source (.phase)
   → lexer         hand-written, source -> tokens
   → parser        hand-written recursive descent, tokens -> AST
-  → analysis      names, domains, ownership/borrows, lifetimes, typestate, branch/loop merges, MMIO
+  → analysis      names, domains, ownership/borrows, lifetimes, typestate, branch/loop merges, device registers
   → pir           AST -> a flat per-function intermediate representation
   → codegen_c     PIR -> readable C
-  → cc            real C compiler -> a real binary
+  → cc            real C compiler -> a real binary (or arm-none-eabi-gcc -> a Cortex-M3 .elf)
 ```
 
 ```text
@@ -212,15 +254,20 @@ crates/
   analysis/    the safety analyzer (all checks above)
   pir/         Phase Intermediate Representation builder
   codegen_c/   lowers PIR to raw C source
-  driver/      the `phase` CLI
+  driver/      the `phase` CLI, including the language server (`phase lsp`)
   fuzz/        phase-fuzz: differential fuzzer (+ regressions/, every past finding)
 
 runtime/
   phase_runtime.h/.c   generic sim_dma_wait/sim_device_wait, always linked
   phase_check.h/.c     runtime ownership checker, linked by `phase build --checked`
   *_extern.c           one per demo program, implementing that program's extern fns
-  hw/                  real ARM Cortex-M3 backend (startup, linker script,
-                       real MMIO register map, real sim_dma_wait/sim_device_wait)
+  hw/                  real ARM Cortex-M3 backend for --target=mps2-an385 (startup,
+                       linker script, real sim_dma_wait/sim_device_wait, memset/memcpy)
+
+editors/
+  vscode/              TextMate grammar + an extension that starts `phase lsp`
+  vim/                 syntax and filetype detection
+  README.md            setup for VS Code, Neovim, Vim, Helix and Emacs
 
 examples/
   *.phase              programs that pass analysis (sdr_session.phase is the fullest)
@@ -235,18 +282,18 @@ docs/
 
 scripts/
   capture_bug_gallery.sh      regenerates the transcript from real compiler output
-  build_hw_demo.sh            cross-compile + run the real-hardware demo under QEMU
+  build_hw_demo.sh            runs both hardware examples with --target=mps2-an385 --run
 ```
 
 ## Building and testing
 
 **Requirements:** a recent stable Rust toolchain and a C compiler (`cc`).
-The hardware demo additionally needs `arm-none-eabi-gcc` and
+`--target=mps2-an385` additionally needs `arm-none-eabi-gcc` and
 `qemu-system-arm` (`sudo apt-get install --no-install-recommends
 gcc-arm-none-eabi qemu-system-arm`) — everything else works without them,
 and the one test that needs them
-(`hw_uart_echo_runs_on_a_real_arm_cortex_m3_target_under_qemu`) skips
-itself with a clear message if they're missing. (CI sets
+(`hardware_examples_run_on_the_mps2_an385_board_under_qemu`) skips itself
+with a clear message if they're missing. (CI sets
 `PHASE_REQUIRE_HW_TOOLS=1`, which turns that skip into a failure.)
 
 ```bash
@@ -262,10 +309,12 @@ Cortex-M3 run under QEMU; tests that drive the `phase` binary itself; a
 sweep asserting every bug-gallery file is rejected with its documented
 error; runtime-checker tests (each kind of violation, compiled without the
 analyzer, must be caught; every example must run clean when checked); and
-a fuzzing pass that replays every past finding and tries a fresh batch.
+a fuzzing pass that replays every past finding and tries a fresh batch;
+and a full language-server session over pipes.
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) also runs
 `cargo fmt --check`, `clippy -D warnings`, the volatile proof demo, 1,500
-freshly fuzzed programs, and a staleness check on the transcript.
+freshly fuzzed programs, the editor grammar against every example, and a
+staleness check on the transcript.
 
 ```bash
 # Check a file for safety without generating C (exit code 0 = safe, 1 = rejected)
@@ -280,6 +329,12 @@ phase build examples/sdr_session.phase
 
 phase build examples/mmio_registers.phase
 ./build/mmio_registers
+
+# Cross-compile for the ARM MPS2 AN385 board (Cortex-M3) and run it on QEMU
+phase build --target=mps2-an385 --run examples/uart_hello.phase
+
+# The language server your editor talks to (see editors/README.md)
+phase lsp
 
 # The same program with every ownership rule checked at run time
 phase build --checked examples/ping_pong.phase
@@ -346,11 +401,16 @@ the `@DEVICE` path; unset or non-zero takes `@DMA`).
 `examples/counting_loop.phase`: a `while` loop with a real `n = n + 1;`
 counter that runs exactly 5 iterations and stops on its own.
 
-`examples/hw_uart_echo.phase`: the exact same compiler and PHASE source
-shape, cross-compiled for a real ARM Cortex-M3 target and run on QEMU's
-model of the real MPS2 AN385 board (`./scripts/build_hw_demo.sh`) — its
-`sync()` is a real register poll on real (emulated) hardware, not the
-host's simulated address space.
+`examples/uart_hello.phase`: a UART driver written entirely in PHASE
+against the board's declared register map — baud divisor, transmitter
+enable, and a wait on the TX-full flag before each byte. Built with
+`--target=mps2-an385 --run`, it prints `Hello from PHASE` on QEMU's model
+of the MPS2 AN385 board; a host build runs the same code against
+simulated registers.
+
+`examples/hw_uart_echo.phase`: a buffer handed to the UART as a device,
+built for the same board — its `sync()` is a real register poll on real
+(emulated) hardware, not the host's simulated address space.
 
 `examples/mmio_poll.phase`: a real
 `while volatile_read(READY @MMIO) == 0 { .. }` polling loop, with the
@@ -360,7 +420,7 @@ before terminating.
 
 ## Honest scope
 
-PHASE 1.x is a focused, research-grade compiler: its guarantees are
+PHASE is a focused, research-grade compiler: its guarantees are
 precise and tested, but its language is deliberately small. Limitations
 below are documented on purpose rather than left as silent gaps someone
 has to discover the hard way:
@@ -381,7 +441,7 @@ has to discover the hard way:
   `let` or shadowed.
 - **`if`/`while` conditions and assignment right-hand sides are a
   deliberately small subset of expressions** (identifiers, literals,
-  binary comparisons/arithmetic, and a direct `volatile_read(REG @MMIO)`)
+  binary comparisons/arithmetic, and a direct `volatile_read` of a register)
   — not the full `Expr` grammar. A condition using any other call is a
   clear `UnsupportedExpr` error, not a silent guess: general `extern fn`
   calls inside a condition would be re-invoked every loop iteration with
@@ -393,15 +453,18 @@ has to discover the hard way:
   with a clear message naming the missing file — or, with
   `--stub-externs`, generates placeholders to try the program without one.
 - **The runtime checker and the fuzzer cover buffers and typestate.**
-  Plain struct entities and MMIO are checked statically but not at run
-  time, and the fuzzer uses three buffer types and one typestate machine.
-  Their silence is strong evidence for the rules they exercise, not a
-  proof of everything.
-- **No real hardware target *by default*.** `phase build` links the
-  simulated runtime; `examples/hw_uart_echo.phase` proves the swap to a
-  real ARM Cortex-M3 target works (`./scripts/build_hw_demo.sh`, validated
-  on QEMU's model of the real MPS2 AN385 board), but it's a separate
-  cross-compile step, not a `phase build` flag.
+  Plain struct entities and device registers are checked statically but
+  not at run time, and the fuzzer uses three buffer types and one
+  typestate machine. Their silence is strong evidence for the rules they
+  exercise, not a proof of everything.
+- **One hardware target.** `--target=mps2-an385` (ARM Cortex-M3, validated
+  on QEMU's model of the board). Another board needs its own startup code,
+  linker script and wait functions under `runtime/`. A register map
+  describes one device instance; there are no arrays of registers or
+  device templates yet, and a field write is a read-modify-write that is
+  not atomic against an interrupt handler.
+- **The language server reports diagnostics and symbols only.** No hover,
+  go-to-definition or completion yet.
 - **No LLVM backend.** Compiling to readable C was a deliberate choice so
   the engineering effort goes into the analysis passes, not backend
   plumbing.
@@ -414,33 +477,30 @@ has to discover the hard way:
 - **`split` cuts into equal, fixed slices.** A buffer with a run-time
   length (`buffer<T, _>`) or a parameter can't be split, and parts can't
   be sized unequally.
-- **Unannotated parameters are trusted to write.** A buffer parameter
-  without `read`/`write` is assumed to possibly write. Passing read-only
-  data to one is a warning rather than an error, so 1.1 programs keep
-  compiling; annotate your externs to make it exact.
+- **Unannotated parameters are assumed to write.** A buffer parameter
+  without `read`/`write` may be given data the caller may write, never
+  read-only data (an error since 2.0). Annotate your externs to make the
+  aliasing and borrow rules exact.
 
 Full rationale for all of these is in
 [`phase_specification.md`](phase_specification.md) §4.4 and §10.
 
 ## What's next
 
-1.4 adds ring buffers (`rotate`, `split`/`join`) and extends the runtime
-checker and the fuzzer to buffer types and typestate, on top of 1.3's
-runtime-checked builds and 1.2's access modes (see
-[`CHANGELOG.md`](CHANGELOG.md)). Next, in order:
+2.0 adds device register maps, a Cortex-M3 build target and editor
+support, and makes read-only data passed to a parameter with no access
+mode an error — on top of 1.4's ring buffers and 1.3's runtime-checked
+builds and fuzzing (see [`CHANGELOG.md`](CHANGELOG.md)). Likely next:
 
-- **MMIO register maps** — named registers and fields with access rules,
-  instead of bare `volatile_read`/`volatile_write` on single words.
-- **Editor support** — syntax highlighting and diagnostics in the editor,
-  built on `--error-format=short`.
-- **2.0** — an unannotated buffer parameter becomes an error rather than
-  a warning, so every signature says whether it writes.
 - **A tutorial** — "PHASE in 15 minutes", from a first buffer to a
   circular DMA pipeline.
 - **M12 — An LLVM backend**, removing the dependency on an external `cc`
   ([`phase_specification.md`](phase_specification.md) §9).
 - **A real DMA controller** — the ping-pong pipeline on a board with one
-  (e.g. an STM32 Nucleo), instead of QEMU's MPS2 model, which has none.
+  (e.g. an STM32 Nucleo), instead of QEMU's MPS2 model, which has none —
+  with its registers declared as a `device`.
+- **More from the language server** — hover with an entity's domain and
+  history, go-to-definition.
 
 For the complete language specification, domain model, type system, and
 full milestone roadmap, see

@@ -571,6 +571,97 @@ buffer as it found it — rejects a rotation that leaves the roles shifted.
 
 ---
 
+## v2.0 additions
+
+v2.0 added `device` register maps (spec §3.7): a peripheral's registers,
+their access modes, widths and bit fields, declared once and checked at
+every access. #34–#38 are the register mistakes that checking catches;
+#39 is the 1.2 warning that became an error.
+
+## #34 — Clearing a flag through a read-only register
+
+**`examples/bug_gallery/write_read_only_register.phase`**
+
+**Category:** [CWE-684](https://cwe.mitre.org/data/definitions/684.html) —
+Incorrect Provision of Specified Functionality.
+
+**Real-world precedent:** peripherals differ in how a status flag is
+cleared — by writing 1 to it, by writing a separate clear register, by
+reading a data register. Code written for one convention and run on
+another writes a register the hardware ignores, and the flag it believes
+it cleared is still set on the next poll.
+
+**What PHASE does:** a register declared `read` cannot be written.
+
+---
+
+## #35 — Reading a write-only register, #36 — setting one field of it
+
+**`examples/bug_gallery/read_write_only_register.phase`**,
+**`examples/bug_gallery/field_write_on_write_only_register.phase`**
+
+**Category:** [CWE-908](https://cwe.mitre.org/data/definitions/908.html) —
+Use of Uninitialized Resource.
+
+**Real-world precedent:** a write-only command or clear register reads
+back as zero, as the last value on the bus, or as something unrelated.
+Code that reads it gets a meaningless value; the C idiom `CMD |= START;`
+reads it too, and writes that value back with one bit changed —
+clobbering every other field.
+
+**What PHASE does:** a register declared `write` cannot be read, and a
+single field of it cannot be written (a field write is read-modify-write);
+the whole register must be written instead.
+
+---
+
+## #37 — A value too wide for its field
+
+**`examples/bug_gallery/field_value_too_wide.phase`**
+
+**Category:** [CWE-197](https://cwe.mitre.org/data/definitions/197.html) —
+Numeric Truncation Error.
+
+**Real-world precedent:** a 4-bit prescaler written with 16. In C,
+`CTRL |= 16 << PRESCALE_POS;` sets the bit above the field — here the
+timer's enable bit; with a mask, it silently writes 0.
+
+**What PHASE does:** a literal written to a register or field must fit
+its width. (A value computed at run time is masked to the field.)
+
+---
+
+## #38 — Two registers at one address
+
+**`examples/bug_gallery/overlapping_registers.phase`**
+
+**Category:** [CWE-684](https://cwe.mitre.org/data/definitions/684.html).
+
+**Real-world precedent:** a copy-pasted line in a hand-written register
+header, so two names refer to one address and every write to one changes
+the other.
+
+**What PHASE does:** registers in a device may not overlap, must be
+aligned to their size, and fields may not overlap; the generated C checks
+every offset with `_Static_assert`.
+
+---
+
+## #39 — Read-only data to a parameter that never said it only reads
+
+**`examples/bug_gallery/read_only_to_unannotated_param.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html).
+
+**Real-world precedent:** as #20 and #21 — a writer reached through a
+read-only view — but through a function declared before access modes
+existed, which for all the checker knows writes what it is given.
+
+**What PHASE does:** since 2.0, an error (a warning in 1.2–1.4). One word
+in the signature, `read`, fixes it when the function really only reads.
+
+---
+
 ## Summary table
 
 | # | Bug-gallery file | CWE | Named real-world precedent |
@@ -608,3 +699,9 @@ buffer as it found it — rejects a rotation that leaves the roles shifted.
 | 31 | `use_ring_while_split.phase` | CWE-362, CWE-367 | whole-buffer view over a half still being written |
 | 32 | `join_with_half_in_flight.phase` | CWE-362, CWE-367 | stream stopped for one half only |
 | 33 | `rotate_wrong_direction.phase` | CWE-696 | triple-buffer roles out of sync with the code |
+| 34 | `write_read_only_register.phase` | CWE-684 | a write the hardware ignores; a flag never cleared |
+| 35 | `read_write_only_register.phase` | CWE-908 | trusting what a write-only register reads back as |
+| 36 | `field_write_on_write_only_register.phase` | CWE-908 | `CMD \|= START` on a write-only register |
+| 37 | `field_value_too_wide.phase` | CWE-197 | a field value spilling into (or masked out of) its register |
+| 38 | `overlapping_registers.phase` | CWE-684 | a copy-pasted register map |
+| 39 | `read_only_to_unannotated_param.phase` | CWE-362 | a legacy API that may write what it is given |

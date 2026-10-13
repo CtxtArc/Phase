@@ -1,0 +1,18 @@
+// Bug gallery #39: read-only data handed to a function that never said it
+// won't write. `checksum` was declared before access modes existed, so for
+// all PHASE knows it writes its argument -- through a read borrow of a
+// frame someone else is still reading. A warning in 1.x; an error in 2.0.
+// The fix is one word in the signature: `x: read buffer<u8, 64> @RAM`.
+// Expected: "'checksum' doesn't declare whether it writes its parameter 'x', but 'view' is read-only; mark the parameter `read` if 'checksum' only reads it (or `write` if it writes, and pass it data it may write)"
+
+extern fn checksum(x: buffer<u8, 64> @RAM) -> u32;
+extern fn show(x: read buffer<u8, 64> @RAM);
+
+fn main() {
+    buffer<u8, 64> frame @RAM;
+    let view = borrow frame read;
+    show(view);
+    // BUG: `checksum` may write what it is given.
+    let sum: u32 = checksum(view);
+    release view;
+}

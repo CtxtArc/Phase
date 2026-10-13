@@ -2,7 +2,7 @@
 
 **A physical-domain safety language for signal, RF, and embedded pipelines**
 
-Version 1.4
+Version 2.0
 
 ---
 
@@ -244,15 +244,72 @@ exclusive (no other borrows of any kind may be live). Attempting a `move` or
 borrows are live, the owner may still be read — passed to a `read`
 parameter (§3.12) or have its fields read — but not written.
 
-### 3.7 volatile MMIO access
+### 3.7 Devices, registers and volatile MMIO access
+
+A `device` declares a peripheral's register map (v2.0):
+
+```phase
+device Uart0 @ 0x40004000 {
+    DATA:    read write u32 @ 0x00;
+    STATE:   read u32 @ 0x04 { TXFULL: bit 0, RXFULL: bit 1 }
+    CTRL:    read write u32 @ 0x08 = 0 { TX_EN: bit 0, RX_EN: bit 1 }
+    BAUDDIV: read write u32 @ 0x10 { DIV: bits 0..=19 }
+}
+
+fn send_byte(c: u32) {
+    while volatile_read(Uart0.STATE.TXFULL) == 1 {
+    }
+    volatile_write(Uart0.DATA, c);
+}
+```
+
+The device has a base address; each register has an access mode (`read`,
+`write`, or both), a type (`u8`, `u16` or `u32`), a byte offset, an
+optional reset value (`= 0`), and optional fields — `bit N`, or
+`bits LO..=HI`, inclusive, lowest bit first. Addresses may be written in
+hex (`0x4000_4000`).
+
+`volatile_read(Dev.REG)` reads a whole register and
+`volatile_read(Dev.REG.FIELD)` one field, shifted down to bit 0;
+`volatile_write(Dev.REG, v)` writes a whole register and
+`volatile_write(Dev.REG.FIELD, v)` one field, leaving the other bits as
+they were. The analyzer checks:
+
+- **The map itself.** A register is `u8`, `u16` or `u32`, aligned to its
+  size, and overlaps no other register; a field lies inside its register
+  and overlaps no other field; a reset value fits; names are unique, and
+  a device's name is not also a function, entity, typestate or local.
+- **Names.** A misspelled register or field is an error that lists the
+  ones that exist.
+- **Access.** Only a readable register is read and only a writable one
+  written. Writing a *field* also needs a readable register: it is a
+  read-modify-write, and a write-only register reads back as something
+  other than what was last written (#36).
+- **Values.** A literal written to a register or field must fit its width
+  (#37). A non-literal value is masked to the field's width.
+
+A register is a hardware location, not a value: `Uart0.STATE` on its own
+is an error, as is using `Uart0` as a value.
+
+Codegen lays each device out as a C struct of `volatile` members at the
+declared offsets (each one checked by `_Static_assert`), with
+`Dev_REG_FIELD_Pos`/`_Msk` macros so hand-written C can use the same
+fields. On a hardware target (`--target=mps2-an385`, §5.3) the device
+macro is the declared address; in a host build it is a simulated register
+block that starts from the declared reset values. A field write is a
+read-modify-write and is not atomic with respect to an interrupt handler
+writing the same register.
+
+The pre-2.0 form, a bare register name tagged `@MMIO`, is still accepted
+and becomes a simulated `uint32_t` register:
 
 ```phase
 let status: u32 = volatile_read(UART_STATUS @MMIO);
 volatile_write(UART_CONTROL @MMIO, 0x1);
 ```
 
-Volatile accesses are never eliminated, reordered across each other, or
-cached by codegen, regardless of optimization level.
+Either way, volatile accesses are never eliminated, reordered across each
+other, or cached by codegen, regardless of optimization level.
 
 ### 3.8 Typestate (protocol states)
 
@@ -357,9 +414,10 @@ form) is assumed to possibly write.
 
 - **Read-only data stays read-only.** A read borrow, or a `read`
   parameter inside its function, may only be passed to `read` parameters.
-  Passing it to a `write` parameter is an error; passing it to a parameter
-  with no mode is a **warning** (accepted, because a 1.1 program may do it;
-  expected to become an error in 2.0).
+  Passing it to a `write` parameter, or to a parameter with no mode, is an
+  error (#39). (Before 2.0 the second case was a warning, so 1.1 programs
+  kept compiling.) Data the caller may write can still go to a parameter
+  with no mode.
 - **Inside a PHASE function** a `read` parameter cannot be moved, synced,
   destroyed, or write-borrowed.
 - **Aliasing.** The same storage may appear more than once in a call when
@@ -567,9 +625,13 @@ For every program `phase check` accepts, within a function body:
   only is unusable after it). A `while` body leaves every pre-existing
   entity exactly as it found it, so the single-pass check is a loop
   invariant and holds for any iteration count.
-- **MMIO.** Every `volatile_read`/`volatile_write` targets an `@MMIO`
-  register reference and is lowered to a `volatile` access, so the C
-  compiler cannot eliminate or reorder it.
+- **MMIO.** Every `volatile_read`/`volatile_write` targets a declared
+  device register (or a simulated `@MMIO` one) and is lowered to a
+  `volatile` access, so the C compiler cannot eliminate or reorder it. A
+  device register is only read if readable and written if writable, a
+  field write only on a register that can also be read, and a literal
+  only if it fits (§3.7); the register map itself is laid out exactly as
+  declared, which the C compiler checks.
 
 **Trust boundary.** `extern fn` bodies are not analyzed (§3.9): PHASE
 trusts that a kernel does only what its signature says — touches only the
@@ -616,8 +678,19 @@ driver, a microcontroller HAL) can implement it without changing the
 compiler. `runtime/hw/` is one such backend: an ARM Cortex-M3 (MPS2 AN385)
 startup file, linker script, register map, and wait functions that poll a
 real peripheral register, validated under QEMU (see M10 in §9).
-`phase build` links the simulated runtime; the hardware build is the
-separate `scripts/build_hw_demo.sh` step.
+
+`phase build --target=mps2-an385` (v2.0) builds for it: the generated C is
+compiled with `arm-none-eabi-gcc` (or `$PHASE_ARM_CC`) for the Cortex-M3
+together with `runtime/hw/` — startup and vector table, linker script,
+the hardware wait functions, and `memset`/`memcpy`, since a bare-metal
+build has no libc — into `build/<stem>.elf`, with every `device` at its
+declared address. A program's externs come from `runtime/hw/<stem>_extern.c`
+if it exists, else `runtime/<stem>_extern.c`; they must be freestanding.
+`--run` runs the result on `qemu-system-arm -M mps2-an385` (or `$PHASE_QEMU`)
+with semihosting on, so the program exits cleanly when `main` returns.
+`--checked` and `--stub-externs` are host-only: the checker and the stubs
+print and exit through libc. `examples/uart_hello.phase`, a UART driver
+written in PHASE, prints "Hello from PHASE" this way.
 
 ---
 
@@ -649,13 +722,16 @@ phase/
                        control-flow analyzers (one pass over each fn body)
     pir/            -- Phase IR data structures + builder
     codegen_c/      -- PIR -> C source
-    driver/         -- the `phase` CLI
+    driver/         -- the `phase` CLI, including the language server
+                       (`phase lsp`, §6.8)
     fuzz/           -- phase-fuzz: differential fuzzer (§6.7)
   runtime/
     phase_runtime.c / .h   -- sim_dma_wait / sim_device_wait (host)
     phase_check.c / .h     -- runtime ownership checker for --checked (§6.7)
     <program>_extern.c     -- hand-written bodies for a program's extern fns
     hw/                    -- ARM Cortex-M3 backend (§5.3)
+  editors/                 -- TextMate grammar, VS Code extension, Vim
+                              syntax (§6.8)
   examples/
     *.phase                -- programs that pass analysis
     bug_gallery/*.phase    -- one rejected program per bug class (§8)
@@ -674,6 +750,7 @@ phase [options] build <file>   -- full pipeline, emits a native binary
 phase [options] --dump-tokens <file>
 phase [options] --dump-ast <file>
 phase [options] --dump-pir <file>
+phase lsp                      -- language server on stdin/stdout (§6.8)
 phase --version | --help
 
 options:
@@ -684,6 +761,10 @@ options:
                                 writes <stem>.checked.gen.c and <stem>-checked
   --stub-externs               (build) generate placeholder extern bodies
                                 instead of requiring runtime/<stem>_extern.c
+  --target=host|mps2-an385     (build) host (default), or a Cortex-M3 .elf
+                                for the MPS2 AN385 board (§5.3)
+  --run                        (build) run the result: the host binary, or
+                                the .elf on qemu-system-arm
 ```
 
 `build` locates the runtime by walking up from the source file to the
@@ -727,8 +808,26 @@ the same renderer.
 
 **Warnings** (v1.2) use the same format with a `warning` label. They never
 reject a program or change the exit status; `check` reports their count on
-its success line. The one warning today is read-only data passed to a
-parameter that declares no access mode (§3.12).
+its success line. No rule warns in 2.0: the only warning, read-only data
+passed to a parameter with no access mode, is an error now (§3.12).
+
+### 6.8 Editor support
+
+`phase lsp` is a Language Server Protocol server on stdin/stdout, built
+into the compiler. On every open and change of a document it runs the
+same parser and analysis as `phase check` and publishes the result as LSP
+diagnostics: the same underlined range (narrowed to the entity a message
+is about), errors and warnings with their severities, and every note as
+related information. It answers `textDocument/documentSymbol` with the
+file's functions and devices (with their registers), follows the
+`shutdown`/`exit` protocol, and converts columns to UTF-16 as the
+protocol requires. Nothing else is implemented yet; other requests get
+`MethodNotFound`.
+
+`editors/` has a TextMate grammar (in a VS Code extension that also
+starts `phase lsp`), a Vim syntax file, and setup notes for Neovim,
+Helix and Emacs. CI tokenizes every example with the grammar and checks
+the scopes it assigns.
 
 ### 6.6 Transition table representation
 
@@ -835,7 +934,9 @@ which is the point of checking. Whole-buffer use while split is caught
 least often: the analyzer's other rules usually reject such a program for
 a second reason. For the release, 6,000 freshly generated programs from the 1.4
 generator (2,619 accepted and run with several stub seeds each, including
-1,500 at `--chaos 0.3`) produced no violations.
+1,500 at `--chaos 0.3`) produced no violations. After the 2.0
+changes, another 4,000 (1,710 accepted and run, including 1,000 at
+`--chaos 0.3`) produced none either.
 
 **Scope of the evidence.** Struct entities other than typestate values
 are not tracked at run time; the generator covers one typestate machine,
@@ -937,6 +1038,12 @@ for the analyzer and as the security narrative for the portfolio write-up.
 | 31 | Using the whole buffer while it is split | A whole-buffer view over a half still being written | "`ring` is split into lo, hi; join them back first" |
 | 32 | Joining the halves while one is still in flight | Stopping the stream for one half only | "cannot join `lo` (@RAM) and `hi` (@DMA) into `ring`: its parts must all be in the same domain" |
 | 33 | Rotating a triple-buffer ring the wrong way | Waiting on an idle buffer, restarting one in flight | "entity `b` is @RAM at the end of the `while` body but @DMA when the loop is entered" |
+| 34 | Clearing a flag by writing a read-only status register | A write the hardware ignores; a stale "data ready" | "`Adc.STATUS` is read-only; it cannot be written" |
+| 35 | Reading a write-only register | Trusting whatever a command register reads back as | "`Adc.CLEAR` is write-only; it cannot be read" |
+| 36 | Setting one field of a write-only register | `CMD \|= START;` clobbering every other bit | "cannot write field `Dma.CMD.START`: `Dma.CMD` is write-only" |
+| 37 | A value too wide for its field | Spilling into the neighbouring field (here, the enable bit) | "16 does not fit in `Timer.CTRL.PRESCALE` (4 bits, at most 15)" |
+| 38 | Two registers at one offset | A copy-pasted register map | "register `Timer.VALUE` (bytes 0x4..0x8) overlaps `Timer.CTRL`" |
+| 39 | Read-only data passed to a parameter with no access mode | A legacy API that may write what it is given | "`checksum` doesn't declare whether it writes its parameter `x`, but `view` is read-only" |
 
 Every file in `examples/bug_gallery/` carries its expected error in an
 `// Expected: "..."` header, and a test asserts the analyzer produces it.
@@ -1020,8 +1127,9 @@ other example. Output: `./scripts/build_hw_demo.sh` cross-compiles with
 `arm-none-eabi-gcc` (`-mcpu=cortex-m3 -mthumb -ffreestanding -nostdlib`)
 against a real linker script/vector table (`runtime/hw/`) and runs the
 resulting ARM binary under `qemu-system-arm -M mps2-an385` -- QEMU's
-cycle-accurate model of that real board, the standard way embedded
-engineers validate firmware without physical silicon on the bench.
+model of that real board's peripherals and memory map, a standard way to
+validate firmware without physical silicon on the bench. (Since v2.0 this
+is `phase build --target=mps2-an385 --run`; the script just runs that.)
 Verified three ways: (1) a driver end-to-end test cross-compiles and
 actually runs the binary under QEMU, asserting on its real UART0 output;
 (2) `arm-none-eabi-objdump` disassembly confirms `sim_device_wait` really
@@ -1119,6 +1227,21 @@ order across three rotating buffers with two always in flight, and
 `examples/circular_dma.phase` processes eight blocks from alternating
 halves of one circular buffer, then uses it whole; bug-gallery #30–#33.
 
+**v2.0 — Hardware as a compiler feature, editor support, and the 2.0 rule**
+`device` declarations (§3.7) give a peripheral's register map — address,
+registers with access modes, widths, offsets, reset values and bit fields
+— and the analyzer checks every access against it: misspelled names,
+writes to read-only registers, reads of write-only ones, field writes
+that would read a write-only register, values too wide for a field, and
+overlapping or misaligned maps. `phase build --target=mps2-an385 --run`
+cross-compiles for the Cortex-M3 board and runs on QEMU (§5.3), replacing
+the separate build script. `phase lsp` (§6.8) puts the compiler's
+diagnostics in the editor. And, as promised in 1.2, read-only data passed
+to a parameter with no access mode is an error. Output:
+`examples/uart_hello.phase` — a UART driver written entirely in PHASE —
+prints "Hello from PHASE" from the real UART0 data register on QEMU's
+board model; bug-gallery #34–#39.
+
 **M12 — LLVM backend** *(not yet started)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead
 of C, avoiding a dependency on an external `cc`. See §10 for why this was
@@ -1137,8 +1260,8 @@ immediately as the language grows.
 
 - Not a replacement for C, Rust, or CUDA.
 - No LLVM backend (documented future work, M12).
-- `phase build` targets the host simulation; the real-hardware runtime
-  (§5.3) is a separate build step, not a CLI target switch.
+- One hardware target (the MPS2 AN385 board, §5.3). Others need their own
+  startup, linker script and wait functions under `runtime/`.
 - No interprocedural analysis beyond signatures: each function is checked
   against the signatures of the functions it calls — including any
   declared domain changes (§3.11) — and `extern fn` bodies are trusted

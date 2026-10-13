@@ -498,6 +498,25 @@ note: 'hi' is moved to @DMA by 'start_circular' here
 examples/bug_gallery/process_half_in_flight.phase: 1 error found
 ```
 
+### `examples/bug_gallery/read_only_to_unannotated_param.phase`
+
+Bug gallery #39: read-only data handed to a function that never said it
+
+```
+error: 'checksum' doesn't declare whether it writes its parameter 'x', but 'view' is read-only; mark the parameter `read` if 'checksum' only reads it (or `write` if it writes, and pass it data it may write)
+  --> examples/bug_gallery/read_only_to_unannotated_param.phase:16:29
+   |
+16 |     let sum: u32 = checksum(view);
+   |                             ^^^^
+note: 'view' is a read borrow taken here
+  --> examples/bug_gallery/read_only_to_unannotated_param.phase:13:5
+   |
+13 |     let view = borrow frame read;
+   |     -----------------------------
+
+examples/bug_gallery/read_only_to_unannotated_param.phase: 1 error found
+```
+
 ### `examples/bug_gallery/read_param_handed_to_writer.phase`
 
 Bug gallery #21: a helper that promises (`read`) not to modify its

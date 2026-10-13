@@ -4,6 +4,87 @@ All notable changes to PHASE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] — 2026-10-13
+
+The hardware path becomes a compiler feature: a peripheral's register map
+is declared in PHASE and every access is checked against it, and
+`phase build --target=mps2-an385 --run` builds for an ARM Cortex-M3 board
+and runs on QEMU. The compiler's diagnostics come to the editor through a
+built-in language server. And the change promised in 1.2 lands, which is
+why this is 2.0.
+
+After the changes, 4,000 freshly fuzzed programs (1,710 accepted and run
+in checked mode) produced no soundness violations. The fuzzer does not
+generate device registers; those are covered by the analyzer, codegen and
+end-to-end tests, including the run on QEMU.
+
+### Breaking
+
+- **Read-only data passed to a parameter with no access mode is an
+  error** (it was a warning since 1.2). A read borrow or a `read`
+  parameter may only go to `read` parameters; a parameter with neither
+  `read` nor `write` may write. Fix: mark the parameter `read` if the
+  function only reads it. Every program 1.4 accepted *without warnings*
+  is still accepted. (Bug gallery #39.)
+- `device` is now a keyword at the start of a top-level item, and a local
+  cannot have the name of a declared device. `device`, `bit` and `bits`
+  remain usable as names everywhere else.
+- Internal crate APIs: `Item::Device`; `CallArg::DeviceRegister` and
+  `PirExpr::DeviceRead`; `PirProgram::devices`; `TokenKind::DotDotEq`.
+
+### Added
+
+- **`device` register maps** (spec §3.7):
+
+      device Uart0 @ 0x40004000 {
+          DATA:  read write u32 @ 0x00;
+          STATE: read u32 @ 0x04 { TXFULL: bit 0, RXFULL: bit 1 }
+          CTRL:  read write u32 @ 0x08 = 0 { TX_EN: bit 0, BAUD: bits 4..=11 }
+      }
+
+  `volatile_read(Uart0.STATE.TXFULL)` reads a field;
+  `volatile_write(Uart0.CTRL.TX_EN, 1)` writes one and keeps the other
+  bits. Checked: the map (sizes, alignment, no overlapping registers or
+  fields, reset values that fit, unique names) and every access (real
+  register and field names, read only readable registers, write only
+  writable ones, field writes only where the register can also be read,
+  literals that fit). In C, a device is a struct of `volatile` members at
+  the declared offsets (`_Static_assert`ed), at its real address on a
+  hardware target and a simulated block, starting from the reset values,
+  in a host build; `Pos`/`Msk` macros serve hand-written C. The
+  `REG @MMIO` form still works.
+- **`phase build --target=mps2-an385`** (spec §5.3): cross-compiles for the
+  ARM MPS2 AN385 board (Cortex-M3) with `arm-none-eabi-gcc` into
+  `build/<stem>.elf`; externs come from `runtime/hw/<stem>_extern.c` or
+  `runtime/<stem>_extern.c`. **`--run`** runs the result: the host binary,
+  or the .elf on `qemu-system-arm`, which now exits cleanly through
+  semihosting when `main` returns. `PHASE_ARM_CC` and `PHASE_QEMU`
+  override the tools. `scripts/build_hw_demo.sh` just runs this now.
+- **`phase lsp`** (spec §6.8): a Language Server Protocol server built into
+  the compiler. It publishes the same diagnostics as `phase check` — same
+  underlines, notes as related information — on every change, and lists
+  functions and devices as document symbols.
+- **`editors/`**: a TextMate grammar in a VS Code extension that starts
+  `phase lsp`, a Vim syntax file, and setup notes for Neovim, Helix and
+  Emacs. CI checks the grammar's scopes against every example.
+- Hex integer literals (`0x4000_4000`).
+- `examples/uart_hello.phase`: a UART driver written entirely in PHASE;
+  on QEMU's board model it prints "Hello from PHASE" from the real UART0
+  data register.
+- Bug gallery #34 `write_read_only_register`, #35
+  `read_write_only_register`, #36 `field_write_on_write_only_register`,
+  #37 `field_value_too_wide`, #38 `overlapping_registers`, #39
+  `read_only_to_unannotated_param`, with CWE mappings.
+- `runtime/hw/libc_min.c`: `memset`/`memcpy`/`memmove`/`memcmp`, which GCC
+  may call even in freestanding code.
+
+### Changed
+
+- The error for a `volatile_read`/`volatile_write` whose first argument
+  is not a register now names both forms (`Uart0.STATE`, `REG @MMIO`).
+- Spec: QEMU's MPS2 model is described as a model of the board's
+  peripherals and memory map, not as cycle-accurate (it isn't).
+
 ## [1.4.0] — 2026-10-13
 
 Ring buffers: `rotate` for triple buffering and `split`/`join` for
