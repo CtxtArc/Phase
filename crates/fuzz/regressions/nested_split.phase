@@ -1,0 +1,38 @@
+// Fuzzer finding (seed 918000581): a false alarm in the runtime checker --
+// a split buffer, its first part and that part's own first part share one
+// address, and the checker confused their records ("'b1' is split into
+// parts"). Fixed in the runtime checker (split records are looked up by
+// name and call frame). Must be accepted and run clean.
+
+extern fn flip() -> bool;
+extern fn count() -> u32;
+extern fn gstart(x: write buffer<u8, _> @RAM -> @DMA);
+
+fn main() {
+    buffer<u8, 8> b1 @RAM;
+    split b1 into s2, s3;
+    split s2 into s4, s5;
+    gstart(s4);
+    let c6: bool = flip();
+    if c6 {
+        let n7: u32 = 0;
+        let l8: u32 = count();
+        while n7 < l8 {
+            n7 = n7 + 1;
+        }
+        sync(s4);
+        let n9: u32 = 0;
+        let l10: u32 = count();
+        while n9 < l10 {
+            let h11 = borrow s4 write;
+            release h11;
+            n9 = n9 + 1;
+        }
+    } else {
+        buffer<u8, 8> b13 @RAM;
+        sync(s4);
+        join s4, s5 into s2;
+        join s2, s3 into b1;
+        return;
+    }
+}

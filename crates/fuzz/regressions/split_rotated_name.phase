@@ -1,0 +1,19 @@
+// Fuzzer finding (seed 918000661): a false alarm in the runtime checker --
+// a buffer split under a name that `rotate` had moved onto other storage
+// ends under its declared name, which the checker did not match ("'b1'
+// does not refer to a live buffer"). Fixed in the runtime checker. Must be
+// accepted and run clean.
+
+extern fn flip() -> bool;
+
+fn main() {
+    buffer<u8, 16> b1 @DMA;
+    buffer<u8, 16> b2 @RAM;
+    buffer<u8, 16> b3 @RAM;
+    rotate b1, b2, b3;
+    destroy b2;
+    destroy b1;
+    split b3 into s6, s7;
+    sync(s6);
+    sync(s7);
+}
