@@ -13,7 +13,7 @@ mod diagnostics;
 mod json;
 mod lsp;
 
-use diagnostics::{Diagnostic, ErrorFormat};
+use diagnostics::{Diagnostic, ErrorFormat, Source};
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
@@ -73,18 +73,18 @@ struct Reporter {
 }
 
 impl Reporter {
-    fn emit(&self, diag: &Diagnostic, path: &str, src: &str) {
+    fn emit(&self, diag: &Diagnostic, sources: &[Source]) {
         eprint!(
             "{}",
-            diagnostics::render(diag, path, src, self.format, self.color)
+            diagnostics::render(diag, sources, self.format, self.color)
         );
     }
 
     /// Print every warning and error, and a count when there are errors.
     /// Returns whether the program was rejected.
-    fn report(&self, report: &phase_analysis::Report, path: &str, src: &str) -> bool {
+    fn report(&self, report: &phase_analysis::Report, path: &str, sources: &[Source]) -> bool {
         for e in report.warnings.iter().chain(&report.errors) {
-            self.emit(&Diagnostic::from(e), path, src);
+            self.emit(&Diagnostic::from(e), sources);
             if self.format == ErrorFormat::Human {
                 eprintln!();
             }
@@ -107,8 +107,36 @@ impl Reporter {
     }
 
     fn parse_error(&self, e: &phase_parser::ParseError, path: &str, src: &str) -> ExitCode {
-        self.emit(&Diagnostic::from(e), path, src);
+        self.emit(&Diagnostic::from(e), &[Source { path, src }]);
         ExitCode::FAILURE
+    }
+}
+
+/// The display paths and sources of a loaded program's files.
+fn sources_of(files: &[phase_parser::SourceFile]) -> Vec<(String, &str)> {
+    files
+        .iter()
+        .map(|f| (f.path.display().to_string(), f.src.as_str()))
+        .collect()
+}
+
+fn as_sources<'a>(owned: &'a [(String, &'a str)]) -> Vec<Source<'a>> {
+    owned
+        .iter()
+        .map(|(path, src)| Source { path, src })
+        .collect()
+}
+
+/// Load `path` and everything it imports, reporting a file that can't be
+/// read or parsed.
+fn load(path: &str, rep: &Reporter) -> Option<phase_parser::Loaded> {
+    match phase_parser::load(Path::new(path), &mut |p| fs::read_to_string(p)) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            let owned = sources_of(&e.files);
+            rep.emit(&Diagnostic::from(&e.error), &as_sources(&owned));
+            None
+        }
     }
 }
 
@@ -136,19 +164,14 @@ fn find_runtime_dir(source: &Path) -> Option<PathBuf> {
 /// Parse and analyze `src`, reporting any errors, and returning `None` on
 /// failure. Shared by every command past `check` that needs a program
 /// known to be safe before proceeding.
-fn parse_and_analyze(path: &str, src: &str, rep: &Reporter) -> Option<phase_ast::Program> {
-    let program = match phase_parser::parse(src) {
-        Ok(p) => p,
-        Err(e) => {
-            rep.parse_error(&e, path, src);
-            return None;
-        }
-    };
-    let report = phase_analysis::analyze_full(&program);
-    if rep.report(&report, path, src) {
+fn parse_and_analyze(path: &str, rep: &Reporter) -> Option<phase_ast::Program> {
+    let loaded = load(path, rep)?;
+    let report = phase_analysis::analyze_full(&loaded.program);
+    let owned = sources_of(&loaded.files);
+    if rep.report(&report, path, &as_sources(&owned)) {
         None
     } else {
-        Some(program)
+        Some(loaded.program)
     }
 }
 
@@ -252,8 +275,9 @@ fn main() -> ExitCode {
             }
             Err(e) => rep.parse_error(&e, path, &src),
         },
-        "check" => match phase_parser::parse(&src) {
-            Ok(program) => {
+        "check" => match load(path, &rep) {
+            Some(loaded) => {
+                let program = &loaded.program;
                 let entities = program
                     .items
                     .iter()
@@ -265,26 +289,31 @@ fn main() -> ExitCode {
                     .filter(|i| matches!(i, phase_ast::Item::Fn(_)))
                     .count();
 
-                let report = phase_analysis::analyze_full(&program);
-                if rep.report(&report, path, &src) {
+                let report = phase_analysis::analyze_full(program);
+                let owned = sources_of(&loaded.files);
+                if rep.report(&report, path, &as_sources(&owned)) {
                     return ExitCode::FAILURE;
                 }
+                let files = match loaded.files.len() {
+                    1 => String::new(),
+                    n => format!(", {n} files"),
+                };
                 let warnings = match report.warnings.len() {
                     0 => String::new(),
                     1 => ", 1 warning".to_string(),
                     n => format!(", {n} warnings"),
                 };
                 println!(
-                    "OK: {path} parsed and passed domain/ownership analysis ({entities} entit{}, {fns} fn{}{warnings})",
+                    "OK: {path} parsed and passed domain/ownership analysis ({entities} entit{}, {fns} fn{}{files}{warnings})",
                     if entities == 1 { "y" } else { "ies" },
                     if fns == 1 { "" } else { "s" },
                 );
                 ExitCode::SUCCESS
             }
-            Err(e) => rep.parse_error(&e, path, &src),
+            None => ExitCode::FAILURE,
         },
         "--dump-pir" => {
-            let Some(program) = parse_and_analyze(path, &src, &rep) else {
+            let Some(program) = parse_and_analyze(path, &rep) else {
                 return ExitCode::FAILURE;
             };
             match phase_pir::build(&program) {
@@ -299,7 +328,7 @@ fn main() -> ExitCode {
             }
         }
         "build" => {
-            let Some(program) = parse_and_analyze(path, &src, &rep) else {
+            let Some(program) = parse_and_analyze(path, &rep) else {
                 return ExitCode::FAILURE;
             };
             let pir = match phase_pir::build(&program) {

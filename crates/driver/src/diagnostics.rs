@@ -103,16 +103,26 @@ impl Style {
 }
 
 /// Render `diag` (which occurred in `src`, read from `path`).
-pub fn render(
-    diag: &Diagnostic,
-    path: &str,
-    src: &str,
-    format: ErrorFormat,
-    color: bool,
-) -> String {
+/// One source file a diagnostic may point into: `sources[span.file]`.
+#[derive(Debug, Clone, Copy)]
+pub struct Source<'a> {
+    pub path: &'a str,
+    pub src: &'a str,
+}
+
+/// The file a span is in (the first one, if the span's is unknown).
+fn file_of<'a>(sources: &[Source<'a>], span: Span) -> Source<'a> {
+    sources
+        .get(span.file as usize)
+        .or(sources.first())
+        .copied()
+        .unwrap_or(Source { path: "", src: "" })
+}
+
+pub fn render(diag: &Diagnostic, sources: &[Source], format: ErrorFormat, color: bool) -> String {
     match format {
-        ErrorFormat::Short => render_short(diag, path, src),
-        ErrorFormat::Human => render_human(diag, path, src, &Style { on: color }),
+        ErrorFormat::Short => render_short(diag, sources),
+        ErrorFormat::Human => render_human(diag, sources, &Style { on: color }),
     }
 }
 
@@ -125,28 +135,38 @@ fn reported_col(span: Span, src: &str, subject: Option<&str>) -> usize {
     }
 }
 
-fn render_short(diag: &Diagnostic, path: &str, src: &str) -> String {
+fn render_short(diag: &Diagnostic, sources: &[Source]) -> String {
     let mut out = String::new();
     match diag.span {
-        Some(s) => writeln!(
+        Some(s) => {
+            let f = file_of(sources, s);
+            writeln!(
+                out,
+                "{}:{}:{}: {}: {}",
+                f.path,
+                s.line,
+                reported_col(s, f.src, diag.subject.as_deref()),
+                diag.severity,
+                diag.message
+            )
+        }
+        None => writeln!(
             out,
-            "{path}:{}:{}: {}: {}",
-            s.line,
-            reported_col(s, src, diag.subject.as_deref()),
+            "{}: {}: {}",
+            file_of(sources, Span::default()).path,
             diag.severity,
             diag.message
         ),
-        None => writeln!(out, "{path}: {}: {}", diag.severity, diag.message),
     }
     .unwrap();
     for (span, msg) in &diag.notes {
+        let path = file_of(sources, *span).path;
         writeln!(out, "{path}:{}:{}: note: {msg}", span.line, span.col).unwrap();
     }
     out
 }
 
-fn render_human(diag: &Diagnostic, path: &str, src: &str, st: &Style) -> String {
-    let lines: Vec<&str> = src.lines().collect();
+fn render_human(diag: &Diagnostic, sources: &[Source], st: &Style) -> String {
     let width = std::iter::once(diag.span)
         .flatten()
         .chain(diag.notes.iter().map(|(s, _)| *s))
@@ -165,8 +185,7 @@ fn render_human(diag: &Diagnostic, path: &str, src: &str, st: &Style) -> String 
     match diag.span {
         Some(span) => snippet(
             &mut out,
-            path,
-            &lines,
+            file_of(sources, span),
             span,
             diag.subject.as_deref(),
             '^',
@@ -174,11 +193,26 @@ fn render_human(diag: &Diagnostic, path: &str, src: &str, st: &Style) -> String 
             st,
             Some(diag.severity),
         ),
-        None => writeln!(out, "{} {path}", st.gutter(&format!("{:>width$}-->", ""))).unwrap(),
+        None => writeln!(
+            out,
+            "{} {}",
+            st.gutter(&format!("{:>width$}-->", "")),
+            file_of(sources, Span::default()).path
+        )
+        .unwrap(),
     }
     for (span, msg) in &diag.notes {
         writeln!(out, "{}{}", st.note("note"), st.bold(&format!(": {msg}"))).unwrap();
-        snippet(&mut out, path, &lines, *span, None, '-', width, st, None);
+        snippet(
+            &mut out,
+            file_of(sources, *span),
+            *span,
+            None,
+            '-',
+            width,
+            st,
+            None,
+        );
     }
     out
 }
@@ -230,8 +264,7 @@ fn find_word(line: &str, word: &str, from: usize, to: usize) -> Option<usize> {
 #[allow(clippy::too_many_arguments)]
 fn snippet(
     out: &mut String,
-    path: &str,
-    lines: &[&str],
+    file: Source,
     span: Span,
     subject: Option<&str>,
     mark: char,
@@ -240,9 +273,10 @@ fn snippet(
     // `Some(severity)` for the primary location, `None` for a note.
     primary: Option<&str>,
 ) {
+    let path = file.path;
     let blank = st.gutter(&format!("{:>width$} |", ""));
     let arrow = st.gutter(&format!("{:>width$}-->", ""));
-    let Some(line) = lines.get(span.line.saturating_sub(1) as usize) else {
+    let Some(line) = file.src.lines().nth(span.line.saturating_sub(1) as usize) else {
         writeln!(out, "{arrow} {path}:{}:{}", span.line, span.col).unwrap();
         return;
     };
@@ -279,8 +313,14 @@ mod tests {
             col,
             end_line,
             end_col,
+            file: 0,
         }
     }
+
+    const T: &[Source] = &[Source {
+        path: "t.phase",
+        src: SRC,
+    }];
 
     const SRC: &str = "fn main() {\n    fir_filter(raw, filtered);\n}\n";
 
@@ -296,13 +336,7 @@ mod tests {
 
     #[test]
     fn human_format_underlines_the_subject() {
-        let out = render(
-            &diag(Some("raw")),
-            "t.phase",
-            SRC,
-            ErrorFormat::Human,
-            false,
-        );
+        let out = render(&diag(Some("raw")), T, ErrorFormat::Human, false);
         let expected = "\
 error: entity 'raw' is in domain @DMA
  --> t.phase:2:16
@@ -320,7 +354,7 @@ note: declared here
 
     #[test]
     fn without_a_subject_the_whole_statement_is_underlined() {
-        let out = render(&diag(None), "t.phase", SRC, ErrorFormat::Human, false);
+        let out = render(&diag(None), T, ErrorFormat::Human, false);
         assert!(
             out.contains("  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^\n"),
             "{out}"
@@ -335,13 +369,7 @@ note: declared here
 
     #[test]
     fn short_format_is_one_line_per_location() {
-        let out = render(
-            &diag(Some("raw")),
-            "t.phase",
-            SRC,
-            ErrorFormat::Short,
-            false,
-        );
+        let out = render(&diag(Some("raw")), T, ErrorFormat::Short, false);
         assert_eq!(
             out,
             "t.phase:2:16: error: entity 'raw' is in domain @DMA\nt.phase:1:1: note: declared here\n"
@@ -358,7 +386,42 @@ note: declared here
 
     #[test]
     fn color_wraps_in_ansi_codes() {
-        let out = render(&diag(Some("raw")), "t.phase", SRC, ErrorFormat::Human, true);
+        let out = render(&diag(Some("raw")), T, ErrorFormat::Human, true);
         assert!(out.starts_with("\x1b[1;31merror\x1b[0m"));
+    }
+
+    #[test]
+    fn each_location_is_shown_in_its_own_file() {
+        let lib = "extern fn look(x: read buffer<u8, 4> @RAM);\n";
+        let sources = [
+            Source {
+                path: "t.phase",
+                src: SRC,
+            },
+            Source {
+                path: "lib/look.phase",
+                src: lib,
+            },
+        ];
+        let mut d = diag(Some("raw"));
+        d.notes = vec![(
+            Span {
+                line: 1,
+                col: 11,
+                end_line: 1,
+                end_col: 15,
+                file: 1,
+            },
+            "'look' is declared here".into(),
+        )];
+        let out = render(&d, &sources, ErrorFormat::Human, false);
+        assert!(out.contains(" --> t.phase:2:16\n"), "{out}");
+        assert!(out.contains(" --> lib/look.phase:1:11\n"), "{out}");
+        assert!(out.contains("1 | extern fn look("), "{out}");
+        let short = render(&d, &sources, ErrorFormat::Short, false);
+        assert!(
+            short.contains("lib/look.phase:1:11: note: 'look' is declared here"),
+            "{short}"
+        );
     }
 }

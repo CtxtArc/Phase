@@ -9,8 +9,10 @@
 use crate::diagnostics::{underline_range, Diagnostic};
 use crate::json::{self, obj, Json};
 use phase_ast::{Item, Span};
+use phase_parser::SourceFile;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 
 /// Run the server until the client sends `exit`. Returns the process exit
 /// status the protocol asks for: 0 after a `shutdown`, 1 otherwise.
@@ -196,29 +198,82 @@ impl Server {
     }
 
     fn publish(&self, uri: &str) -> Json {
-        let text = self.docs.get(uri).map(String::as_str).unwrap_or("");
-        let diagnostics = check(text).iter().map(|d| to_lsp(d, uri, text)).collect();
+        let (diags, files) = self.check(uri);
+        let diagnostics = diags.iter().map(|d| to_lsp(d, uri, &files)).collect();
         notification(
             "textDocument/publishDiagnostics",
             obj(&[("uri", uri.into()), ("diagnostics", Json::Arr(diagnostics))]),
         )
     }
-}
 
-/// Everything `phase check` would report for `text`.
-fn check(text: &str) -> Vec<Diagnostic> {
-    match phase_parser::parse(text) {
-        Err(e) => vec![Diagnostic::from(&e)],
-        Ok(program) => {
-            let report = phase_analysis::analyze_full(&program);
-            report
-                .errors
-                .iter()
-                .chain(&report.warnings)
-                .map(Diagnostic::from)
-                .collect()
+    /// Everything `phase check` would report for the document at `uri`,
+    /// and the files it was loaded from. Imports are read from open
+    /// documents first (unsaved edits count), then from disk.
+    fn check(&self, uri: &str) -> (Vec<Diagnostic>, Vec<SourceFile>) {
+        let root = uri_to_path(uri);
+        let docs = &self.docs;
+        let mut read = |p: &Path| -> io::Result<String> {
+            if p == root {
+                return Ok(docs.get(uri).cloned().unwrap_or_default());
+            }
+            match docs.iter().find(|(u, _)| uri_to_path(u) == p) {
+                Some((_, text)) => Ok(text.clone()),
+                None => std::fs::read_to_string(p),
+            }
+        };
+        match phase_parser::load(&root, &mut read) {
+            Err(e) => (vec![Diagnostic::from(&e.error)], e.files),
+            Ok(loaded) => {
+                let report = phase_analysis::analyze_full(&loaded.program);
+                let diags = report
+                    .errors
+                    .iter()
+                    .chain(&report.warnings)
+                    .map(Diagnostic::from)
+                    .collect();
+                (diags, loaded.files)
+            }
         }
     }
+}
+
+/// `file:///a/b%20c.phase` -> `/a/b c.phase`.
+fn uri_to_path(uri: &str) -> PathBuf {
+    let raw = uri.strip_prefix("file://").unwrap_or(uri);
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    PathBuf::from(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// `/a/b c.phase` -> `file:///a/b%20c.phase`.
+fn path_to_uri(path: &Path) -> String {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let mut out = String::from("file://");
+    for b in abs.to_string_lossy().bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// The number of UTF-16 code units in the first `chars` chars of `line`.
@@ -241,35 +296,73 @@ fn range(span: Span, text: &str, subject: Option<&str>) -> Json {
     obj(&[("start", pos(start)), ("end", pos(end))])
 }
 
-fn to_lsp(d: &Diagnostic, uri: &str, text: &str) -> Json {
+/// One diagnostic for the document at `uri` (file 0 of `files`). A
+/// problem located in an imported file is shown on the `import` that
+/// brought that file in, with a link to where it really is.
+fn to_lsp(d: &Diagnostic, uri: &str, files: &[SourceFile]) -> Json {
+    let text_of = |file: u32| files.get(file as usize).map_or("", |f| f.src.as_str());
+    let uri_of = |file: u32| match file {
+        0 => uri.to_string(),
+        n => files
+            .get(n as usize)
+            .map_or_else(|| uri.to_string(), |f| path_to_uri(&f.path)),
+    };
+    let location = |s: Span, subject: Option<&str>| {
+        obj(&[
+            ("uri", uri_of(s.file).into()),
+            ("range", range(s, text_of(s.file), subject)),
+        ])
+    };
     // A diagnostic without a location (rare) goes on the first line.
     let span = d.span.unwrap_or(Span {
         line: 1,
         col: 1,
         end_line: 1,
         end_col: 1,
+        file: 0,
     });
-    let related: Vec<Json> = d
-        .notes
-        .iter()
-        .map(|(s, m)| {
-            obj(&[
-                (
-                    "location",
-                    obj(&[("uri", uri.into()), ("range", range(*s, text, None))]),
-                ),
-                ("message", m.clone().into()),
-            ])
-        })
-        .collect();
+    let mut related: Vec<Json> = Vec::new();
+    let (shown_at, message) = match files.get(span.file as usize) {
+        Some(f) if span.file != 0 => {
+            related.push(obj(&[
+                ("location", location(span, d.subject.as_deref())),
+                ("message", d.message.clone().into()),
+            ]));
+            let name = f.path.file_name().map_or_else(
+                || f.path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let at = f.via.unwrap_or(Span {
+                line: 1,
+                col: 1,
+                end_line: 1,
+                end_col: 1,
+                file: 0,
+            });
+            (
+                range(at, text_of(0), None),
+                format!("in {name}:{}: {}", span.line, d.message),
+            )
+        }
+        _ => (
+            range(span, text_of(0), d.subject.as_deref()),
+            d.message.clone(),
+        ),
+    };
+    related.extend(d.notes.iter().map(|(s, m)| {
+        obj(&[
+            ("location", location(*s, None)),
+            ("message", m.clone().into()),
+        ])
+    }));
     let mut fields = vec![
-        ("range", range(span, text, d.subject.as_deref())),
+        ("range", shown_at),
         (
             "severity",
             (if d.severity == "warning" { 2u32 } else { 1u32 }).into(),
         ),
         ("source", "phase".into()),
-        ("message", d.message.clone().into()),
+        ("message", message.into()),
     ];
     if !related.is_empty() {
         fields.push(("relatedInformation", Json::Arr(related)));
@@ -328,9 +421,11 @@ mod tests {
     #[test]
     fn a_rejected_program_gets_a_diagnostic_narrowed_to_its_subject() {
         let src = "extern fn look(x: read buffer<u8, 4> @RAM);\nfn main() {\n    buffer<u8, 4> b @DMA;\n    look(b);\n    sync(b);\n}\n";
-        let diags = check(src);
+        let mut server = Server::default();
+        server.docs.insert("file:///t.phase".into(), src.into());
+        let (diags, files) = server.check("file:///t.phase");
         assert_eq!(diags.len(), 1);
-        let lsp = to_lsp(&diags[0], "file:///t.phase", src);
+        let lsp = to_lsp(&diags[0], "file:///t.phase", &files);
         assert_eq!(lsp.at(&["range", "start", "line"]), Some(&Json::Num(3.0)));
         // `look(b)` starts at character 4; the subject `b` is at 9.
         assert_eq!(
@@ -339,5 +434,57 @@ mod tests {
         );
         assert_eq!(lsp.get("severity"), Some(&Json::Num(1.0)));
         assert!(lsp.get("relatedInformation").is_some());
+    }
+
+    #[test]
+    fn uris_and_paths_round_trip() {
+        let p = Path::new("/home/me/my code/a+b.phase");
+        assert_eq!(path_to_uri(p), "file:///home/me/my%20code/a%2Bb.phase");
+        assert_eq!(uri_to_path(&path_to_uri(p)), p);
+    }
+
+    #[test]
+    fn an_error_in_an_imported_file_is_shown_on_the_import() {
+        let dir = std::env::temp_dir().join("phase_lsp_import_test");
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        // The library itself is broken: it reads a buffer the DMA engine owns.
+        std::fs::write(
+            dir.join("lib/helpers.phase"),
+            "extern fn look(x: read buffer<u8, 4> @RAM);\nfn peek(b: buffer<u8, 4> @DMA) {\n    look(b);\n}\n",
+        )
+        .unwrap();
+        let root = dir.join("app.phase");
+        let uri = path_to_uri(&root);
+        let mut server = Server::default();
+        // Unsaved text of the open document; the library comes from disk.
+        server.docs.insert(
+            uri.clone(),
+            "import \"lib/helpers.phase\";\nfn main() {\n}\n".into(),
+        );
+        let (diags, files) = server.check(&uri);
+        assert_eq!(files.len(), 2);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        let lsp = to_lsp(&diags[0], &uri, &files);
+        // Shown on line 0 (the import) of the open document...
+        assert_eq!(lsp.at(&["range", "start", "line"]), Some(&Json::Num(0.0)));
+        let msg = lsp.get("message").and_then(Json::as_str).unwrap();
+        assert!(
+            msg.starts_with("in helpers.phase:3: entity 'b' is in domain @DMA"),
+            "{msg}"
+        );
+        // ...linked to where it really is.
+        let rel = lsp
+            .get("relatedInformation")
+            .and_then(Json::as_arr)
+            .unwrap();
+        let first = rel[0]
+            .at(&["location", "uri"])
+            .and_then(Json::as_str)
+            .unwrap();
+        assert!(first.ends_with("/lib/helpers.phase"), "{first}");
+        assert_eq!(
+            rel[0].at(&["location", "range", "start", "line"]),
+            Some(&Json::Num(2.0))
+        );
     }
 }

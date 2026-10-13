@@ -1,7 +1,10 @@
 //! Hand-written recursive-descent parser for PHASE: tokens -> AST.
 
 use phase_ast::*;
-use phase_lexer::{tokenize, LexError, Span, Token, TokenKind};
+use phase_lexer::{tokenize_file, LexError, Span, Token, TokenKind};
+
+mod load;
+pub use load::{load, LoadError, Loaded, SourceFile};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
@@ -42,7 +45,13 @@ pub struct Parser {
 
 /// Parse a full PHASE source file into a `Program`.
 pub fn parse(src: &str) -> Result<Program, ParseError> {
-    let tokens = tokenize(src)?;
+    parse_file(src, 0)
+}
+
+/// Like [`parse`], with every span in source file `file`. `import`s are
+/// left in the program; [`load`] resolves them.
+pub fn parse_file(src: &str, file: u32) -> Result<Program, ParseError> {
+    let tokens = tokenize_file(src, file)?;
     Parser::new(tokens).parse_program()
 }
 
@@ -146,9 +155,32 @@ impl Parser {
             // `device` is a keyword only here, at the start of an item, so
             // existing programs may keep using it as a name.
             TokenKind::Ident(w) if w == "device" => self.parse_device_decl().map(Item::Device),
+            TokenKind::Ident(w) if w == "import" => {
+                let start = self.peek_span();
+                self.bump();
+                let path = match self.peek().clone() {
+                    TokenKind::Str(s) => {
+                        self.bump();
+                        s
+                    }
+                    other => {
+                        return Err(ParseError {
+                            message: format!(
+                                "expected a file path in quotes after `import`, found {other:?}"
+                            ),
+                            span: self.peek_span(),
+                        })
+                    }
+                };
+                self.expect(TokenKind::Semi)?;
+                Ok(Item::Import(ImportDecl {
+                    path,
+                    span: start.to(self.prev_span),
+                }))
+            }
             other => Err(ParseError {
                 message: format!(
-                    "expected item (entity/state/fn/extern fn/device), found {:?}",
+                    "expected item (entity/state/fn/extern fn/device/import), found {:?}",
                     other
                 ),
                 span: self.peek_span(),

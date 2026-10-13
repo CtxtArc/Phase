@@ -126,6 +126,7 @@ pub struct Lexer<'a> {
     pos: usize,
     line: u32,
     col: u32,
+    file: u32,
     _src: &'a str,
 }
 
@@ -136,6 +137,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             line: 1,
             col: 1,
+            file: 0,
             _src: src,
         }
     }
@@ -166,6 +168,7 @@ impl<'a> Lexer<'a> {
             col: self.col,
             end_line: self.line,
             end_col: self.col,
+            file: self.file,
         }
     }
 
@@ -413,6 +416,13 @@ impl<'a> Lexer<'a> {
 
 pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
     Lexer::new(src).tokenize()
+}
+
+/// Like [`tokenize`], with every span in source file `file`.
+pub fn tokenize_file(src: &str, file: u32) -> Result<Vec<Token>, LexError> {
+    let mut lexer = Lexer::new(src);
+    lexer.file = file;
+    lexer.tokenize()
 }
 
 #[cfg(test)]

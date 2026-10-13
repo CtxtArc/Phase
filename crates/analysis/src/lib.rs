@@ -379,6 +379,26 @@ pub fn analyze_full(program: &Program) -> Report {
 
     let devices = check_devices(program, &mut errors);
 
+    for item in &program.items {
+        match item {
+            // `parse` leaves imports in place; only loading from files
+            // (`phase_parser::load`) can resolve them.
+            Item::Import(imp) => errors.push(
+                err(format!(
+                    "cannot resolve `import \"{}\"` here: imports are resolved when compiling a file",
+                    imp.path
+                ))
+                .at(imp.span),
+            ),
+            // The program's entry point belongs to the file being compiled.
+            Item::Fn(f) if f.name == "main" && f.name_span.file != 0 => errors.push(
+                err("an imported file defines 'main'; only the file being compiled may")
+                    .at(f.name_span),
+            ),
+            _ => {}
+        }
+    }
+
     let mut seen_fns: HashMap<&str, Span> = HashMap::new();
     for item in &program.items {
         let (name, span) = match item {
@@ -439,7 +459,7 @@ fn check_devices<'p>(
             Item::ExternFn(f) => other_names.insert(f.name.as_str()),
             Item::Entity(e) => other_names.insert(e.name.as_str()),
             Item::State(s) => other_names.insert(s.name.as_str()),
-            Item::Device(_) => false,
+            Item::Device(_) | Item::Import(_) => false,
         };
     }
     let mut devices: HashMap<&str, &DeviceDecl> = HashMap::new();

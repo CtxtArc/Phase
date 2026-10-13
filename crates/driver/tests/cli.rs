@@ -536,3 +536,90 @@ fn unknown_targets_and_host_only_flags_on_a_hardware_target_are_rejected() {
     assert!(!checked.status.success());
     assert!(String::from_utf8_lossy(&checked.stderr).contains("need a host build"));
 }
+
+#[test]
+fn a_program_split_across_files_is_checked_and_built_as_one() {
+    let dir = std::env::temp_dir().join("phase_cli_imports");
+    std::fs::create_dir_all(dir.join("runtime")).unwrap();
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    let root = workspace_root();
+    for f in ["phase_runtime.h", "phase_runtime.c"] {
+        std::fs::copy(root.join("runtime").join(f), dir.join("runtime").join(f)).unwrap();
+    }
+    // lib/capture.phase imports its own helper; both are loaded once.
+    std::fs::write(
+        dir.join("lib/capture.phase"),
+        "import \"wait.phase\";\nextern fn start(dst: write buffer<u8, 4> @RAM -> @DMA);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("lib/wait.phase"),
+        "import \"capture.phase\";\nfn wait(b: buffer<u8, 4> @DMA -> @RAM) {\n    sync(b);\n}\n",
+    )
+    .unwrap();
+    let app = dir.join("app.phase");
+    std::fs::write(
+        &app,
+        "import \"lib/capture.phase\";\nextern fn look(x: read buffer<u8, 4> @RAM);\nfn main() {\n    buffer<u8, 4> x @RAM;\n    start(x);\n    wait(x);\n    look(x);\n}\n",
+    )
+    .unwrap();
+    let ok = phase().arg("check").arg(&app).output().unwrap();
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(String::from_utf8_lossy(&ok.stdout).contains("(0 entities, 2 fns, 3 files)"));
+    let built = phase()
+        .args(["build", "--stub-externs", "--run"])
+        .arg(&app)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    assert!(String::from_utf8_lossy(&built.stdout).contains("[stub] look(x: 4 x u8)"));
+
+    // An error in the library is reported in the library.
+    std::fs::write(
+        dir.join("lib/wait.phase"),
+        "fn wait(b: buffer<u8, 4> @DMA -> @RAM) {\n}\n",
+    )
+    .unwrap();
+    let bad = phase()
+        .args(["--error-format=short", "check"])
+        .arg(&app)
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        stderr.contains(
+            "lib/wait.phase:2:1: error: parameter 'b' must be in @RAM when 'wait' returns"
+        ),
+        "{stderr}"
+    );
+
+    // A missing file is reported at the import that names it.
+    std::fs::write(&app, "import \"lib/nope.phase\";\nfn main() {}\n").unwrap();
+    let missing = phase()
+        .args(["--error-format=short", "check"])
+        .arg(&app)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("app.phase:1:1: error: cannot import \"lib/nope.phase\""),
+        "{stderr}"
+    );
+
+    // `main` belongs to the file being compiled.
+    std::fs::write(dir.join("lib/wait.phase"), "fn main() {}\n").unwrap();
+    std::fs::write(&app, "import \"lib/wait.phase\";\n").unwrap();
+    let main_in_lib = phase().arg("check").arg(&app).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&main_in_lib.stderr).contains("an imported file defines 'main'")
+    );
+}

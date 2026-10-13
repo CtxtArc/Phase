@@ -4,12 +4,15 @@
 
 /// A region of source text: from `(line, col)` up to, but not including,
 /// `(end_line, end_col)`. Lines and columns are 1-based and count chars.
+/// `file` says which source file (v2.1, with imports): 0 is the file
+/// being compiled, others are files it imports, numbered as loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct Span {
     pub line: u32,
     pub col: u32,
     pub end_line: u32,
     pub end_col: u32,
+    pub file: u32,
 }
 
 impl Span {
@@ -30,6 +33,7 @@ impl Span {
             col: start.col,
             end_line: end.end_line,
             end_col: end.end_col,
+            file: start.file,
         }
     }
 }
@@ -256,6 +260,15 @@ impl RegDecl {
     }
 }
 
+/// `import "devices/uart.phase";` (v2.1): every item of that file (and
+/// of what it imports) becomes part of this program. The path is relative
+/// to the importing file's directory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportDecl {
+    pub path: String,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Entity(EntityDecl),
@@ -263,6 +276,9 @@ pub enum Item {
     Fn(FnDecl),
     ExternFn(ExternFnDecl),
     Device(DeviceDecl),
+    /// Resolved (and removed) when a program is loaded from files; left in
+    /// place by `parse` on a single source string.
+    Import(ImportDecl),
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -497,6 +497,7 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
             }
             Item::State(_) => {} // typestate is compile-time-only; nothing to lower
             Item::Device(_) => {} // lowered above
+            Item::Import(_) => {} // resolved when the program was loaded
         }
     }
 
