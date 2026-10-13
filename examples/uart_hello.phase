@@ -1,0 +1,56 @@
+// v2.0 example: a UART driver written entirely in PHASE.
+//
+// The register map below is the CMSDK APB UART on the ARM MPS2 AN385
+// board, as documented (and as QEMU models it). Declaring it makes every
+// access a checked compiler feature: a misspelled register or field, a
+// write to a read-only register, or a value too wide for its field is a
+// compile error, not a silent bug.
+//
+//   phase build --target=mps2-an385 --run examples/uart_hello.phase
+//
+// cross-compiles this for the board and runs it on QEMU: the text below
+// comes out of the real UART0 data register. A plain host build runs the
+// same code against a simulated register block instead.
+
+device Uart0 @ 0x40004000 {
+    DATA:      read write u32 @ 0x00 { BYTE: bits 0..=7 }
+    STATE:     read write u32 @ 0x04 { TXFULL: bit 0, RXFULL: bit 1, TXOVR: bit 2, RXOVR: bit 3 }
+    CTRL:      read write u32 @ 0x08 = 0 { TX_EN: bit 0, RX_EN: bit 1 }
+    INTSTATUS: read write u32 @ 0x0C;
+    BAUDDIV:   read write u32 @ 0x10 { DIV: bits 0..=19 }
+}
+
+// Wait for room in the transmit FIFO, then send one byte.
+fn send_byte(c: u32) {
+    while volatile_read(Uart0.STATE.TXFULL) == 1 {
+    }
+    volatile_write(Uart0.DATA, c);
+}
+
+fn main() {
+    volatile_write(Uart0.BAUDDIV.DIV, 16);  // the slowest legal divisor
+    volatile_write(Uart0.CTRL.TX_EN, 1);    // enable the transmitter only
+
+    send_byte(72);   // H
+    send_byte(101);  // e
+    send_byte(108);  // l
+    send_byte(108);  // l
+    send_byte(111);  // o
+    send_byte(32);   //
+    send_byte(102);  // f
+    send_byte(114);  // r
+    send_byte(111);  // o
+    send_byte(109);  // m
+    send_byte(32);   //
+    send_byte(80);   // P
+    send_byte(72);   // H
+    send_byte(65);   // A
+    send_byte(83);   // S
+    send_byte(69);   // E
+    send_byte(10);   // newline
+
+    // The FIFO was never overrun: `send_byte` waits for room every time.
+    if volatile_read(Uart0.STATE.TXOVR) == 1 {
+        send_byte(33);  // !
+    }
+}

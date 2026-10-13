@@ -26,7 +26,8 @@
 
 use phase_ast::{BinOp, BorrowMode, Domain};
 use phase_pir::{
-    CallArg, PirEntityDef, PirExpr, PirFn, PirFnSig, PirInst, PirLiteral, PirProgram, PirType,
+    CallArg, PirDevice, PirEntityDef, PirExpr, PirFn, PirFnSig, PirInst, PirLiteral, PirProgram,
+    PirReg, PirType, RegRef,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -185,8 +186,118 @@ fn generate_header(program: &PirProgram, stem: &str) -> String {
         out.push('\n');
     }
 
+    for d in &program.devices {
+        out.push_str(&format_device(d));
+    }
+
     out.push_str(&format!("#endif /* {guard} */\n"));
     out
+}
+
+fn reg_c_type(bits: u32) -> &'static str {
+    match bits {
+        8 => "uint8_t",
+        16 => "uint16_t",
+        _ => "uint32_t",
+    }
+}
+
+/// A field's mask, unshifted.
+fn field_mask(lo: u32, hi: u32) -> u64 {
+    let width = hi - lo + 1;
+    if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    }
+}
+
+/// A `device` register map (v2.0) as a CMSIS-style struct laid out at the
+/// declared offsets, and a macro naming the device: the real base address
+/// on a hardware target (`PHASE_TARGET_HW`), a simulated register block in
+/// a host build. `Pos`/`Msk` macros let hand-written C use the same fields.
+fn format_device(d: &PirDevice) -> String {
+    let mut regs: Vec<&PirReg> = d.regs.iter().collect();
+    regs.sort_by_key(|r| r.offset);
+    let ty = format!("phase_dev_{}_regs", d.name);
+    let mut s = format!(
+        "/* --- device {} @ {:#x} ---\n * Registers at their declared offsets. On a hardware target \
+         (PHASE_TARGET_HW)\n * `{}` is the device's real address; in a host build, a simulated \
+         register block\n * starting from the declared reset values. */\n",
+        d.name, d.base, d.name
+    );
+    s.push_str("typedef struct {\n");
+    let mut at = 0u64;
+    let mut pad = 0;
+    for r in &regs {
+        if r.offset > at {
+            s.push_str(&format!("    uint8_t phase_pad{pad}[{}];\n", r.offset - at));
+            pad += 1;
+        }
+        let access = match (r.readable, r.writable) {
+            (true, true) => "read write",
+            (true, false) => "read",
+            _ => "write",
+        };
+        s.push_str(&format!(
+            "    volatile {} {}; /* {:#04x}, {access} */\n",
+            reg_c_type(r.bits),
+            r.name,
+            r.offset
+        ));
+        at = r.offset + u64::from(r.bits / 8);
+    }
+    s.push_str(&format!("}} {ty};\n"));
+    for r in &regs {
+        s.push_str(&format!(
+            "_Static_assert(offsetof({ty}, {}) == {:#x}, \"{}.{} offset\");\n",
+            r.name, r.offset, d.name, r.name
+        ));
+    }
+    s.push_str(&format!(
+        "#ifdef PHASE_TARGET_HW\n#define {} (({ty} *){:#x}u)\n#else\nextern {ty} phase_dev_{}_sim;\n#define {} (&phase_dev_{}_sim)\n#endif\n",
+        d.name, d.base, d.name, d.name, d.name
+    ));
+    for r in &regs {
+        for (f, lo, hi) in &r.fields {
+            s.push_str(&format!(
+                "#define {}_{}_{}_Pos {lo}u\n#define {}_{}_{}_Msk ({:#x}u << {lo}u)\n",
+                d.name,
+                r.name,
+                f,
+                d.name,
+                r.name,
+                f,
+                field_mask(*lo, *hi)
+            ));
+        }
+    }
+    s.push('\n');
+    s
+}
+
+/// `Dev->REG`, or for a field, its value shifted down and masked.
+fn format_reg_read(r: &RegRef) -> String {
+    let reg = format!("{}->{}", r.device, r.reg);
+    match &r.field {
+        None => reg,
+        Some((_, lo, hi)) => format!("(({reg} >> {lo}u) & {:#x}u)", field_mask(*lo, *hi)),
+    }
+}
+
+/// A register write; a field write keeps the register's other bits.
+fn format_reg_write(r: &RegRef, value: &str) -> String {
+    let reg = format!("{}->{}", r.device, r.reg);
+    let ty = reg_c_type(r.bits);
+    match &r.field {
+        None => format!("{reg} = ({ty})({value});"),
+        Some((name, lo, hi)) => {
+            let mask = field_mask(*lo, *hi);
+            format!(
+                "{reg} = ({ty})(({reg} & ~({mask:#x}u << {lo}u)) | ((({ty})({value}) & {mask:#x}u) << {lo}u)); /* field {name} */"
+            )
+        }
+    }
 }
 
 fn format_struct(e: &PirEntityDef) -> String {
@@ -249,6 +360,29 @@ fn generate_source(program: &PirProgram, stem: &str, checked: bool) -> String {
         );
     }
     out.push('\n');
+
+    if !program.devices.is_empty() {
+        out.push_str(
+            "/* Simulated register blocks for a host build, at their reset values. */\n#ifndef PHASE_TARGET_HW\n",
+        );
+        for d in &program.devices {
+            let inits: Vec<String> = d
+                .regs
+                .iter()
+                .filter_map(|r| r.reset.map(|v| format!(".{} = {v:#x}u", r.name)))
+                .collect();
+            let init = if inits.is_empty() {
+                "{0}".to_string()
+            } else {
+                format!("{{ {} }}", inits.join(", "))
+            };
+            out.push_str(&format!(
+                "phase_dev_{}_regs phase_dev_{}_sim = {init};\n",
+                d.name, d.name
+            ));
+        }
+        out.push_str("#endif\n\n");
+    }
 
     if !program.mmio_registers.is_empty() {
         out.push_str("/* Storage for the simulated MMIO registers declared in the header. */\n");
@@ -772,6 +906,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
                 // reordered or eliminated" claim (bug-gallery #7).
                 let reg = match args.first() {
                     Some(CallArg::MmioRegister(r)) => r.clone(),
+                    Some(CallArg::DeviceRegister(r)) => format_reg_read(r),
                     _ => {
                         "/* internal error: volatile_read missing MMIO register arg */".to_string()
                     }
@@ -914,8 +1049,12 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
                     Some(CallArg::Entity(n)) => n.clone(),
                     Some(CallArg::Literal(lit)) => format_literal(lit),
                     Some(CallArg::MmioRegister(r)) => r.clone(),
+                    Some(CallArg::DeviceRegister(r)) => format_reg_read(r),
                     None => "/* internal error: volatile_write missing value arg */".to_string(),
                 };
+                if let Some(CallArg::DeviceRegister(r)) = args.first() {
+                    return format!("{pad}{}\n", format_reg_write(r, &value));
+                }
                 return format!("{pad}{reg} = {value};\n");
             }
             let call_sig = cx.sigs.get(callee.as_str()).copied();
@@ -1005,6 +1144,7 @@ fn format_pir_expr(e: &PirExpr) -> String {
         // read the same register on every loop iteration: the C standard
         // itself forbids hoisting a `volatile` read out of a loop.
         PirExpr::VolatileRead { register } => register.clone(),
+        PirExpr::DeviceRead(r) => format_reg_read(r),
     }
 }
 
@@ -1057,6 +1197,7 @@ fn format_args(
             }
             CallArg::Literal(lit) => parts.push(format_literal(lit)),
             CallArg::MmioRegister(name) => parts.push(name.clone()),
+            CallArg::DeviceRegister(r) => parts.push(format_reg_read(r)),
         }
     }
     parts.join(", ")
@@ -1579,6 +1720,69 @@ mod tests {
         let g = generate_checked(&pir, "t");
         for needle in ["phase_chk_rotate(", "phase_chk_split(", "phase_chk_join("] {
             assert!(g.source.contains(needle), "missing {needle}:\n{}", g.source);
+        }
+    }
+
+    const DEVICE_SRC: &str = r#"
+        device Timer @ 0x40000000 {
+            LOAD:  read write u32 @ 0x00;
+            CTRL:  read write u8 @ 0x08 = 0x2 { EN: bit 0, MODE: bits 1..=2 }
+            CLEAR: write u16 @ 0x0C;
+        }
+        fn main() {
+            volatile_write(Timer.LOAD, 1000);
+            volatile_write(Timer.CTRL.MODE, 3);
+            volatile_write(Timer.CLEAR, 1);
+            while volatile_read(Timer.CTRL.EN) == 0 {
+                volatile_write(Timer.CTRL.EN, 1);
+            }
+            let load: u32 = volatile_read(Timer.LOAD);
+            volatile_write(Timer.LOAD, load);
+        }
+    "#;
+
+    #[test]
+    fn a_device_becomes_a_struct_at_the_declared_offsets() {
+        let g = generate_src(DEVICE_SRC, "t");
+        for needle in [
+            "volatile uint32_t LOAD; /* 0x00, read write */",
+            "uint8_t phase_pad0[4];",
+            "volatile uint8_t CTRL; /* 0x08, read write */",
+            "uint8_t phase_pad1[3];",
+            "volatile uint16_t CLEAR; /* 0x0c, write */",
+            "} phase_dev_Timer_regs;",
+            "_Static_assert(offsetof(phase_dev_Timer_regs, CLEAR) == 0xc, \"Timer.CLEAR offset\");",
+            "#define Timer ((phase_dev_Timer_regs *)0x40000000u)",
+            "#define Timer (&phase_dev_Timer_sim)",
+            "#define Timer_CTRL_MODE_Pos 1u",
+            "#define Timer_CTRL_MODE_Msk (0x3u << 1u)",
+        ] {
+            assert!(
+                g.header.contains(needle),
+                "missing {needle:?} in\n{}",
+                g.header
+            );
+        }
+        assert!(
+            g.source
+                .contains("phase_dev_Timer_regs phase_dev_Timer_sim = { .CTRL = 0x2u };"),
+            "{}",
+            g.source
+        );
+    }
+
+    #[test]
+    fn register_accesses_are_direct_volatile_reads_and_writes() {
+        let g = generate_src(DEVICE_SRC, "t");
+        for needle in [
+            "Timer->LOAD = (uint32_t)(1000);",
+            "Timer->CTRL = (uint8_t)((Timer->CTRL & ~(0x3u << 1u)) | (((uint8_t)(3) & 0x3u) << 1u)); /* field MODE */",
+            "Timer->CLEAR = (uint16_t)(1);",
+            "while ((((Timer->CTRL >> 0u) & 0x1u) == 0)) {",
+            "uint32_t load = Timer->LOAD;",
+            "Timer->LOAD = (uint32_t)(load);",
+        ] {
+            assert!(g.source.contains(needle), "missing {needle:?} in\n{}", g.source);
         }
     }
 }

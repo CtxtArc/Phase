@@ -35,7 +35,9 @@
 //! typestate safety, only enough domain bookkeeping (which domain an
 //! entity is in right now) to pick the correct runtime call for `sync`.
 
-use phase_ast::{BinOp, BorrowMode, BufferLen, Domain, Expr, Item, Program, Stmt, TypeExpr};
+use phase_ast::{
+    BinOp, BorrowMode, BufferLen, DeviceDecl, Domain, Expr, Item, Program, Stmt, TypeExpr,
+};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +121,39 @@ pub enum PirExpr {
     VolatileRead {
         register: String,
     },
+    /// `volatile_read(Dev.REG)` / `volatile_read(Dev.REG.FIELD)` (v2.0).
+    DeviceRead(RegRef),
+}
+
+/// A register (or one field of it) of a declared `device` (v2.0).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegRef {
+    pub device: String,
+    pub reg: String,
+    /// Register width in bits: 8, 16 or 32.
+    pub bits: u32,
+    /// `(name, lowest bit, highest bit)` for a field access.
+    pub field: Option<(String, u32, u32)>,
+}
+
+/// A `device` register map, for codegen to lay out (v2.0).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PirDevice {
+    pub name: String,
+    pub base: u64,
+    pub regs: Vec<PirReg>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PirReg {
+    pub name: String,
+    pub offset: u64,
+    pub bits: u32,
+    pub reset: Option<u64>,
+    pub readable: bool,
+    pub writable: bool,
+    /// `(name, lowest bit, highest bit)`.
+    pub fields: Vec<(String, u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +165,9 @@ pub enum CallArg {
     /// refer to a declared local; it names a simulated memory-mapped
     /// register that codegen materializes as a `volatile` global.
     MmioRegister(String),
+    /// `Dev.REG[.FIELD]` -- a device register argument to `volatile_read`/
+    /// `volatile_write` (v2.0).
+    DeviceRegister(RegRef),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -301,6 +339,8 @@ pub struct PirProgram {
     /// program via `volatile_read`/`volatile_write` (M6), in first-seen
     /// order. Codegen materializes each of these as a `volatile` global.
     pub mmio_registers: Vec<String>,
+    /// Every `device` register map, in declaration order (v2.0).
+    pub devices: Vec<PirDevice>,
 }
 
 /// Map a PHASE scalar type name to its C representation. Returns `None`
@@ -385,6 +425,40 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
     let mut out = PirProgram::default();
 
     for item in &program.items {
+        if let Item::Device(d) = item {
+            out.devices.push(PirDevice {
+                name: d.name.clone(),
+                base: d.base,
+                regs: d
+                    .regs
+                    .iter()
+                    .map(|r| PirReg {
+                        name: r.name.clone(),
+                        offset: r.offset,
+                        bits: r.bits().unwrap_or(32),
+                        reset: r.reset,
+                        readable: r.readable,
+                        writable: r.writable,
+                        fields: r
+                            .fields
+                            .iter()
+                            .map(|f| (f.name.clone(), f.lo, f.hi))
+                            .collect(),
+                    })
+                    .collect(),
+            });
+        }
+    }
+    let devices: HashMap<&str, &DeviceDecl> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Device(d) => Some((d.name.as_str(), d)),
+            _ => None,
+        })
+        .collect();
+
+    for item in &program.items {
         match item {
             Item::Entity(e) => {
                 let mut fields = Vec::new();
@@ -407,6 +481,7 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
             Item::Fn(f) => {
                 let sig = lower_fn_sig(&f.name, &f.params, &f.return_type, &known_entities)?;
                 let mut lowerer = Lowerer {
+                    devices: &devices,
                     known_entities: &known_entities,
                     initial_states: &initial_states,
                     domain_changes: &domain_changes,
@@ -421,6 +496,7 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
                 out.fns.push(PirFn { sig, body });
             }
             Item::State(_) => {} // typestate is compile-time-only; nothing to lower
+            Item::Device(_) => {} // lowered above
         }
     }
 
@@ -468,8 +544,11 @@ fn collect_mmio_registers(fns: &[PirFn]) -> Vec<String> {
                 note_expr(lhs, seen, out);
                 note_expr(rhs, seen, out);
             }
-            PirExpr::Ident(_) | PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => {
-            }
+            PirExpr::Ident(_)
+            | PirExpr::IntLit(_)
+            | PirExpr::FloatLit(_)
+            | PirExpr::BoolLit(_)
+            | PirExpr::DeviceRead(_) => {}
         }
     }
 
@@ -535,6 +614,7 @@ fn lower_fn_sig(
 }
 
 struct Lowerer<'a> {
+    devices: &'a HashMap<&'a str, &'a DeviceDecl>,
     known_entities: &'a HashMap<&'a str, ()>,
     /// machine name -> its initial state
     initial_states: &'a HashMap<String, String>,
@@ -694,7 +774,7 @@ impl<'a> Lowerer<'a> {
                 else_block,
             } => {
                 let context = format!("`if` inside fn '{fn_name}'");
-                let pir_cond = lower_pir_expr(cond, &context)?;
+                let pir_cond = self.lower_pir_expr(cond, &context)?;
 
                 // Domain bookkeeping (not a safety check -- M4's analyzer
                 // already proved both arms agree wherever it matters) --
@@ -726,7 +806,7 @@ impl<'a> Lowerer<'a> {
 
             Stmt::While { cond, body } => {
                 let context = format!("`while` inside fn '{fn_name}'");
-                let pir_cond = lower_pir_expr(cond, &context)?;
+                let pir_cond = self.lower_pir_expr(cond, &context)?;
                 // Same "ran zero or one times" model as M4: keep the
                 // post-body view, matching an `if` with an implicit empty
                 // else that merges into the then-arm's state.
@@ -740,7 +820,7 @@ impl<'a> Lowerer<'a> {
 
             Stmt::Assign { name, value } => {
                 let context = format!("assignment to '{name}' inside fn '{fn_name}'");
-                let pir_value = lower_pir_expr(value, &context)?;
+                let pir_value = self.lower_pir_expr(value, &context)?;
                 out.push(PirInst::Assign {
                     name: name.clone(),
                     value: pir_value,
@@ -881,6 +961,73 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Lower an `if`/`while` condition or a `name = expr;` (M9) right-hand
+    /// side to `PirExpr`. Identifiers, literals, binary comparisons/
+    /// arithmetic, and (M11) `volatile_read(REG @MMIO)` -- see the module doc
+    /// comment for why anything else is a clear error rather than a guess.
+    fn lower_pir_expr(&self, e: &Expr, context: &str) -> Result<PirExpr, PirError> {
+        match e {
+            Expr::Ident(n) => Ok(PirExpr::Ident(n.clone())),
+            Expr::IntLit(n) => Ok(PirExpr::IntLit(*n)),
+            Expr::FloatLit(n) => Ok(PirExpr::FloatLit(*n)),
+            Expr::BoolLit(b) => Ok(PirExpr::BoolLit(*b)),
+            Expr::Binary { op, lhs, rhs } => Ok(PirExpr::Binary {
+                op: *op,
+                lhs: Box::new(self.lower_pir_expr(lhs, context)?),
+                rhs: Box::new(self.lower_pir_expr(rhs, context)?),
+            }),
+            // M11: the M6 analyzer (`check_call`, invoked via `check_expr` on
+            // every `if`/`while` condition and assignment RHS) already
+            // guarantees a `volatile_read` call here has exactly one
+            // @MMIO-tagged register argument -- same trust relationship PIR
+            // already has with `lower_call_args`'s volatile_read handling.
+            Expr::Call { callee, args } if callee == "volatile_read" => match args.as_slice() {
+                [Expr::DomainRef { name, .. }] => Ok(PirExpr::VolatileRead {
+                    register: name.clone(),
+                }),
+                [e] if self.reg_ref(e).is_some() => {
+                    Ok(PirExpr::DeviceRead(self.reg_ref(e).unwrap()))
+                }
+                _ => Err(PirError::UnsupportedExpr {
+                    context: format!("malformed volatile_read in {context}"),
+                }),
+            },
+            other => Err(PirError::UnsupportedExpr {
+                context: format!("expression in {context}: {other:?}"),
+            }),
+        }
+    }
+
+    /// `Dev.REG` / `Dev.REG.FIELD` for a declared device (the analyzer has
+    /// already checked the names and access).
+    fn reg_ref(&self, e: &Expr) -> Option<RegRef> {
+        let (d, reg, field) = match e {
+            Expr::FieldAccess { base, field } => match base.as_ref() {
+                Expr::Ident(d) => (d, field, None),
+                Expr::FieldAccess { base, field: reg } => match base.as_ref() {
+                    Expr::Ident(d) => (d, reg, Some(field)),
+                    _ => return None,
+                },
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let r = self.devices.get(d.as_str())?.reg(reg)?;
+        let field = match field {
+            Some(f) => {
+                let f = r.field(f)?;
+                Some((f.name.clone(), f.lo, f.hi))
+            }
+            None => None,
+        };
+        Some(RegRef {
+            device: d.clone(),
+            reg: r.name.clone(),
+            bits: r.bits().unwrap_or(32),
+            field,
+        })
+    }
+
     fn lower_call_args(&self, args: &[Expr], context: &str) -> Result<Vec<CallArg>, PirError> {
         let mut out = Vec::new();
         for a in args {
@@ -894,6 +1041,9 @@ impl<'a> Lowerer<'a> {
                 // as the register argument to volatile_read/volatile_write,
                 // and that its domain is @MMIO.
                 Expr::DomainRef { name, .. } => CallArg::MmioRegister(name.clone()),
+                e @ Expr::FieldAccess { .. } if self.reg_ref(e).is_some() => {
+                    CallArg::DeviceRegister(self.reg_ref(e).unwrap())
+                }
                 other => {
                     return Err(PirError::UnsupportedExpr {
                         context: format!("argument to '{context}': {other:?}"),
@@ -902,40 +1052,6 @@ impl<'a> Lowerer<'a> {
             });
         }
         Ok(out)
-    }
-}
-
-/// Lower an `if`/`while` condition or a `name = expr;` (M9) right-hand
-/// side to `PirExpr`. Identifiers, literals, binary comparisons/
-/// arithmetic, and (M11) `volatile_read(REG @MMIO)` -- see the module doc
-/// comment for why anything else is a clear error rather than a guess.
-fn lower_pir_expr(e: &Expr, context: &str) -> Result<PirExpr, PirError> {
-    match e {
-        Expr::Ident(n) => Ok(PirExpr::Ident(n.clone())),
-        Expr::IntLit(n) => Ok(PirExpr::IntLit(*n)),
-        Expr::FloatLit(n) => Ok(PirExpr::FloatLit(*n)),
-        Expr::BoolLit(b) => Ok(PirExpr::BoolLit(*b)),
-        Expr::Binary { op, lhs, rhs } => Ok(PirExpr::Binary {
-            op: *op,
-            lhs: Box::new(lower_pir_expr(lhs, context)?),
-            rhs: Box::new(lower_pir_expr(rhs, context)?),
-        }),
-        // M11: the M6 analyzer (`check_call`, invoked via `check_expr` on
-        // every `if`/`while` condition and assignment RHS) already
-        // guarantees a `volatile_read` call here has exactly one
-        // @MMIO-tagged register argument -- same trust relationship PIR
-        // already has with `lower_call_args`'s volatile_read handling.
-        Expr::Call { callee, args } if callee == "volatile_read" => match args.as_slice() {
-            [Expr::DomainRef { name, .. }] => Ok(PirExpr::VolatileRead {
-                register: name.clone(),
-            }),
-            _ => Err(PirError::UnsupportedExpr {
-                context: format!("malformed volatile_read in {context}"),
-            }),
-        },
-        other => Err(PirError::UnsupportedExpr {
-            context: format!("expression in {context}: {other:?}"),
-        }),
     }
 }
 

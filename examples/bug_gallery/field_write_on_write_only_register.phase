@@ -1,0 +1,16 @@
+// Bug gallery #36: setting one bit of a write-only register. Writing a
+// field means read-modify-write -- read the register, change the field,
+// write it back -- and reading a write-only register returns garbage, so
+// the write-back clobbers every other bit. In C this is `CMD |= START;`.
+// Expected: "cannot write field 'Dma.CMD.START': 'Dma.CMD' is write-only, and writing one field reads the register to keep its other bits; write the whole register instead"
+
+device Dma @ 0x40020000 {
+    CMD:    write u32 @ 0x00 { START: bit 0, ABORT: bit 1, CHANNEL: bits 4..=6 }
+    STATUS: read u32 @ 0x04 { BUSY: bit 0 }
+}
+
+fn main() {
+    volatile_write(Dma.CMD, 0x30);       // channel 3
+    // BUG: reads CMD back to keep CHANNEL -- but CMD is write-only.
+    volatile_write(Dma.CMD.START, 1);
+}

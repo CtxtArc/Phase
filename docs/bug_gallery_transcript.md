@@ -88,6 +88,12 @@ OK: examples/sdr_session.phase parsed and passed domain/ownership analysis (2 en
 OK: examples/triple_buffer.phase parsed and passed domain/ownership analysis (1 entity, 2 fns)
 ```
 
+### `examples/uart_hello.phase`
+
+```
+OK: examples/uart_hello.phase parsed and passed domain/ownership analysis (0 entities, 2 fns)
+```
+
 ## Bug gallery (expected to fail, with the exact compiler output)
 
 ### `examples/bug_gallery/aliased_arguments.phase`
@@ -272,6 +278,44 @@ note: 'scratch' is moved to @DMA by 'start_capture' here
 examples/bug_gallery/dma_into_dead_block.phase: 1 error found
 ```
 
+### `examples/bug_gallery/field_value_too_wide.phase`
+
+Bug gallery #37: a value too wide for its field. In C,
+
+```
+error: 16 does not fit in 'Timer.CTRL.PRESCALE' (4 bits, at most 15)
+  --> examples/bug_gallery/field_value_too_wide.phase:14:5
+   |
+14 |     volatile_write(Timer.CTRL.PRESCALE, 16);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: 'Timer.CTRL.PRESCALE' is declared here
+  --> examples/bug_gallery/field_value_too_wide.phase:8:39
+   |
+ 8 |     CTRL: read write u32 @ 0x04 = 0 { PRESCALE: bits 0..=3, ENABLE: bit 4 }
+   |                                       --------
+
+examples/bug_gallery/field_value_too_wide.phase: 1 error found
+```
+
+### `examples/bug_gallery/field_write_on_write_only_register.phase`
+
+Bug gallery #36: setting one bit of a write-only register. Writing a
+
+```
+error: cannot write field 'Dma.CMD.START': 'Dma.CMD' is write-only, and writing one field reads the register to keep its other bits; write the whole register instead
+  --> examples/bug_gallery/field_write_on_write_only_register.phase:15:5
+   |
+15 |     volatile_write(Dma.CMD.START, 1);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: 'Dma.CMD' is declared here
+  --> examples/bug_gallery/field_write_on_write_only_register.phase:8:5
+   |
+ 8 |     CMD:    write u32 @ 0x00 { START: bit 0, ABORT: bit 1, CHANNEL: bits 4..=6 }
+   |     ---
+
+examples/bug_gallery/field_write_on_write_only_register.phase: 1 error found
+```
+
 ### `examples/bug_gallery/forged_typestate.phase`
 
 Bug gallery #8: claiming a typestate with an annotation instead of
@@ -376,6 +420,25 @@ note: 'x' is borrowed by 'view' here
 examples/bug_gallery/move_while_borrowed.phase: 1 error found
 ```
 
+### `examples/bug_gallery/overlapping_registers.phase`
+
+Bug gallery #38: two registers at one address -- a copy-pasted offset in
+
+```
+error: register 'Timer.VALUE' (bytes 0x4..0x8) overlaps 'Timer.CTRL'
+ --> examples/bug_gallery/overlapping_registers.phase:9:5
+  |
+9 |     VALUE: read u32 @ 0x04;
+  |     ^^^^^
+note: 'Timer.CTRL' is declared here
+ --> examples/bug_gallery/overlapping_registers.phase:7:5
+  |
+7 |     CTRL:  read write u32 @ 0x04 { ENABLE: bit 0 }
+  |     ----
+
+examples/bug_gallery/overlapping_registers.phase: 1 error found
+```
+
 ### `examples/bug_gallery/ping_pong_without_swap.phase`
 
 Bug gallery #23: double buffering without trading places. After the
@@ -471,6 +534,25 @@ note: 'frame' is moved to @DMA by 'start_capture' here
    |     ---------------------
 
 examples/bug_gallery/read_while_capture_in_flight.phase: 1 error found
+```
+
+### `examples/bug_gallery/read_write_only_register.phase`
+
+Bug gallery #35: reading a write-only register. Many peripherals read
+
+```
+error: 'Adc.CLEAR' is write-only; it cannot be read
+  --> examples/bug_gallery/read_write_only_register.phase:14:5
+   |
+14 |     let cleared: u32 = volatile_read(Adc.CLEAR);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: 'Adc.CLEAR' is declared here
+  --> examples/bug_gallery/read_write_only_register.phase:8:5
+   |
+ 8 |     CLEAR:  write u32 @ 0x08 { EOC: bit 0, OVR: bit 1 }
+   |     -----
+
+examples/bug_gallery/read_write_only_register.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/refill_while_processing.phase`
@@ -826,6 +908,25 @@ note: 'x' is borrowed by 'a' here
   |     -----------------------
 
 examples/bug_gallery/write_borrow_conflict.phase: 1 error found
+```
+
+### `examples/bug_gallery/write_read_only_register.phase`
+
+Bug gallery #34: clearing a status flag by writing a read-only register.
+
+```
+error: 'Adc.STATUS' is read-only; it cannot be written
+  --> examples/bug_gallery/write_read_only_register.phase:18:5
+   |
+18 |     volatile_write(Adc.STATUS, 0);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: 'Adc.STATUS' is declared here
+  --> examples/bug_gallery/write_read_only_register.phase:8:5
+   |
+ 8 |     STATUS: read u32 @ 0x00 { EOC: bit 0, OVR: bit 1 }
+   |     ------
+
+examples/bug_gallery/write_read_only_register.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/write_through_read_borrow.phase`

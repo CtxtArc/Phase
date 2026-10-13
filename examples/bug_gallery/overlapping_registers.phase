@@ -1,0 +1,15 @@
+// Bug gallery #38: two registers at one address -- a copy-pasted offset in
+// a register map. Every write to one silently changes the other.
+// Expected: "register 'Timer.VALUE' (bytes 0x4..0x8) overlaps 'Timer.CTRL'"
+
+device Timer @ 0x40000000 {
+    LOAD:  read write u32 @ 0x00;
+    CTRL:  read write u32 @ 0x04 { ENABLE: bit 0 }
+    // BUG: copied from CTRL; the data sheet says 0x08.
+    VALUE: read u32 @ 0x04;
+}
+
+fn main() {
+    volatile_write(Timer.LOAD, 1000);
+    volatile_write(Timer.CTRL.ENABLE, 1);
+}

@@ -17,6 +17,15 @@ extern uint32_t _estack; /* top of RAM -- initial stack pointer */
 
 int main(void);
 
+/* ARM semihosting SYS_EXIT (0x18) with ADP_Stopped_ApplicationExit. */
+static void phase_hw_exit(void) {
+    register uint32_t op __asm__("r0") = 0x18u;
+    register uint32_t arg __asm__("r1") = 0x20026u;
+    __asm__ volatile("bkpt 0xAB" : : "r"(op), "r"(arg) : "memory");
+    for (;;) {
+    }
+}
+
 void Reset_Handler(void) {
     for (uint32_t *src = &_sidata, *dst = &_sdata; dst < &_edata;) {
         *dst++ = *src++;
@@ -28,9 +37,11 @@ void Reset_Handler(void) {
     main();
 
     /* main() returning has nowhere to go on bare metal -- there's no OS
-     * to return control to, so just halt. */
-    for (;;) {
-    }
+     * to return control to. Under QEMU with semihosting enabled (as
+     * `phase build --target=mps2-an385 --run` starts it), report a clean
+     * exit to the host; without semihosting the BKPT faults, and the
+     * HardFault handler halts -- the same end state as before. */
+    phase_hw_exit();
 }
 
 static void Default_Handler(void) {

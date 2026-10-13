@@ -1,0 +1,15 @@
+// Bug gallery #35: reading a write-only register. Many peripherals read
+// back zero, the last value on the bus, or something else entirely from a
+// write-only "clear" or "command" register -- a value the code then trusts.
+// Expected: "'Adc.CLEAR' is write-only; it cannot be read"
+
+device Adc @ 0x40010000 {
+    STATUS: read u32 @ 0x00 { EOC: bit 0, OVR: bit 1 }
+    CLEAR:  write u32 @ 0x08 { EOC: bit 0, OVR: bit 1 }
+}
+
+fn main() {
+    volatile_write(Adc.CLEAR, 3);
+    // BUG: CLEAR cannot be read back.
+    let cleared: u32 = volatile_read(Adc.CLEAR);
+}

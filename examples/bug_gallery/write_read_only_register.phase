@@ -1,0 +1,19 @@
+// Bug gallery #34: clearing a status flag by writing a read-only register.
+// Hardware ignores the write, so the flag the code believes it cleared is
+// still set -- and the next poll sees a stale "data ready". The register
+// map says which registers take writes; PHASE holds the code to it.
+// Expected: "'Adc.STATUS' is read-only; it cannot be written"
+
+device Adc @ 0x40010000 {
+    STATUS: read u32 @ 0x00 { EOC: bit 0, OVR: bit 1 }
+    DATA:   read u32 @ 0x04 { VALUE: bits 0..=11 }
+    CLEAR:  write u32 @ 0x08 { EOC: bit 0, OVR: bit 1 }
+}
+
+fn main() {
+    while volatile_read(Adc.STATUS.EOC) == 0 {
+    }
+    let sample: u32 = volatile_read(Adc.DATA.VALUE);
+    // BUG: STATUS is read-only; this peripheral clears flags through CLEAR.
+    volatile_write(Adc.STATUS, 0);
+}

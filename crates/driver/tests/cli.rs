@@ -450,3 +450,47 @@ fn circular_dma_processes_alternating_halves_then_rejoins_the_whole_buffer() {
         );
     }
 }
+
+#[test]
+fn a_device_register_map_builds_and_runs_against_simulated_registers() {
+    let root = workspace_root();
+    let out = phase()
+        .current_dir(std::env::temp_dir())
+        .env_remove("PHASE_RUNTIME_DIR")
+        .args(["build", "--run"])
+        .arg(root.join("examples/uart_hello.phase"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // No C warnings either.
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let header = std::fs::read_to_string(root.join("build/uart_hello.gen.h")).unwrap();
+    assert!(header.contains("} phase_dev_Uart0_regs;"), "{header}");
+}
+
+#[test]
+fn unknown_targets_and_host_only_flags_on_a_hardware_target_are_rejected() {
+    let root = workspace_root();
+    let bogus = phase()
+        .args(["build", "--target=avr"])
+        .arg(root.join("examples/uart_hello.phase"))
+        .output()
+        .unwrap();
+    assert!(!bogus.status.success());
+    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unknown --target 'avr'"));
+    let checked = phase()
+        .args(["build", "--checked", "--target", "mps2-an385"])
+        .arg(root.join("examples/uart_hello.phase"))
+        .output()
+        .unwrap();
+    assert!(!checked.status.success());
+    assert!(String::from_utf8_lossy(&checked.stderr).contains("need a host build"));
+}

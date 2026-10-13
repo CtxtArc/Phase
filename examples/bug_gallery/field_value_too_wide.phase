@@ -1,0 +1,15 @@
+// Bug gallery #37: a value too wide for its field. In C,
+// `CTRL |= 16 << PRESCALE_POS;` with a 4-bit prescaler silently sets the
+// bit above it -- here the timer's enable bit -- instead of dividing by 16.
+// Expected: "16 does not fit in 'Timer.CTRL.PRESCALE' (4 bits, at most 15)"
+
+device Timer @ 0x40000000 {
+    LOAD: read write u32 @ 0x00;
+    CTRL: read write u32 @ 0x04 = 0 { PRESCALE: bits 0..=3, ENABLE: bit 4 }
+}
+
+fn main() {
+    volatile_write(Timer.LOAD, 48000);
+    // BUG: the prescaler is 4 bits wide.
+    volatile_write(Timer.CTRL.PRESCALE, 16);
+}

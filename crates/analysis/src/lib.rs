@@ -30,7 +30,10 @@
 //! * **MMIO** -- `volatile_read`/`volatile_write` take an `@MMIO` register
 //!   reference as their first argument.
 
-use phase_ast::{BorrowMode, BufferLen, Domain, Expr, FnDecl, Item, Program, Span, Stmt, TypeExpr};
+use phase_ast::{
+    BorrowMode, BufferLen, DeviceDecl, Domain, Expr, FnDecl, Item, Program, RegDecl, RegField,
+    Span, Stmt, TypeExpr,
+};
 use std::collections::{HashMap, HashSet};
 
 /// How serious a diagnostic is.
@@ -371,6 +374,8 @@ pub fn analyze_full(program: &Program) -> Report {
         }
     }
 
+    let devices = check_devices(program, &mut errors);
+
     let mut seen_fns: HashMap<&str, Span> = HashMap::new();
     for item in &program.items {
         let (name, span) = match item {
@@ -394,6 +399,7 @@ pub fn analyze_full(program: &Program) -> Report {
         if let Item::Fn(f) = item {
             let mut checker = FnChecker::new(
                 &f.name,
+                &devices,
                 &entity_domains,
                 &fn_sigs,
                 &state_machines,
@@ -412,6 +418,171 @@ pub fn analyze_full(program: &Program) -> Report {
         .into_iter()
         .partition(|e| e.severity == Severity::Warning);
     Report { errors, warnings }
+}
+
+/// Validate every `device` register map (v2.0) and index them by name.
+/// A register is `u8`, `u16` or `u32`, aligned to its width, and doesn't
+/// overlap another; a field lies within its register and doesn't overlap
+/// another field; a reset value fits. Device names share the namespace of
+/// functions, entities and typestate machines.
+fn check_devices<'p>(
+    program: &'p Program,
+    errors: &mut Vec<AnalysisError>,
+) -> HashMap<&'p str, &'p DeviceDecl> {
+    let mut other_names: HashSet<&str> = HashSet::new();
+    for item in &program.items {
+        match item {
+            Item::Fn(f) => other_names.insert(f.name.as_str()),
+            Item::ExternFn(f) => other_names.insert(f.name.as_str()),
+            Item::Entity(e) => other_names.insert(e.name.as_str()),
+            Item::State(s) => other_names.insert(s.name.as_str()),
+            Item::Device(_) => false,
+        };
+    }
+    let mut devices: HashMap<&str, &DeviceDecl> = HashMap::new();
+    for item in &program.items {
+        let Item::Device(d) = item else { continue };
+        if let Some(first) = devices.get(d.name.as_str()) {
+            errors.push(
+                err(format!("device '{}' is declared more than once", d.name))
+                    .at(d.span)
+                    .note(first.span, format!("'{}' is first declared here", d.name)),
+            );
+            continue;
+        }
+        if other_names.contains(d.name.as_str()) {
+            errors.push(
+                err(format!(
+                    "'{}' is declared as a device and as a function, entity or typestate",
+                    d.name
+                ))
+                .at(d.span),
+            );
+        }
+        let mut placed: Vec<(&RegDecl, u64, u64)> = Vec::new();
+        for r in &d.regs {
+            let full = format!("{}.{}", d.name, r.name);
+            if let Some((first, _, _)) = placed.iter().find(|(p, _, _)| p.name == r.name) {
+                errors.push(
+                    err(format!(
+                        "device '{}' declares register '{}' more than once",
+                        d.name, r.name
+                    ))
+                    .at(r.span)
+                    .note(first.span, format!("'{full}' is first declared here")),
+                );
+                continue;
+            }
+            let Some(bits) = r.bits() else {
+                errors.push(
+                    err(format!(
+                        "register '{full}' has type '{}'; a register is u8, u16 or u32",
+                        r.ty
+                    ))
+                    .at(r.span),
+                );
+                continue;
+            };
+            let bytes = u64::from(bits / 8);
+            if r.offset % bytes != 0 {
+                errors.push(
+                    err(format!(
+                        "register '{full}' is at offset {:#x}, which is not aligned to its {bytes} bytes",
+                        r.offset
+                    ))
+                    .at(r.span),
+                );
+            }
+            let (start, end) = (r.offset, r.offset.saturating_add(bytes));
+            if let Some((other, _, _)) = placed.iter().find(|(_, s, e)| start < *e && *s < end) {
+                errors.push(
+                    err(format!(
+                        "register '{full}' (bytes {:#x}..{:#x}) overlaps '{}.{}'",
+                        start, end, d.name, other.name
+                    ))
+                    .at(r.span)
+                    .note(
+                        other.span,
+                        format!("'{}.{}' is declared here", d.name, other.name),
+                    ),
+                );
+            }
+            placed.push((r, start, end));
+            let max = if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            if let Some(v) = r.reset.filter(|v| *v > max) {
+                errors.push(
+                    err(format!(
+                        "reset value {v:#x} does not fit in the {bits}-bit register '{full}'"
+                    ))
+                    .at(r.span),
+                );
+            }
+            let mut fields: Vec<&RegField> = Vec::new();
+            for f in &r.fields {
+                if f.lo > f.hi {
+                    errors.push(
+                        err(format!(
+                            "field '{full}.{}' is `bits {}..={}`; the low bit comes first",
+                            f.name, f.lo, f.hi
+                        ))
+                        .at(f.span),
+                    );
+                    continue;
+                }
+                if f.hi >= bits {
+                    errors.push(
+                        err(format!(
+                            "field '{full}.{}' uses bit {}, outside the {bits}-bit register",
+                            f.name, f.hi
+                        ))
+                        .at(f.span),
+                    );
+                    continue;
+                }
+                if let Some(first) = fields.iter().find(|g| g.name == f.name) {
+                    errors.push(
+                        err(format!(
+                            "register '{full}' declares field '{}' more than once",
+                            f.name
+                        ))
+                        .at(f.span)
+                        .note(first.span, "first declared here"),
+                    );
+                    continue;
+                }
+                if let Some(g) = fields.iter().find(|g| f.lo <= g.hi && g.lo <= f.hi) {
+                    errors.push(
+                        err(format!(
+                            "fields '{full}.{}' and '{full}.{}' share bits",
+                            g.name, f.name
+                        ))
+                        .at(f.span)
+                        .note(g.span, format!("'{}' is declared here", g.name)),
+                    );
+                    continue;
+                }
+                fields.push(f);
+            }
+        }
+        devices.insert(d.name.as_str(), d);
+    }
+    devices
+}
+
+/// `Dev.REG` or `Dev.REG.FIELD` as written.
+struct DeviceRef<'e> {
+    device: &'e str,
+    reg: &'e str,
+    field: Option<&'e str>,
+}
+
+/// A field's width in bits.
+fn field_bits(f: &RegField) -> u32 {
+    f.hi - f.lo + 1
 }
 
 #[derive(Debug, Clone)]
@@ -530,6 +701,8 @@ impl BorrowState {
 
 struct FnChecker<'a> {
     fn_name: String,
+    /// `device` register maps (v2.0), by device name.
+    devices: &'a HashMap<&'a str, &'a DeviceDecl>,
     fn_sigs: &'a HashMap<&'a str, FnSig>,
     state_machines: &'a HashMap<&'a str, HashSet<&'a str>>,
     initial_states: &'a HashMap<&'a str, &'a str>,
@@ -636,6 +809,7 @@ enum MergeKind {
 impl<'a> FnChecker<'a> {
     fn new(
         fn_name: &str,
+        devices: &'a HashMap<&'a str, &'a DeviceDecl>,
         entity_domains: &'a HashMap<&'a str, Option<Domain>>,
         fn_sigs: &'a HashMap<&'a str, FnSig>,
         state_machines: &'a HashMap<&'a str, HashSet<&'a str>>,
@@ -643,6 +817,7 @@ impl<'a> FnChecker<'a> {
     ) -> Self {
         FnChecker {
             fn_name: fn_name.to_string(),
+            devices,
             entity_domains,
             fn_sigs,
             state_machines,
@@ -1818,6 +1993,16 @@ impl<'a> FnChecker<'a> {
     }
 
     fn check_no_shadowing(&self, name: &str, errors: &mut Vec<AnalysisError>) -> bool {
+        if let Some(d) = self.devices.get(name) {
+            errors.push(
+                err(format!(
+                    "'{name}' is a device; choose another name for this local"
+                ))
+                .about(name)
+                .note(d.span, format!("device '{name}' is declared here")),
+            );
+            return false;
+        }
         if let Some(existing) = self.locals.get(name) {
             errors.push(
                 err(format!(
@@ -2136,6 +2321,10 @@ impl<'a> FnChecker<'a> {
             )));
             return;
         }
+        if let Some(target) = self.device_ref(&args[0]) {
+            self.check_device_access(callee, target, args.get(1), errors);
+            return;
+        }
         match args.first() {
             Some(Expr::DomainRef { domain, .. }) if *domain == Domain::Mmio => {}
             Some(Expr::DomainRef { name, domain }) => {
@@ -2146,10 +2335,155 @@ impl<'a> FnChecker<'a> {
             }
             Some(_) => {
                 errors.push(err(format!(
-                    "'{callee}' requires an @MMIO register reference (e.g. `REG_NAME @MMIO`) as its first argument"
+                    "'{callee}' requires a register as its first argument: a device register (`Uart0.STATE`, or a field, `Uart0.STATE.TXFULL`) or a simulated one (`REG_NAME @MMIO`)"
                 )));
             }
             None => unreachable!("arity already checked above"),
+        }
+    }
+
+    /// `Dev.REG` or `Dev.REG.FIELD`, where `Dev` is a declared device (and
+    /// not shadowed -- device names cannot be reused for locals): the
+    /// device and the path after it. `None` if `e` doesn't start with a
+    /// device name.
+    fn device_ref<'e>(&self, e: &'e Expr) -> Option<DeviceRef<'e>> {
+        match e {
+            Expr::FieldAccess { base, field } => match base.as_ref() {
+                Expr::Ident(d) => self.devices.get(d.as_str()).map(|_| DeviceRef {
+                    device: d,
+                    reg: field,
+                    field: None,
+                }),
+                Expr::FieldAccess { base, field: reg } => match base.as_ref() {
+                    Expr::Ident(d) => self.devices.get(d.as_str()).map(|_| DeviceRef {
+                        device: d,
+                        reg,
+                        field: Some(field),
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Resolve a device reference to its register (and field), reporting
+    /// an unknown name.
+    fn resolve_device_ref(
+        &self,
+        r: &DeviceRef,
+        errors: &mut Vec<AnalysisError>,
+    ) -> Option<(&'a RegDecl, Option<&'a RegField>)> {
+        let dev = self.devices.get(r.device)?;
+        let Some(reg) = dev.reg(r.reg) else {
+            let known: Vec<&str> = dev.regs.iter().map(|r| r.name.as_str()).collect();
+            errors.push(
+                err(format!(
+                    "device '{}' has no register '{}' (it has {})",
+                    r.device,
+                    r.reg,
+                    known.join(", ")
+                ))
+                .note(dev.span, format!("'{}' is declared here", r.device)),
+            );
+            return None;
+        };
+        let Some(fname) = r.field else {
+            return Some((reg, None));
+        };
+        match reg.field(fname) {
+            Some(f) => Some((reg, Some(f))),
+            None => {
+                let known: Vec<&str> = reg.fields.iter().map(|f| f.name.as_str()).collect();
+                errors.push(
+                    err(format!(
+                        "register '{}.{}' has no field '{fname}'{}",
+                        r.device,
+                        r.reg,
+                        if known.is_empty() {
+                            " (it declares no fields)".to_string()
+                        } else {
+                            format!(" (it has {})", known.join(", "))
+                        }
+                    ))
+                    .note(
+                        reg.span,
+                        format!("'{}.{}' is declared here", r.device, r.reg),
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    /// v2.0: `volatile_read(Dev.REG[.FIELD])` needs a readable register;
+    /// `volatile_write(Dev.REG[.FIELD], v)` a writable one -- and, for a
+    /// field, a readable one too, since the other bits are kept by reading
+    /// the register first. A literal value must fit the register or field.
+    fn check_device_access(
+        &mut self,
+        callee: &str,
+        r: DeviceRef,
+        value: Option<&Expr>,
+        errors: &mut Vec<AnalysisError>,
+    ) {
+        let Some((reg, field)) = self.resolve_device_ref(&r, errors) else {
+            return;
+        };
+        let name = match field {
+            Some(f) => format!("{}.{}.{}", r.device, reg.name, f.name),
+            None => format!("{}.{}", r.device, reg.name),
+        };
+        let reg_name = format!("{}.{}", r.device, reg.name);
+        let declared = format!("'{reg_name}' is declared here");
+        if callee == "volatile_read" {
+            if !reg.readable {
+                errors.push(
+                    err(format!("'{reg_name}' is write-only; it cannot be read"))
+                        .note(reg.span, declared),
+                );
+            }
+            return;
+        }
+        if !reg.writable {
+            errors.push(
+                err(format!("'{reg_name}' is read-only; it cannot be written"))
+                    .note(reg.span, declared),
+            );
+            return;
+        }
+        if field.is_some() && !reg.readable {
+            errors.push(
+                err(format!(
+                    "cannot write field '{name}': '{reg_name}' is write-only, and writing one field reads the register to keep its other bits; write the whole register instead"
+                ))
+                .note(reg.span, declared),
+            );
+            return;
+        }
+        let bits = field.map(field_bits).or(reg.bits()).unwrap_or(32);
+        let max = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        match value {
+            Some(Expr::IntLit(v)) if *v < 0 || *v as u64 > max => {
+                errors.push(
+                    err(format!(
+                        "{v} does not fit in '{name}' ({bits} bit{}, at most {max})",
+                        if bits == 1 { "" } else { "s" }
+                    ))
+                    .note(
+                        field.map_or(reg.span, |f| f.span),
+                        format!("'{name}' is declared here"),
+                    ),
+                );
+            }
+            Some(Expr::IntLit(_)) => {}
+            Some(v) => self.check_expr(v, errors),
+            None => {}
         }
     }
 
@@ -2158,6 +2492,9 @@ impl<'a> FnChecker<'a> {
     /// plain scalar -- an entity has no scalar value to read.
     fn check_value_ident(&self, name: &str, errors: &mut Vec<AnalysisError>) {
         match self.locals.get(name) {
+            None if self.devices.contains_key(name) => errors.push(err(format!(
+                "'{name}' is a device, not a value; access its registers with volatile_read/volatile_write"
+            ))),
             None => errors.push(err(format!("unknown name '{name}'")).about(name)),
             Some(var) if var.is_tracked() => errors.push(
                 err(format!(
@@ -2246,6 +2583,16 @@ impl<'a> FnChecker<'a> {
         match expr {
             Expr::Call { callee, args } => self.check_call(callee, args, errors),
             Expr::Ident(name) => self.check_value_ident(name, errors),
+            Expr::FieldAccess { .. } if self.device_ref(expr).is_some() => {
+                let r = self.device_ref(expr).unwrap();
+                let path = match r.field {
+                    Some(f) => format!("{}.{}.{f}", r.device, r.reg),
+                    None => format!("{}.{}", r.device, r.reg),
+                };
+                errors.push(err(format!(
+                    "'{path}' is a device register; read it with volatile_read({path})"
+                )));
+            }
             Expr::FieldAccess { base, .. } => match base.as_ref() {
                 Expr::Ident(name) => match self.locals.get(name) {
                     None => errors.push(err(format!("unknown name '{name}'")).about(name)),
@@ -3184,7 +3531,10 @@ mod tests {
                 let status: u32 = volatile_read(x);
             }
         "#;
-        assert_single_error_containing(src, "'volatile_read' requires an @MMIO register reference");
+        assert_single_error_containing(
+            src,
+            "'volatile_read' requires a register as its first argument",
+        );
     }
 
     #[test]
@@ -4997,5 +5347,171 @@ mod ring_tests {
             &with("fn main() { buffer<u8, 8> ring @RAM; let n: u32 = 0; while n < 2 { split ring into lo, hi; n = n + 1; } }"),
             "entity 'ring' is split on one path but not the other; a `while` body must leave every entity exactly as it found it",
         );
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    fn check(src: &str) -> Result<(), Vec<AnalysisError>> {
+        analyze(&phase_parser::parse(src).expect("fixture must parse"))
+    }
+
+    fn rejects(src: &str, needle: &str) {
+        let errs = check(src).expect_err("expected a rejection");
+        assert!(
+            errs.iter().any(|e| e.message.contains(needle)),
+            "no error containing {needle:?} in {:#?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    const UART: &str = r#"
+        device Uart0 @ 0x40004000 {
+            DATA:  read write u32 @ 0x00;
+            STATE: read u32 @ 0x04 { TXFULL: bit 0, RXFULL: bit 1 }
+            CTRL:  read write u32 @ 0x08 = 0 { TX_EN: bit 0, MODE: bits 4..=6 }
+            KICK:  write u8 @ 0x0C { GO: bit 0 }
+        }
+    "#;
+
+    fn with(body: &str) -> String {
+        format!("{UART}\n{body}")
+    }
+
+    #[test]
+    fn reads_writes_and_fields_are_accepted() {
+        check(&with(
+            "fn send(c: u32) { while volatile_read(Uart0.STATE.TXFULL) == 1 { } volatile_write(Uart0.DATA, c); }
+             fn main() {
+                 volatile_write(Uart0.CTRL.MODE, 7);
+                 volatile_write(Uart0.KICK, 255);
+                 let s: u32 = volatile_read(Uart0.STATE);
+                 send(s);
+                 if volatile_read(Uart0.CTRL.TX_EN) == 0 { volatile_write(Uart0.CTRL.TX_EN, 1); }
+             }",
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn unknown_registers_and_fields_are_named() {
+        rejects(
+            &with("fn main() { let s: u32 = volatile_read(Uart0.STATUS); }"),
+            "device 'Uart0' has no register 'STATUS' (it has DATA, STATE, CTRL, KICK)",
+        );
+        rejects(
+            &with("fn main() { let s: u32 = volatile_read(Uart0.STATE.TXFUL); }"),
+            "register 'Uart0.STATE' has no field 'TXFUL' (it has TXFULL, RXFULL)",
+        );
+        rejects(
+            &with("fn main() { let s: u32 = volatile_read(Uart0.DATA.LOW); }"),
+            "register 'Uart0.DATA' has no field 'LOW' (it declares no fields)",
+        );
+    }
+
+    #[test]
+    fn access_modes_are_enforced() {
+        rejects(
+            &with("fn main() { volatile_write(Uart0.STATE, 0); }"),
+            "'Uart0.STATE' is read-only; it cannot be written",
+        );
+        rejects(
+            &with("fn main() { volatile_write(Uart0.STATE.TXFULL, 0); }"),
+            "'Uart0.STATE' is read-only; it cannot be written",
+        );
+        rejects(
+            &with("fn main() { let k: u32 = volatile_read(Uart0.KICK); }"),
+            "'Uart0.KICK' is write-only; it cannot be read",
+        );
+        rejects(
+            &with("fn main() { volatile_write(Uart0.KICK.GO, 1); }"),
+            "cannot write field 'Uart0.KICK.GO': 'Uart0.KICK' is write-only",
+        );
+    }
+
+    #[test]
+    fn literal_values_must_fit() {
+        rejects(
+            &with("fn main() { volatile_write(Uart0.CTRL.MODE, 8); }"),
+            "8 does not fit in 'Uart0.CTRL.MODE' (3 bits, at most 7)",
+        );
+        rejects(
+            &with("fn main() { volatile_write(Uart0.CTRL.TX_EN, 2); }"),
+            "2 does not fit in 'Uart0.CTRL.TX_EN' (1 bit, at most 1)",
+        );
+        rejects(
+            &with("fn main() { volatile_write(Uart0.KICK, 256); }"),
+            "256 does not fit in 'Uart0.KICK' (8 bits, at most 255)",
+        );
+    }
+
+    #[test]
+    fn registers_and_devices_are_not_values() {
+        rejects(
+            &with("fn main() { let s: u32 = 0; s = Uart0.STATE; }"),
+            "'Uart0.STATE' is a device register; read it with volatile_read(Uart0.STATE)",
+        );
+        rejects(
+            &with("fn main() { let s: u32 = 0; s = Uart0; }"),
+            "'Uart0' is a device, not a value",
+        );
+        rejects(
+            &with("fn main() { let Uart0: u32 = 0; }"),
+            "'Uart0' is a device; choose another name",
+        );
+    }
+
+    #[test]
+    fn register_maps_are_validated() {
+        rejects(
+            "device D @ 0 { A: read u32 @ 0x02; } fn main() {}",
+            "register 'D.A' is at offset 0x2, which is not aligned to its 4 bytes",
+        );
+        rejects(
+            "device D @ 0 { A: read u32 @ 0x00; B: read u16 @ 0x02; } fn main() {}",
+            "register 'D.B' (bytes 0x2..0x4) overlaps 'D.A'",
+        );
+        rejects(
+            "device D @ 0 { A: read f32 @ 0; } fn main() {}",
+            "register 'D.A' has type 'f32'; a register is u8, u16 or u32",
+        );
+        rejects(
+            "device D @ 0 { A: read u8 @ 0 { X: bit 8 } } fn main() {}",
+            "field 'D.A.X' uses bit 8, outside the 8-bit register",
+        );
+        rejects(
+            "device D @ 0 { A: read u32 @ 0 { X: bits 5..=3 } } fn main() {}",
+            "field 'D.A.X' is `bits 5..=3`; the low bit comes first",
+        );
+        rejects(
+            "device D @ 0 { A: read u32 @ 0 { X: bits 0..=3, Y: bit 3 } } fn main() {}",
+            "fields 'D.A.X' and 'D.A.Y' share bits",
+        );
+        rejects(
+            "device D @ 0 { A: read u32 @ 0; A: read u32 @ 4; } fn main() {}",
+            "device 'D' declares register 'A' more than once",
+        );
+        rejects(
+            "device D @ 0 { A: read u8 @ 0 = 0x100; } fn main() {}",
+            "reset value 0x100 does not fit in the 8-bit register 'D.A'",
+        );
+        rejects(
+            "device D @ 0 { A: read u8 @ 0; } device D @ 4 { B: read u8 @ 0; } fn main() {}",
+            "device 'D' is declared more than once",
+        );
+        rejects(
+            "device main @ 0 { A: read u8 @ 0; } fn main() {}",
+            "'main' is declared as a device and as a function",
+        );
+    }
+
+    #[test]
+    fn simulated_registers_still_work_alongside_devices() {
+        check(&with(
+            "fn main() { let s: u32 = volatile_read(LEGACY @MMIO); volatile_write(Uart0.DATA, s); }",
+        ))
+        .unwrap();
     }
 }

@@ -198,12 +198,71 @@ pub struct ExternFnDecl {
     pub return_type: Option<TypeExpr>,
 }
 
+/// One bit field of a register: `TXFULL: bit 0` or `BAUD: bits 4..=11`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegField {
+    pub name: String,
+    pub span: Span,
+    /// Lowest and highest bit, inclusive.
+    pub lo: u32,
+    pub hi: u32,
+}
+
+/// A memory-mapped register of a `device` (v2.0):
+/// `CTRL: read write u32 @ 0x08 = 0 { TX_EN: bit 0 }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegDecl {
+    pub name: String,
+    pub span: Span,
+    pub readable: bool,
+    pub writable: bool,
+    /// The register's type name (`u8`, `u16` or `u32`).
+    pub ty: String,
+    /// Byte offset from the device's base address.
+    pub offset: u64,
+    /// Value after reset, if declared (initializes the simulated register).
+    pub reset: Option<u64>,
+    pub fields: Vec<RegField>,
+}
+
+/// `device Uart0 @ 0x40004000 { .. }` (v2.0): a peripheral's register map.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceDecl {
+    pub name: String,
+    pub span: Span,
+    pub base: u64,
+    pub regs: Vec<RegDecl>,
+}
+
+impl DeviceDecl {
+    pub fn reg(&self, name: &str) -> Option<&RegDecl> {
+        self.regs.iter().find(|r| r.name == name)
+    }
+}
+
+impl RegDecl {
+    /// Width in bits, for the types a register may have.
+    pub fn bits(&self) -> Option<u32> {
+        match self.ty.as_str() {
+            "u8" => Some(8),
+            "u16" => Some(16),
+            "u32" => Some(32),
+            _ => None,
+        }
+    }
+
+    pub fn field(&self, name: &str) -> Option<&RegField> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Entity(EntityDecl),
     State(StateDecl),
     Fn(FnDecl),
     ExternFn(ExternFnDecl),
+    Device(DeviceDecl),
 }
 
 #[derive(Debug, Clone, PartialEq)]

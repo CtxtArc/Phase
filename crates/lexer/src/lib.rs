@@ -41,28 +41,29 @@ pub enum TokenKind {
     KwFalse,
 
     // Punctuation
-    LBrace, // {
-    RBrace, // }
-    LParen, // (
-    RParen, // )
-    LAngle, // <
-    RAngle, // >
-    Colon,  // :
-    Semi,   // ;
-    Comma,  // ,
-    Dot,    // .
-    Arrow,  // ->
-    At,     // @
-    Eq,     // =
-    EqEq,   // ==
-    NotEq,  // !=
-    LtEq,   // <=
-    GtEq,   // >=
-    Plus,   // +
-    Minus,  // -
-    Star,   // *
-    Slash,  // /
-    Bang,   // !
+    LBrace,   // {
+    RBrace,   // }
+    LParen,   // (
+    RParen,   // )
+    LAngle,   // <
+    RAngle,   // >
+    Colon,    // :
+    Semi,     // ;
+    Comma,    // ,
+    Dot,      // .
+    DotDotEq, // ..=
+    Arrow,    // ->
+    At,       // @
+    Eq,       // =
+    EqEq,     // ==
+    NotEq,    // !=
+    LtEq,     // <=
+    GtEq,     // >=
+    Plus,     // +
+    Minus,    // -
+    Star,     // *
+    Slash,    // /
+    Bang,     // !
 
     Eof,
 }
@@ -251,6 +252,29 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_number(&mut self, start: Span) -> Result<TokenKind, LexError> {
+        // `0x4000_4000`: hexadecimal, `_` allowed as a separator (v2.0, for
+        // register addresses).
+        if self.peek() == Some('0') && matches!(self.peek2(), Some('x' | 'X')) {
+            self.bump();
+            self.bump();
+            let mut s = String::new();
+            while let Some(c) = self.peek() {
+                if c.is_ascii_hexdigit() {
+                    s.push(c);
+                    self.bump();
+                } else if c == '_' {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            return i64::from_str_radix(&s, 16)
+                .map(TokenKind::Int)
+                .map_err(|_| LexError {
+                    message: format!("invalid hexadecimal literal '0x{s}'"),
+                    span: start,
+                });
+        }
         let mut s = String::new();
         let mut is_float = false;
         while let Some(c) = self.peek() {
@@ -339,7 +363,15 @@ impl<'a> Lexer<'a> {
             ':' => Colon,
             ';' => Semi,
             ',' => Comma,
-            '.' => Dot,
+            '.' => {
+                if self.peek() == Some('.') && self.peek2() == Some('=') {
+                    self.bump();
+                    self.bump();
+                    DotDotEq
+                } else {
+                    Dot
+                }
+            }
             '@' => At,
             '=' => {
                 if self.peek() == Some('=') {
@@ -505,5 +537,26 @@ mod tests {
         assert_eq!((toks[1].span.line, toks[1].span.col), (2, 1));
         // and is one char wide
         assert_eq!((toks[1].span.end_line, toks[1].span.end_col), (2, 2));
+    }
+
+    #[test]
+    fn hex_literals_and_inclusive_ranges() {
+        let toks = tokenize("0x4000_4000 0XfF 4..=11 a.b").unwrap();
+        let kinds: Vec<_> = toks.into_iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Int(0x4000_4000),
+                TokenKind::Int(255),
+                TokenKind::Int(4),
+                TokenKind::DotDotEq,
+                TokenKind::Int(11),
+                TokenKind::Ident("a".into()),
+                TokenKind::Dot,
+                TokenKind::Ident("b".into()),
+                TokenKind::Eof,
+            ]
+        );
+        assert!(tokenize("0x").unwrap_err().message.contains("hexadecimal"));
     }
 }

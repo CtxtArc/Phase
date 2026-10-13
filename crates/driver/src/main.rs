@@ -44,6 +44,13 @@ options:
                                program's extern fns instead of requiring
                                runtime/<stem>_extern.c; scalar results come
                                from a PRNG seeded by PHASE_STUB_SEED
+  --target=host|mps2-an385     (build) host (default): compile with `cc` and
+                               simulate devices; mps2-an385: cross-compile
+                               for the ARM MPS2 AN385 board (Cortex-M3) with
+                               arm-none-eabi-gcc into <stem>.elf, devices at
+                               their real addresses
+  --run                        (build) run the result: the host binary, or the
+                               .elf under qemu-system-arm -M mps2-an385
 
 `build` writes <project>/build/<stem>.gen.{{c,h}} and <project>/build/<stem>,
 where <project> is the nearest directory at or above <file> that contains a
@@ -146,8 +153,11 @@ fn main() -> ExitCode {
     let mut color_mode = "auto".to_string();
     let mut checked = false;
     let mut stub_externs = false;
+    let mut target = "host".to_string();
+    let mut run = false;
     let mut positional: Vec<String> = Vec::new();
-    for arg in env::args().skip(1) {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
         if let Some(v) = arg.strip_prefix("--error-format=") {
             format = match v {
                 "human" => ErrorFormat::Human,
@@ -161,6 +171,18 @@ fn main() -> ExitCode {
             checked = true;
         } else if arg == "--stub-externs" {
             stub_externs = true;
+        } else if arg == "--run" {
+            run = true;
+        } else if arg == "--target" || arg.starts_with("--target=") {
+            let v = match arg.strip_prefix("--target=") {
+                Some(v) => v.to_string(),
+                None => args.next().unwrap_or_default(),
+            };
+            if !matches!(v.as_str(), "host" | "mps2-an385") {
+                eprintln!("error: unknown --target '{v}' (expected host or mps2-an385)");
+                return ExitCode::FAILURE;
+            }
+            target = v;
         } else if let Some(v) = arg.strip_prefix("--color=") {
             if !matches!(v, "auto" | "always" | "never") {
                 eprintln!("error: unknown --color '{v}' (expected auto, always, or never)");
@@ -342,8 +364,27 @@ fn main() -> ExitCode {
             //     never bodies -- spec §3.9). Only linked if the program
             //     actually declares any `extern fn`, and only if a
             //     matching file exists.
-            let generic_runtime_c = runtime_dir.join("phase_runtime.c");
             let needs_extern_runtime = !pir.extern_fns.is_empty();
+            if target == "mps2-an385" {
+                if checked || stub_externs {
+                    eprintln!(
+                        "error: --checked and --stub-externs need a host build (the checker and \
+                         the stubs print and exit through libc); build without --target to use them"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                return build_mps2(&BuildMps2 {
+                    stem: &stem,
+                    runtime_dir: &runtime_dir,
+                    build_dir: &build_dir,
+                    source_path: &source_path,
+                    needs_extern_runtime,
+                    extern_count: pir.extern_fns.len(),
+                    run,
+                });
+            }
+
+            let generic_runtime_c = runtime_dir.join("phase_runtime.c");
             let extern_runtime_c = if stub_externs {
                 let stubs = build_dir.join(format!("{stem}.stubs.c"));
                 if let Err(e) = fs::write(&stubs, phase_codegen_c::generate_stubs(&pir, &stem)) {
@@ -407,6 +448,9 @@ fn main() -> ExitCode {
                         eprint!("{}", String::from_utf8_lossy(&output.stderr));
                     }
                     println!("OK: built {binary_path}");
+                    if run {
+                        return run_and_report(Command::new(&binary_path), &binary_path);
+                    }
                     ExitCode::SUCCESS
                 }
                 Ok(output) => {
@@ -426,4 +470,143 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Run a built program with inherited stdio, and exit with its status.
+fn run_and_report(mut cmd: Command, what: &str) -> ExitCode {
+    match cmd.status() {
+        Ok(st) if st.success() => ExitCode::SUCCESS,
+        Ok(st) => {
+            eprintln!("error: '{what}' exited with {st}");
+            ExitCode::from(st.code().map_or(1, |c| c.clamp(1, 255) as u8))
+        }
+        Err(e) => {
+            eprintln!("error: could not run '{what}': {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+struct BuildMps2<'a> {
+    stem: &'a str,
+    runtime_dir: &'a Path,
+    build_dir: &'a Path,
+    source_path: &'a str,
+    needs_extern_runtime: bool,
+    extern_count: usize,
+    run: bool,
+}
+
+/// `--target=mps2-an385`: cross-compile the generated C with the
+/// bare-metal runtime in runtime/hw/ (vector table and startup, linker
+/// script, real-hardware `sync` waits) for the ARM MPS2 AN385 board, and
+/// optionally run it on QEMU's model of that board. `PHASE_TARGET_HW` puts
+/// every `device` at its declared address.
+fn build_mps2(b: &BuildMps2) -> ExitCode {
+    let hw = b.runtime_dir.join("hw");
+    let needed = [
+        "startup.c",
+        "phase_runtime_hw.c",
+        "libc_min.c",
+        "mps2an385.ld",
+    ];
+    if let Some(missing) = needed.iter().find(|f| !hw.join(f).is_file()) {
+        eprintln!(
+            "error: --target=mps2-an385 needs '{}', which was not found",
+            hw.join(missing).display()
+        );
+        return ExitCode::FAILURE;
+    }
+    // A target-specific extern runtime wins over the host one.
+    let extern_c = [
+        hw.join(format!("{}_extern.c", b.stem)),
+        b.runtime_dir.join(format!("{}_extern.c", b.stem)),
+    ]
+    .into_iter()
+    .find(|p| p.is_file());
+    if b.needs_extern_runtime && extern_c.is_none() {
+        eprintln!(
+            "error: this program declares {} extern fn(s) but neither '{}' nor '{}' was found -- \
+             a bare-metal build needs freestanding implementations of them",
+            b.extern_count,
+            hw.join(format!("{}_extern.c", b.stem)).display(),
+            b.runtime_dir.join(format!("{}_extern.c", b.stem)).display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let cc = env::var("PHASE_ARM_CC").unwrap_or_else(|_| "arm-none-eabi-gcc".to_string());
+    let elf = b.build_dir.join(format!("{}.elf", b.stem));
+    let mut cmd = Command::new(&cc);
+    cmd.args([
+        "-mcpu=cortex-m3",
+        "-mthumb",
+        "-ffreestanding",
+        "-nostdlib",
+        "-nostartfiles",
+        "-O1",
+        "-std=c11",
+        "-Wall",
+        "-DPHASE_TARGET_HW=1",
+    ])
+    .arg("-T")
+    .arg(hw.join("mps2an385.ld"))
+    .arg("-I")
+    .arg(b.build_dir)
+    .arg("-I")
+    .arg(b.runtime_dir)
+    .arg("-I")
+    .arg(&hw)
+    .arg("-o")
+    .arg(&elf)
+    .arg(hw.join("startup.c"))
+    .arg(hw.join("phase_runtime_hw.c"))
+    .arg(hw.join("libc_min.c"))
+    .arg(b.source_path);
+    if b.needs_extern_runtime {
+        cmd.args(extern_c.iter());
+    }
+    cmd.arg("-lgcc");
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            if !out.stderr.is_empty() {
+                eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            }
+        }
+        Ok(out) => {
+            eprintln!("error: {cc} failed to compile the generated C:");
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!(
+                "error: could not invoke '{cc}' ({e}); --target=mps2-an385 needs the GNU Arm \
+                 Embedded toolchain on PATH (or PHASE_ARM_CC set to it)"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    let elf_s = elf.display().to_string();
+    let qemu_args = [
+        "-M",
+        "mps2-an385",
+        "-nographic",
+        "-monitor",
+        "none",
+        "-semihosting-config",
+        "enable=on,target=native",
+        "-kernel",
+    ];
+    if !b.run {
+        println!("OK: built {elf_s} for mps2-an385");
+        println!(
+            "    run it: qemu-system-arm {} {elf_s}",
+            qemu_args.join(" ")
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!("OK: built {elf_s} for mps2-an385; running it on qemu-system-arm");
+    let qemu = env::var("PHASE_QEMU").unwrap_or_else(|_| "qemu-system-arm".to_string());
+    let mut cmd = Command::new(&qemu);
+    cmd.args(qemu_args).arg(&elf);
+    run_and_report(cmd, &qemu)
 }

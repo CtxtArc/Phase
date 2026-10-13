@@ -143,14 +143,158 @@ impl Parser {
             TokenKind::KwState => self.parse_state_decl().map(Item::State),
             TokenKind::KwExtern => self.parse_extern_fn_decl().map(Item::ExternFn),
             TokenKind::KwFn => self.parse_fn_decl().map(Item::Fn),
+            // `device` is a keyword only here, at the start of an item, so
+            // existing programs may keep using it as a name.
+            TokenKind::Ident(w) if w == "device" => self.parse_device_decl().map(Item::Device),
             other => Err(ParseError {
                 message: format!(
-                    "expected item (entity/state/fn/extern fn), found {:?}",
+                    "expected item (entity/state/fn/extern fn/device), found {:?}",
                     other
                 ),
                 span: self.peek_span(),
             }),
         }
+    }
+
+    /// A non-negative integer literal (decimal or hex), e.g. an address.
+    fn expect_uint(&mut self, what: &str) -> Result<u64, ParseError> {
+        match self.peek().clone() {
+            TokenKind::Int(n) if n >= 0 => {
+                self.bump();
+                Ok(n as u64)
+            }
+            other => Err(ParseError {
+                message: format!("expected {what} (an integer), found {other:?}"),
+                span: self.peek_span(),
+            }),
+        }
+    }
+
+    /// The identifier `word`, which is a keyword only in this position.
+    fn expect_word(&mut self, word: &str) -> Result<(), ParseError> {
+        match self.peek() {
+            TokenKind::Ident(w) if w == word => {
+                self.bump();
+                Ok(())
+            }
+            other => Err(ParseError {
+                message: format!("expected '{word}', found {other:?}"),
+                span: self.peek_span(),
+            }),
+        }
+    }
+
+    /// ```text
+    /// device Uart0 @ 0x40004000 {
+    ///     DATA:  read write u32 @ 0x00;
+    ///     STATE: read u32 @ 0x04 { TXFULL: bit 0, RXFULL: bit 1 }
+    ///     CTRL:  read write u32 @ 0x08 = 0 { TX_EN: bit 0, BAUD: bits 4..=11 }
+    /// }
+    /// ```
+    fn parse_device_decl(&mut self) -> Result<DeviceDecl, ParseError> {
+        self.expect_word("device")?;
+        let name_span = self.peek_span();
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::At)?;
+        let base = self.expect_uint("a base address")?;
+        self.expect(TokenKind::LBrace)?;
+        let mut regs = Vec::new();
+        while !self.at(&TokenKind::RBrace) {
+            regs.push(self.parse_reg_decl()?);
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(DeviceDecl {
+            name,
+            span: name_span,
+            base,
+            regs,
+        })
+    }
+
+    fn parse_reg_decl(&mut self) -> Result<RegDecl, ParseError> {
+        let span = self.peek_span();
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::Colon)?;
+        let mut readable = false;
+        let mut writable = false;
+        loop {
+            match self.peek() {
+                TokenKind::KwRead if !readable => readable = true,
+                TokenKind::KwWrite if !writable => writable = true,
+                _ => break,
+            }
+            self.bump();
+        }
+        if !readable && !writable {
+            return Err(ParseError {
+                message: format!(
+                    "register '{name}' needs an access mode: `read`, `write`, or `read write`"
+                ),
+                span: self.peek_span(),
+            });
+        }
+        let ty = self.expect_ident()?;
+        self.expect(TokenKind::At)?;
+        let offset = self.expect_uint("a register offset")?;
+        let reset = if self.at(&TokenKind::Eq) {
+            self.bump();
+            Some(self.expect_uint("a reset value")?)
+        } else {
+            None
+        };
+        let mut fields = Vec::new();
+        if self.at(&TokenKind::LBrace) {
+            self.bump();
+            while !self.at(&TokenKind::RBrace) {
+                let fspan = self.peek_span();
+                let fname = self.expect_ident()?;
+                self.expect(TokenKind::Colon)?;
+                let (lo, hi) = match self.peek() {
+                    TokenKind::Ident(w) if w == "bit" => {
+                        self.bump();
+                        let b = self.expect_uint("a bit number")?;
+                        (b, b)
+                    }
+                    TokenKind::Ident(w) if w == "bits" => {
+                        self.bump();
+                        let lo = self.expect_uint("a bit number")?;
+                        self.expect(TokenKind::DotDotEq)?;
+                        let hi = self.expect_uint("a bit number")?;
+                        (lo, hi)
+                    }
+                    other => {
+                        return Err(ParseError {
+                            message: format!(
+                                "expected `bit N` or `bits LO..=HI` for field '{fname}', found {other:?}"
+                            ),
+                            span: self.peek_span(),
+                        })
+                    }
+                };
+                fields.push(RegField {
+                    name: fname,
+                    span: fspan,
+                    lo: lo.min(u32::MAX as u64) as u32,
+                    hi: hi.min(u32::MAX as u64) as u32,
+                });
+                if self.at(&TokenKind::Comma) {
+                    self.bump();
+                }
+            }
+            self.expect(TokenKind::RBrace)?;
+        } else {
+            self.expect(TokenKind::Semi)?;
+        }
+        Ok(RegDecl {
+            name,
+            span,
+            readable,
+            writable,
+            ty,
+            offset,
+            reset,
+            fields,
+        })
     }
 
     fn parse_entity_decl(&mut self) -> Result<EntityDecl, ParseError> {
@@ -1329,5 +1473,39 @@ mod tests {
     fn unknown_domain_is_a_parse_error() {
         let err = parse("fn main() { move x -> @NOT_A_DOMAIN; }").unwrap_err();
         assert!(err.message.contains("unknown domain"));
+    }
+
+    #[test]
+    fn device_register_maps_are_parsed() {
+        let p = parse(
+            "device Uart0 @ 0x40004000 {
+                DATA: read write u32 @ 0x00;
+                STATE: read u32 @ 0x04 { TXFULL: bit 0, RXFULL: bit 1 }
+                CTRL: write read u32 @ 0x08 = 0x3 { BAUD: bits 4..=11 }
+            }
+            fn main() { let device: u32 = 0; }",
+        )
+        .unwrap();
+        let Item::Device(d) = &p.items[0] else {
+            panic!()
+        };
+        assert_eq!(
+            (d.name.as_str(), d.base, d.regs.len()),
+            ("Uart0", 0x4000_4000, 3)
+        );
+        let st = d.reg("STATE").unwrap();
+        assert!(st.readable && !st.writable);
+        assert_eq!((st.offset, st.field("RXFULL").unwrap().lo), (4, 1));
+        let ctrl = d.reg("CTRL").unwrap();
+        assert!(ctrl.readable && ctrl.writable);
+        assert_eq!(ctrl.reset, Some(3));
+        let baud = ctrl.field("BAUD").unwrap();
+        assert_eq!((baud.lo, baud.hi), (4, 11));
+    }
+
+    #[test]
+    fn a_register_without_an_access_mode_is_an_error() {
+        let e = parse("device D @ 0 { R: u32 @ 0; }").unwrap_err();
+        assert!(e.message.contains("needs an access mode"), "{}", e.message);
     }
 }
