@@ -1,0 +1,24 @@
+extern fn start_circular(lo: write buffer<f32, 128> @RAM -> @DMA,
+                         hi: write buffer<f32, 128> @RAM -> @DMA);
+extern fn wait_half(h: buffer<f32, 128> @DMA -> @RAM);
+extern fn requeue(h: write buffer<f32, 128> @RAM -> @DMA);
+extern fn stop_circular(lo: buffer<f32, 128> @DMA -> @RAM,
+                        hi: buffer<f32, 128> @DMA -> @RAM);
+extern fn process(h: read buffer<f32, 128> @RAM);
+extern fn summarize(x: read buffer<f32, 256> @RAM);
+
+fn main() {
+    buffer<f32, 256> ring @RAM;
+    let n: u32 = 0;
+
+    split ring into lo, hi;    // two halves, each tracked on its own
+    start_circular(lo, hi);
+    while n < 2 {
+        wait_half(lo);  process(hi);  requeue(lo);
+        wait_half(hi);  process(hi);  requeue(hi);
+        n = n + 1;
+    }
+    stop_circular(lo, hi);
+    join lo, hi into ring;     // whole again
+    summarize(ring);
+}

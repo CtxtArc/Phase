@@ -1,0 +1,12 @@
+extern fn fill(dst: write buffer<f32, 256> @RAM);
+extern fn plot(x: read buffer<f32, 256> @RAM);
+extern fn normalize(x: write buffer<f32, 256> @RAM);
+
+fn main() {
+    buffer<f32, 256> data @RAM;
+    fill(data);
+    let view = borrow data read;   // a read-only view
+    plot(view);
+    normalize(view);               // writes through a read-only view
+    release view;
+}

@@ -4,6 +4,26 @@ All notable changes to PHASE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **[PHASE in 15 minutes](docs/tutorial/README.md)**: a tutorial from a
+  first buffer to DMA across calls, borrows, ping-pong streaming,
+  circular DMA, typestate and hardware registers. Its 20 programs are in
+  `docs/tutorial/`; the page is generated from them by
+  `scripts/render_tutorial.py`, which runs every command it shows, and CI
+  fails if it no longer matches the compiler.
+- `--stub-externs` builds print each extern call, its arguments, and the
+  result the stub returns.
+
+### Fixed
+
+- Generated C no longer warns about a `let` whose value is never used, or
+  (with GCC) about a buffer only ever filled by hardware.
+- Bug gallery #1 had a second, unrelated error (a missing `sync` at the
+  end of `main`).
+
 ## [2.0.0] — 2026-10-13
 
 The hardware path becomes a compiler feature: a peripheral's register map

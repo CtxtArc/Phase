@@ -412,7 +412,9 @@ fn generate_source(program: &PirProgram, stem: &str, checked: bool) -> String {
     out.push_str("#include \"phase_runtime.h\"\n");
     // A `let` whose value is never used is legal PHASE; don't let it
     // surface as a C warning about code the user didn't write.
-    out.push_str("#if defined(__GNUC__)\n#pragma GCC diagnostic ignored \"-Wunused-variable\"\n#pragma GCC diagnostic ignored \"-Wunused-but-set-variable\"\n#endif\n");
+    // Nor a buffer only ever filled by hardware: C can't see the DMA
+    // engine write it, so GCC thinks it is read uninitialized.
+    out.push_str("#if defined(__GNUC__)\n#pragma GCC diagnostic ignored \"-Wunused-variable\"\n#endif\n#if defined(__GNUC__) && !defined(__clang__)\n#pragma GCC diagnostic ignored \"-Wunused-but-set-variable\"\n#pragma GCC diagnostic ignored \"-Wmaybe-uninitialized\"\n#endif\n");
     if checked {
         out.push_str("#include \"phase_check.h\"\n");
     }

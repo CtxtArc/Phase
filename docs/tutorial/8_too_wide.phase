@@ -1,0 +1,12 @@
+device Timer @ 0x40000000 {
+    LOAD:   read write u32 @ 0x00;
+    CTRL:   read write u32 @ 0x04 = 0 { ENABLE: bit 0, PRESCALE: bits 4..=7 }
+    STATUS: read u32 @ 0x08 { EXPIRED: bit 0 }
+}
+
+fn main() {
+    volatile_write(Timer.LOAD, 48000);
+    volatile_write(Timer.CTRL.PRESCALE, 16);
+    volatile_write(Timer.CTRL.ENABLE, 1);
+    let expired: u32 = volatile_read(Timer.STATUS.EXPIRED);
+}

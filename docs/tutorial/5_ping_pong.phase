@@ -1,0 +1,22 @@
+extern fn start_capture(dst: write buffer<f32, 256> @RAM -> @DMA);
+extern fn process(x: read buffer<f32, 256> @RAM);
+
+fn wait_capture(b: buffer<f32, 256> @DMA -> @RAM) {
+    sync(b);
+}
+
+fn main() {
+    buffer<f32, 256> ping @RAM;
+    buffer<f32, 256> pong @RAM;
+    let n: u32 = 0;
+
+    start_capture(ping);
+    while n < 3 {
+        wait_capture(ping);    // ping is ready
+        start_capture(pong);   // fill pong meanwhile
+        process(ping);
+        swap ping, pong;       // pong's capture is the next one to wait for
+        n = n + 1;
+    }
+    wait_capture(ping);
+}

@@ -1,0 +1,8 @@
+extern fn fill(dst: write buffer<f32, 256> @RAM);
+extern fn average(src: read buffer<f32, 256> @RAM) -> f32;
+
+fn main() {
+    buffer<f32, 256> samples @RAM;
+    fill(samples);
+    let mean: f32 = average(samples);
+}

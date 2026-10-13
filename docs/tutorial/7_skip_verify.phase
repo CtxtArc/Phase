@@ -1,0 +1,18 @@
+entity Packet : @RAM {
+    len: u32
+}
+
+state Packet {
+    Raw -> Parsed -> Checked
+}
+
+extern fn receive() -> Packet<Raw>;
+extern fn parse(p: Packet<Raw>) -> Packet<Parsed>;
+extern fn verify(p: Packet<Parsed>) -> Packet<Checked>;
+extern fn deliver(p: Packet<Checked>);
+
+fn main() {
+    let raw: Packet<Raw> = receive();
+    let parsed: Packet<Parsed> = parse(raw);
+    deliver(parsed);    // skipped verify
+}

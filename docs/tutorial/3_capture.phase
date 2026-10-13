@@ -1,0 +1,16 @@
+extern fn start_capture(dst: write buffer<f32, 256> @RAM -> @DMA);
+extern fn make_window(w: write buffer<f32, 256> @RAM);
+extern fn apply(x: read buffer<f32, 256> @RAM, w: read buffer<f32, 256> @RAM);
+
+fn wait_capture(b: buffer<f32, 256> @DMA -> @RAM) {
+    sync(b);
+}
+
+fn main() {
+    buffer<f32, 256> frame @RAM;
+    buffer<f32, 256> window @RAM;
+    start_capture(frame);    // frame -> @DMA
+    make_window(window);     // CPU work while the transfer runs
+    wait_capture(frame);     // frame -> @RAM
+    apply(frame, window);
+}

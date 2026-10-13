@@ -8,6 +8,10 @@
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
 </p>
 
+**New here? [PHASE in 15 minutes](docs/tutorial/README.md)** — from a
+first buffer to circular DMA, packet protocols and hardware registers,
+with every program ready to compile.
+
 ## The problem: hardware moves fast, software is blind
 
 In embedded and systems engineering, hardware components (ADCs, DACs,
@@ -277,11 +281,13 @@ demos/
   m6_volatile_proof/   before/after proof that a C compiler really does delete non-volatile writes
 
 docs/
+  tutorial/                   PHASE in 15 minutes: the programs, and the page generated from them
   bug_gallery_transcript.md   generated: real compiler output for every example
   security_mapping.md         the CWE/CVE write-up
 
 scripts/
   capture_bug_gallery.sh      regenerates the transcript from real compiler output
+  render_tutorial.py          regenerates docs/tutorial/README.md by running its programs
   build_hw_demo.sh            runs both hardware examples with --target=mps2-an385 --run
 ```
 
@@ -492,8 +498,6 @@ support, and makes read-only data passed to a parameter with no access
 mode an error — on top of 1.4's ring buffers and 1.3's runtime-checked
 builds and fuzzing (see [`CHANGELOG.md`](CHANGELOG.md)). Likely next:
 
-- **A tutorial** — "PHASE in 15 minutes", from a first buffer to a
-  circular DMA pipeline.
 - **M12 — An LLVM backend**, removing the dependency on an external `cc`
   ([`phase_specification.md`](phase_specification.md) §9).
 - **A real DMA controller** — the ping-pong pipeline on a board with one

@@ -54,6 +54,10 @@ jobs:
           if-no-files-found: ignore
       - name: Editor grammar highlights every example
         run: python3 editors/vscode/test/grammar_check.py
+      - name: Tutorial is up to date with the compiler
+        run: |
+          python3 scripts/render_tutorial.py
+          git diff --exit-code docs/tutorial/README.md
       - name: Bug-gallery transcript is up to date
         run: |
           ./scripts/capture_bug_gallery.sh

@@ -1,0 +1,8 @@
+extern fn average(src: read buffer<f32, 256> @RAM) -> f32;
+
+fn main() {
+    buffer<f32, 256> samples @RAM;
+    move samples -> @DMA;
+    let mean: f32 = average(samples);   // reads it mid-transfer
+    sync(samples);
+}

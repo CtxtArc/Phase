@@ -1,0 +1,4 @@
+fn main() {
+    buffer<f32, 256> samples @RAM;
+    move samples -> @DMA;
+}
