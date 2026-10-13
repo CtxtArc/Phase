@@ -199,6 +199,21 @@ pub enum PirInst {
         state: String,
         initial: String,
     },
+    /// `rotate a, b, c;` -- each name takes the next one's storage.
+    Rotate {
+        names: Vec<String>,
+    },
+    /// `split parent into parts..;` -- the parts are equal, consecutive
+    /// slices of the parent's storage.
+    Split {
+        parent: String,
+        parts: Vec<String>,
+    },
+    /// `join parts.. into parent;` -- the parent is whole again.
+    Join {
+        parent: String,
+        parts: Vec<String>,
+    },
     /// `swap a, b;` -- exchange which storage the two buffer names refer to.
     Swap {
         a: String,
@@ -599,6 +614,45 @@ impl<'a> Lowerer<'a> {
 
             Stmt::Destroy { name } => {
                 out.push(PirInst::EntityDestroy { name: name.clone() });
+                Ok(())
+            }
+
+            Stmt::Rotate { names } => {
+                let ds: Vec<Option<Domain>> =
+                    names.iter().map(|n| self.domains.get(n).copied()).collect();
+                for (i, n) in names.iter().enumerate() {
+                    match ds[(i + 1) % names.len()] {
+                        Some(d) => self.domains.insert(n.clone(), d),
+                        None => self.domains.remove(n),
+                    };
+                }
+                out.push(PirInst::Rotate {
+                    names: names.clone(),
+                });
+                Ok(())
+            }
+
+            Stmt::Split { parent, parts } => {
+                if let Some(d) = self.domains.get(parent).copied() {
+                    for p in parts {
+                        self.domains.insert(p.clone(), d);
+                    }
+                }
+                out.push(PirInst::Split {
+                    parent: parent.clone(),
+                    parts: parts.clone(),
+                });
+                Ok(())
+            }
+
+            Stmt::Join { parent, parts } => {
+                if let Some(d) = parts.first().and_then(|p| self.domains.get(p)).copied() {
+                    self.domains.insert(parent.clone(), d);
+                }
+                out.push(PirInst::Join {
+                    parent: parent.clone(),
+                    parts: parts.clone(),
+                });
                 Ok(())
             }
 

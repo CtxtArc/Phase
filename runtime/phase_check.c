@@ -30,6 +30,10 @@ typedef struct {
     size_t bytes;
     int domain;
     int destroyed;
+    /* Split into parts: set aside (lookups skip it -- its first part shares
+     * its address) until the parts are joined back. */
+    int split;
+    int frame; /* the call depth it was split at */
     int in_use;
 } Storage;
 
@@ -104,9 +108,29 @@ static void borrows_of(Key key, int any_frame, int *readers, int *writer) {
     }
 }
 
+/* The set-aside record of a buffer this frame split under `name`, if any.
+ * The name matters: a split buffer's first part shares its address (and a
+ * part can itself be split), so several records can sit at one key. A
+ * split buffer cannot be swapped or rotated, so its name stays put. */
+static Storage *find_split(Key key, const char *name) {
+    for (int i = 0; i < MAX_STORAGES; i++) {
+        if (storages[i].in_use && storages[i].split && storages[i].key == key &&
+            storages[i].frame == depth && strcmp(storages[i].name, name) == 0) {
+            return &storages[i];
+        }
+    }
+    return NULL;
+}
+
 static Storage *find(Key key, const char *name) {
     for (int i = 0; i < MAX_STORAGES; i++) {
-        if (storages[i].in_use && storages[i].key == key) {
+        if (storages[i].in_use && !storages[i].split && storages[i].key == key) {
+            /* A split buffer's first part shares its address. If the name
+             * used is the split buffer's own, it is being used whole. */
+            if (find_split(key, name)) {
+                fail("'%s' is split into parts; it cannot be used whole until they are joined",
+                     name);
+            }
             return &storages[i];
         }
     }
@@ -133,13 +157,13 @@ static void no_borrows(const Storage *s, const char *name, const char *what) {
 void phase_chk_create(const void *storage, size_t bytes, int domain, const char *name) {
     Key key = KEY(storage);
     for (int i = 0; i < MAX_STORAGES; i++) {
-        if (storages[i].in_use && storages[i].key == key) {
+        if (storages[i].in_use && !storages[i].split && storages[i].key == key) {
             fail("buffer '%s' created over live storage of '%s'", name, storages[i].name);
         }
     }
     for (int i = 0; i < MAX_STORAGES; i++) {
         if (!storages[i].in_use) {
-            storages[i] = (Storage){key, name, bytes, domain, 0, 1};
+            storages[i] = (Storage){key, name, bytes, domain, 0, 0, 0, 1};
             return;
         }
     }
@@ -148,6 +172,30 @@ void phase_chk_create(const void *storage, size_t bytes, int domain, const char 
 
 void phase_chk_scope_end(const void *storage, const char *name) {
     Key key = KEY(storage);
+    /* A buffer still split at its end: its parts carried (and were checked
+     * for) its storage, and have already gone out of scope. Its storage
+     * ends under the name it was declared with, which `swap`/`rotate` may
+     * have moved off it before the split -- so when no live buffer is left
+     * at this address, the split record here is the one ending. */
+    Storage *sp = find_split(key, name);
+    if (!sp) {
+        int live_here = 0;
+        for (int i = 0; i < MAX_STORAGES; i++) {
+            if (storages[i].in_use && !storages[i].split && storages[i].key == key) {
+                live_here = 1;
+            }
+        }
+        for (int i = 0; i < MAX_STORAGES && !live_here && !sp; i++) {
+            if (storages[i].in_use && storages[i].split && storages[i].key == key &&
+                storages[i].frame == depth) {
+                sp = &storages[i];
+            }
+        }
+    }
+    if (sp) {
+        sp->in_use = 0;
+        return;
+    }
     Storage *s = find(key, name);
     if (!s->destroyed && device_owned(s->domain)) {
         fail("'%s' goes out of scope while owned by %s", name, dom_name(s->domain));
@@ -195,6 +243,61 @@ void phase_chk_swap(const void *a, const void *b, const char *a_name, const char
     Storage *sb = live(KEY(b), b_name, "swap it");
     no_borrows(sa, a_name, "swap it");
     no_borrows(sb, b_name, "swap it");
+}
+
+void phase_chk_rotate(const void *p, const char *name) {
+    Storage *s = live(KEY(p), name, "rotate it");
+    no_borrows(s, name, "rotate it");
+}
+
+void phase_chk_split(const void *parent, const char *name, int n, const void *const *parts,
+                     const char *const *part_names, size_t part_bytes) {
+    Storage *s = live(KEY(parent), name, "split it");
+    no_borrows(s, name, "split it");
+    if (part_bytes * (size_t)n != s->bytes) {
+        fail("'%s' (%zu bytes) split into %d parts of %zu bytes", name, s->bytes, n, part_bytes);
+    }
+    int domain = s->domain;
+    s->split = 1;
+    s->frame = depth;
+    s->name = name; /* the record may carry the name of a buffer swapped away */
+    for (int i = 0; i < n; i++) {
+        if (KEY(parts[i]) != KEY(parent) + (Key)i * part_bytes) {
+            fail("part '%s' of '%s' is not at its slice of the buffer", part_names[i], name);
+        }
+        phase_chk_create(parts[i], part_bytes, domain, part_names[i]);
+    }
+}
+
+void phase_chk_join(const void *parent, const char *name, int n, const void *const *parts,
+                    const char *const *part_names) {
+    Key key = KEY(parent);
+    Storage *s = find_split(key, name);
+    if (!s) {
+        fail("join into '%s', which is not split", name);
+    }
+    size_t part_bytes = s->bytes / (size_t)n;
+    int domain = -1;
+    for (int i = 0; i < n; i++) {
+        /* Each slot must hold the original slice: a part swapped away
+         * cannot be joined back in its place. */
+        if (KEY(parts[i]) != key + (Key)i * part_bytes) {
+            fail("'%s' does not hold slice %d of '%s'", part_names[i], i, name);
+        }
+        Storage *p = live(KEY(parts[i]), part_names[i], "join it");
+        no_borrows(p, part_names[i], "join it");
+        if (domain < 0) {
+            domain = p->domain;
+        } else if (p->domain != domain) {
+            fail("joining '%s' while its parts are in %s and %s", name, dom_name(domain),
+                 dom_name(p->domain));
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        find(KEY(parts[i]), part_names[i])->in_use = 0;
+    }
+    s->split = 0;
+    s->domain = domain;
 }
 
 int phase_chk_borrow(const void *p, int write, const char *name) {

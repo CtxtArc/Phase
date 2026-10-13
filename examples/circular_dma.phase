@@ -1,0 +1,52 @@
+// v1.4 example: circular DMA with half-transfer interrupts -- the way most
+// microcontroller ADC drivers (STM32 and friends) stream continuously.
+//
+// The DMA engine runs in circular mode over one buffer, forever: it fills
+// the first half (half-transfer interrupt), then the second half
+// (transfer-complete interrupt), then wraps around to the first. The CPU
+// must only touch the half the engine just finished, and hand it back
+// before the engine wraps around to it.
+//
+// `split ring into lo, hi` makes the two halves separately tracked
+// buffers, so the checker can tell which half the CPU may touch at each
+// point; `ring` itself is off limits until `join lo, hi into ring`.
+
+entity Sample : @RAM {
+    value: f32
+}
+
+// Start circular mode over both halves: the engine owns both.
+extern fn start_circular(lo: write buffer<Sample, 64> @RAM -> @DMA,
+                         hi: write buffer<Sample, 64> @RAM -> @DMA);
+// Wait for the half-transfer / transfer-complete interrupt for this half:
+// the engine has filled it and moved on to the other one.
+extern fn wait_half(h: buffer<Sample, 64> @DMA -> @RAM);
+// Hand the half back before the engine wraps around to it.
+extern fn requeue(h: write buffer<Sample, 64> @RAM -> @DMA);
+extern fn stop_circular(lo: buffer<Sample, 64> @DMA -> @RAM,
+                        hi: buffer<Sample, 64> @DMA -> @RAM);
+
+extern fn process(h: read buffer<Sample, 64> @RAM);
+extern fn summarize(x: read buffer<Sample, 128> @RAM);
+
+fn main() {
+    buffer<Sample, 128> ring @RAM;
+    let n: u32 = 0;
+
+    split ring into lo, hi;
+    start_circular(lo, hi);
+
+    while n < 4 {
+        wait_half(lo);      // half-transfer: the engine is filling hi now
+        process(lo);
+        requeue(lo);
+        wait_half(hi);      // transfer complete: the engine wrapped to lo
+        process(hi);
+        requeue(hi);
+        n = n + 1;
+    }
+
+    stop_circular(lo, hi);
+    join lo, hi into ring;
+    summarize(ring);        // the whole buffer is the CPU's again
+}

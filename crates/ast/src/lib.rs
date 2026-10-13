@@ -238,6 +238,15 @@ pub enum Stmt {
     /// to, along with everything known about it (domain, history). The
     /// building block for ping-pong double buffering.
     Swap { a: String, b: String },
+    /// `rotate a, b, c;` (v1.4) -- each name takes the next one's storage,
+    /// and the last takes the first's: a ring of buffers. `swap a, b` is
+    /// `rotate a, b`.
+    Rotate { names: Vec<String> },
+    /// `split buf into lo, hi;` (v1.4) -- view `buf` as equal, independently
+    /// tracked parts; `buf` itself is unusable until they are joined.
+    Split { parent: String, parts: Vec<String> },
+    /// `join lo, hi into buf;` (v1.4) -- the inverse of `split`.
+    Join { parent: String, parts: Vec<String> },
     /// A bare expression statement, e.g. a function call: `fir_filter(a, b);`
     Expr(Expr),
     /// `return expr?;`

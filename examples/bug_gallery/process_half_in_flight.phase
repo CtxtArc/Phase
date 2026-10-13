@@ -1,0 +1,26 @@
+// Bug gallery #30: processing the wrong half of a circular DMA buffer.
+// After the half-transfer interrupt the engine has moved on to `hi` and is
+// filling it -- reading `hi` now reads a half-written block. The classic
+// off-by-one-half bug in circular ADC drivers.
+// Expected: "entity 'hi' is in domain @DMA but 'process' expects @RAM"
+
+extern fn start_circular(lo: write buffer<f32, 64> @RAM -> @DMA,
+                         hi: write buffer<f32, 64> @RAM -> @DMA);
+extern fn wait_half(h: buffer<f32, 64> @DMA -> @RAM);
+extern fn requeue(h: write buffer<f32, 64> @RAM -> @DMA);
+extern fn process(h: read buffer<f32, 64> @RAM);
+
+fn main() {
+    buffer<f32, 128> ring @RAM;
+    split ring into lo, hi;
+    start_circular(lo, hi);
+
+    wait_half(lo);
+    // BUG: lo is the half that's ready; the engine is writing hi.
+    process(hi);
+    requeue(lo);
+
+    wait_half(lo);
+    wait_half(hi);
+    join lo, hi into ring;
+}

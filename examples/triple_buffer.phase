@@ -1,0 +1,48 @@
+// v1.4 example: triple buffering with `rotate`.
+//
+// Ping-pong (examples/ping_pong.phase) keeps one capture in flight while
+// the CPU processes the other buffer. When processing time jitters, a
+// third buffer lets the DMA engine stay two frames ahead:
+//
+//   at the top of every iteration:  a in flight, b in flight, c free
+//   wait for a, start c, process a  ->  a free, b in flight, c in flight
+//   rotate a, b, c                  ->  a in flight, b in flight, c free
+//
+// `rotate a, b, c` gives each name the next one's buffer (a <- b <- c <- a),
+// so the loop body ends exactly as it began -- the loop invariant the
+// checker requires -- with every frame still waited for before use.
+
+entity Sample : @RAM {
+    value: f32
+}
+
+// Program the DMA engine to fill `dst` with the next frame, and return.
+extern fn start_capture(dst: write buffer<Sample, 128> @RAM -> @DMA);
+extern fn process(frame: read buffer<Sample, 128> @RAM);
+
+fn wait_capture(b: buffer<Sample, 128> @DMA -> @RAM) {
+    sync(b);
+}
+
+fn main() {
+    buffer<Sample, 128> a @RAM;
+    buffer<Sample, 128> b @RAM;
+    buffer<Sample, 128> c @RAM;
+    let n: u32 = 0;
+
+    start_capture(a);       // fill the pipeline: two frames in flight
+    start_capture(b);
+
+    while n < 6 {
+        wait_capture(a);    // the oldest frame is ready
+        start_capture(c);   // keep two in flight
+        process(a);
+        rotate a, b, c;     // a <- b, b <- c, c <- a
+        n = n + 1;
+    }
+
+    wait_capture(a);        // drain the two frames still in flight
+    process(a);
+    wait_capture(b);
+    process(b);
+}

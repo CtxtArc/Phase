@@ -443,3 +443,135 @@ fn correct_typestate_use_runs_clean() {
     );
     assert_eq!(code, 0, "{stderr}");
 }
+
+// ---- v1.4: rotate, split, join ------------------------------------------------
+
+const HALVES: &str = r#"
+    extern fn start4(dst: write buffer<u8, 4> @RAM -> @DMA);
+    extern fn wait4(dst: buffer<u8, 4> @DMA -> @RAM);
+    extern fn look4(x: read buffer<u8, 4> @RAM);
+    extern fn look8(x: read buffer<u8, 8> @RAM);
+    extern fn start8(dst: write buffer<u8, 8> @RAM -> @DMA);
+    extern fn wait8(dst: buffer<u8, 8> @DMA -> @RAM);
+"#;
+
+fn halves(body: &str) -> String {
+    format!("{HALVES}\n{body}")
+}
+
+#[test]
+fn using_the_whole_buffer_while_split_is_caught() {
+    caught(
+        "rt_split_whole",
+        &halves("fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; start4(hi); look8(ring); wait4(hi); join lo, hi into ring; }"),
+        "'ring' is split into parts; it cannot be used whole until they are joined",
+    );
+}
+
+#[test]
+fn joining_while_a_half_is_in_flight_is_caught() {
+    caught(
+        "rt_join_inflight",
+        &halves("fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; start4(hi); join lo, hi into ring; }"),
+        "joining 'ring' while its parts are in @RAM and @DMA",
+    );
+}
+
+#[test]
+fn joining_swapped_parts_is_caught() {
+    caught(
+        "rt_join_swapped",
+        &halves("fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; swap lo, hi; join lo, hi into ring; }"),
+        "'lo' does not hold slice 0 of 'ring'",
+    );
+}
+
+#[test]
+fn a_half_left_with_the_engine_at_scope_end_is_caught() {
+    caught(
+        "rt_half_leak",
+        &halves("fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; start4(lo); }"),
+        "'lo' goes out of scope while owned by @DMA",
+    );
+}
+
+#[test]
+fn rotating_a_borrowed_buffer_is_caught() {
+    caught(
+        "rt_rotate_borrowed",
+        &halves("fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; buffer<u8, 8> c @RAM; let r = borrow b read; rotate a, b, c; release r; }"),
+        "'b' has a live borrow; cannot rotate it",
+    );
+}
+
+#[test]
+fn circular_and_triple_buffer_patterns_run_clean() {
+    let (code, stderr) = run_unanalyzed(
+        "rt_ring_ok",
+        &halves(
+            r#"
+            fn main() {
+                buffer<u8, 8> ring @RAM;
+                let n: u32 = 0;
+                split ring into lo, hi;
+                start4(lo); start4(hi);
+                while n < 3 {
+                    wait4(lo); look4(lo); start4(lo);
+                    wait4(hi); look4(hi); start4(hi);
+                    n = n + 1;
+                }
+                wait4(lo); wait4(hi);
+                swap lo, hi; swap lo, hi;
+                join lo, hi into ring;
+                look8(ring);
+
+                buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; buffer<u8, 8> c @RAM;
+                let m: u32 = 0;
+                start8(a); start8(b);
+                while m < 4 { wait8(a); start8(c); look8(a); rotate a, b, c; m = m + 1; }
+                wait8(a); wait8(b);
+            }
+            "#,
+        ),
+        1,
+    );
+    assert_eq!(code, 0, "{stderr}");
+}
+
+#[test]
+fn nested_splits_and_a_callee_reusing_the_split_buffers_name_run_clean() {
+    // A split buffer, its first part, and that part's own first part all
+    // share one address; the checker tells them apart by name and frame.
+    // Found by phase-fuzz (seed 918000581).
+    let (code, stderr) = run_unanalyzed(
+        "rt_ring_nested",
+        &halves(
+            r#"
+            extern fn look2(x: read buffer<u8, 2> @RAM);
+            fn peek(ring: read buffer<u8, 2> @RAM) { look2(ring); }
+            fn main() {
+                buffer<u8, 8> ring @RAM;
+                split ring into lo, hi;
+                split lo into a, b;
+                peek(a);
+                look4(hi);
+                join a, b into lo;
+                join lo, hi into ring;
+                look8(ring);
+
+                buffer<u8, 8> outer @RAM;
+                split outer into x, y;
+                split x into p, q;
+
+                // Split under a name that rotate moved onto other storage
+                // (seed 918000661): it still ends cleanly unjoined.
+                buffer<u8, 8> r1 @RAM; buffer<u8, 8> r2 @RAM;
+                rotate r1, r2;
+                split r1 into u, v;
+            }
+            "#,
+        ),
+        1,
+    );
+    assert_eq!(code, 0, "{stderr}");
+}

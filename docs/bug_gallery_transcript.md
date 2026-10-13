@@ -16,6 +16,12 @@ above it. Regenerate after any analyzer change with:
 OK: examples/branching_pipeline.phase parsed and passed domain/ownership analysis (0 entities, 1 fn)
 ```
 
+### `examples/circular_dma.phase`
+
+```
+OK: examples/circular_dma.phase parsed and passed domain/ownership analysis (1 entity, 1 fn)
+```
+
 ### `examples/counting_loop.phase`
 
 ```
@@ -74,6 +80,12 @@ OK: examples/radio_pipeline.phase parsed and passed domain/ownership analysis (1
 
 ```
 OK: examples/sdr_session.phase parsed and passed domain/ownership analysis (2 entities, 1 fn)
+```
+
+### `examples/triple_buffer.phase`
+
+```
+OK: examples/triple_buffer.phase parsed and passed domain/ownership analysis (1 entity, 2 fns)
 ```
 
 ## Bug gallery (expected to fail, with the exact compiler output)
@@ -299,6 +311,52 @@ error: no legal transition from @DMA to @DEVICE in the signature of 'forward' (p
 examples/bug_gallery/illegal_signature_transition.phase: 1 error found
 ```
 
+### `examples/bug_gallery/join_with_half_in_flight.phase`
+
+Bug gallery #32: stopping the stream for one half only, then treating
+
+```
+error: cannot join 'lo' (@RAM) and 'hi' (@DMA) into 'ring': its parts must all be in the same domain
+  --> examples/bug_gallery/join_with_half_in_flight.phase:18:14
+   |
+18 |     join lo, hi into ring;
+   |              ^^
+note: 'hi' is moved to @DMA by 'start_circular' here
+  --> examples/bug_gallery/join_with_half_in_flight.phase:14:5
+   |
+14 |     start_circular(lo, hi);
+   |     -----------------------
+note: 'lo' is synced back to @RAM by 'wait_half' here
+  --> examples/bug_gallery/join_with_half_in_flight.phase:15:5
+   |
+15 |     wait_half(lo);
+   |     --------------
+
+error: 'ring' is split into lo, hi; join them back first (cannot use as argument to 'summarize')
+  --> examples/bug_gallery/join_with_half_in_flight.phase:19:15
+   |
+19 |     summarize(ring);
+   |               ^^^^
+note: 'ring' is split here
+  --> examples/bug_gallery/join_with_half_in_flight.phase:13:5
+   |
+13 |     split ring into lo, hi;
+   |     -----------------------
+
+error: entity 'hi' is still owned by @DMA when 'main' returns; sync(hi) before it goes out of scope
+  --> examples/bug_gallery/join_with_half_in_flight.phase:20:1
+   |
+20 | }
+   | ^
+note: 'hi' is moved to @DMA by 'start_circular' here
+  --> examples/bug_gallery/join_with_half_in_flight.phase:14:5
+   |
+14 |     start_circular(lo, hi);
+   |     -----------------------
+
+examples/bug_gallery/join_with_half_in_flight.phase: 3 errors found
+```
+
 ### `examples/bug_gallery/move_while_borrowed.phase`
 
 Bug gallery #2: moving an entity while a borrow of it is still live.
@@ -356,6 +414,25 @@ note: 'pong' is declared in @RAM here
    |     ---------------------------
 
 examples/bug_gallery/ping_pong_without_swap.phase: 2 errors found
+```
+
+### `examples/bug_gallery/process_half_in_flight.phase`
+
+Bug gallery #30: processing the wrong half of a circular DMA buffer.
+
+```
+error: entity 'hi' is in domain @DMA but 'process' expects @RAM for this argument
+  --> examples/bug_gallery/process_half_in_flight.phase:20:13
+   |
+20 |     process(hi);
+   |             ^^
+note: 'hi' is moved to @DMA by 'start_circular' here
+  --> examples/bug_gallery/process_half_in_flight.phase:16:5
+   |
+16 |     start_circular(lo, hi);
+   |     -----------------------
+
+examples/bug_gallery/process_half_in_flight.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/read_param_handed_to_writer.phase`
@@ -445,6 +522,46 @@ note: 'pong' is declared in @RAM here
    |     ---------------------------
 
 examples/bug_gallery/refill_while_processing.phase: 3 errors found
+```
+
+### `examples/bug_gallery/rotate_wrong_direction.phase`
+
+Bug gallery #33: rotating a triple-buffer ring the wrong way. The free
+
+```
+error: entity 'b' is @RAM at the end of the `while` body but @DMA when the loop is entered; a `while` body must leave every entity exactly as it found it
+  --> examples/bug_gallery/rotate_wrong_direction.phase:21:5
+   |
+21 |     while n < 6 {
+   |     ^^^^^^^^^^^^^
+note: 'b' is @RAM after `rotate c, b, a` here
+  --> examples/bug_gallery/rotate_wrong_direction.phase:26:9
+   |
+26 |         rotate c, b, a;
+   |         ---------------
+note: 'b' is moved to @DMA by 'start_capture' here
+  --> examples/bug_gallery/rotate_wrong_direction.phase:20:5
+   |
+20 |     start_capture(b);
+   |     -----------------
+
+error: entity 'c' is @DMA at the end of the `while` body but @RAM when the loop is entered; a `while` body must leave every entity exactly as it found it
+  --> examples/bug_gallery/rotate_wrong_direction.phase:21:5
+   |
+21 |     while n < 6 {
+   |     ^^^^^^^^^^^^^
+note: 'c' is @DMA after `rotate c, b, a` here
+  --> examples/bug_gallery/rotate_wrong_direction.phase:26:9
+   |
+26 |         rotate c, b, a;
+   |         ---------------
+note: 'c' is declared in @RAM here
+  --> examples/bug_gallery/rotate_wrong_direction.phase:16:5
+   |
+16 |     buffer<f32, 128> c @RAM;
+   |     ------------------------
+
+examples/bug_gallery/rotate_wrong_direction.phase: 2 errors found
 ```
 
 ### `examples/bug_gallery/runtime_length_to_fixed.phase`
@@ -657,6 +774,25 @@ note: 'frame' is borrowed by 'view' here
    |     ------------------------------
 
 examples/bug_gallery/use_owner_while_borrowed.phase: 1 error found
+```
+
+### `examples/bug_gallery/use_ring_while_split.phase`
+
+Bug gallery #31: using the whole buffer while it is split. Half of it
+
+```
+error: 'ring' is split into lo, hi; join them back first (cannot use as argument to 'summarize')
+  --> examples/bug_gallery/use_ring_while_split.phase:18:15
+   |
+18 |     summarize(ring);
+   |               ^^^^
+note: 'ring' is split here
+  --> examples/bug_gallery/use_ring_while_split.phase:13:5
+   |
+13 |     split ring into lo, hi;
+   |     -----------------------
+
+examples/bug_gallery/use_ring_while_split.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/volatile_wrong_domain.phase`

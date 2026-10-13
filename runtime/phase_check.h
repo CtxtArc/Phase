@@ -56,6 +56,18 @@ PHASE_ADDR_ONLY(1) void phase_chk_destroy(const void *p, const char *name);
 PHASE_ADDR_ONLY(1) PHASE_ADDR_ONLY(2)
 void phase_chk_swap(const void *a, const void *b, const char *a_name, const char *b_name);
 
+/* rotate: each named storage must be live and unborrowed */
+PHASE_ADDR_ONLY(1) void phase_chk_rotate(const void *p, const char *name);
+
+/* split / join: `parts` are the parts' addresses, in order, each
+ * `part_bytes` long */
+PHASE_ADDR_ONLY(1)
+void phase_chk_split(const void *parent, const char *name, int n, const void *const *parts,
+                     const char *const *part_names, size_t part_bytes);
+PHASE_ADDR_ONLY(1)
+void phase_chk_join(const void *parent, const char *name, int n, const void *const *parts,
+                    const char *const *part_names);
+
 /* borrows: phase_chk_borrow returns a handle id */
 PHASE_ADDR_ONLY(1) int phase_chk_borrow(const void *p, int write, const char *name);
 void phase_chk_release(int handle, const char *name);

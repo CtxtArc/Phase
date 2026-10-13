@@ -550,6 +550,7 @@ fn swapped_buffers(body: &[PirInst]) -> HashSet<String> {
                 out.insert(a.clone());
                 out.insert(b.clone());
             }
+            PirInst::Rotate { names } => out.extend(names.iter().cloned()),
             PirInst::If {
                 then_body,
                 else_body,
@@ -625,6 +626,99 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
             }
             cx.track_ts(name);
             format!("{pad}phase_chk_ts_fresh(&{name}, \"{state}\", \"{initial}\", \"{name}\");\n")
+        }
+
+        PirInst::Rotate { names } => {
+            let elem = match names.first().and_then(|n| cx.locals.get(n)) {
+                Some(PirType::Buffer { elem, .. }) => type_name(elem),
+                _ => "void".to_string(),
+            };
+            let mut s = String::new();
+            if cx.checked {
+                for n in names {
+                    s.push_str(&format!("{pad}phase_chk_rotate({n}, \"{n}\");\n"));
+                }
+            }
+            // a <- b <- c <- .. <- a
+            let mut chain = format!("{elem}* phase_rot_tmp = {};", names[0]);
+            for w in names.windows(2) {
+                chain.push_str(&format!(" {} = {};", w[0], w[1]));
+            }
+            chain.push_str(&format!(" {} = phase_rot_tmp;", names[names.len() - 1]));
+            s.push_str(&format!(
+                "{pad}{{ /* rotate {} */ {chain} }}\n",
+                names.join(", ")
+            ));
+            s
+        }
+
+        PirInst::Split { parent, parts } => {
+            let (elem, len) = match cx.locals.get(parent) {
+                Some(PirType::Buffer {
+                    elem,
+                    len: Some(len),
+                }) => ((**elem).clone(), *len),
+                _ => return format!("{pad}/* internal error: split of a non-fixed buffer */\n"),
+            };
+            let n = parts.len() as u64;
+            let k = len / n.max(1);
+            let elem_c = type_name(&elem);
+            let mut s = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                s.push_str(&format!(
+                    "{pad}{elem_c}* {part} = {parent} + {}; /* part {i} of {parent} */\n",
+                    i as u64 * k
+                ));
+                cx.locals.insert(
+                    part.clone(),
+                    PirType::Buffer {
+                        elem: Box::new(elem.clone()),
+                        len: Some(k),
+                    },
+                );
+            }
+            if cx.checked {
+                // Stable addresses for the parts' scope ends: a part's name
+                // can be swapped to other storage, its slice can't.
+                for part in parts {
+                    // (unused if the parts are joined before their scope ends)
+                    s.push_str(&format!(
+                        "{pad}{elem_c}* const {part}__part = {part}; (void){part}__part;\n"
+                    ));
+                    if let Some(scope) = cx.scopes.last_mut() {
+                        scope.push(ScopeItem::Storage(format!("{part}__part"), part.clone()));
+                    }
+                }
+                s.push_str(&format!(
+                    "{pad}{{ const void *const phase_parts[] = {{{}}}; const char *const phase_names[] = {{{}}}; phase_chk_split({parent}, \"{parent}\", {n}, phase_parts, phase_names, sizeof({}[0]) * {k}); }}\n",
+                    parts.join(", "),
+                    parts.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(", "),
+                    parts[0]
+                ));
+            }
+            s
+        }
+
+        PirInst::Join { parent, parts } => {
+            let mut s = format!(
+                "{pad}/* join {} into {parent} (compile-time only: the parts are slices of it) */\n",
+                parts.join(", ")
+            );
+            if cx.checked {
+                s.push_str(&format!(
+                    "{pad}{{ const void *const phase_parts[] = {{{}}}; const char *const phase_names[] = {{{}}}; phase_chk_join({parent}, \"{parent}\", {}, phase_parts, phase_names); }}\n",
+                    parts.join(", "),
+                    parts.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(", "),
+                    parts.len()
+                ));
+                // The parts are gone; their storage is the parent's again.
+                for scope in cx.scopes.iter_mut() {
+                    scope.retain(
+                        |item| !matches!(item, ScopeItem::Storage(_, n) if parts.contains(n)),
+                    );
+                }
+            }
+            s
         }
 
         PirInst::Swap { a, b } => {
@@ -1444,5 +1538,47 @@ mod tests {
         "#;
         let g = generate_src(src, "t");
         assert!(g.source.contains("volatile uint32_t READY;"));
+    }
+
+    const RING_SRC: &str = r#"
+        extern fn fill(x: write buffer<u8, _> @RAM);
+        fn main() {
+            buffer<u8, 8> a @RAM;
+            buffer<u8, 8> b @RAM;
+            buffer<u8, 8> c @RAM;
+            rotate a, b, c;
+            fill(a);
+            buffer<u8, 8> ring @RAM;
+            split ring into lo, hi;
+            fill(hi);
+            join lo, hi into ring;
+            fill(ring);
+        }
+    "#;
+
+    #[test]
+    fn rotate_split_and_join_lower_to_pointer_moves_and_slices() {
+        let g = generate_src(RING_SRC, "t");
+        assert!(
+            g.source.contains("a = b; b = c; c = phase_rot_tmp;"),
+            "{}",
+            g.source
+        );
+        assert!(g.source.contains("lo = ring + 0;"), "{}", g.source);
+        assert!(g.source.contains("hi = ring + 4;"), "{}", g.source);
+        assert!(g.source.contains("fill(hi, 4);"), "{}", g.source);
+        assert!(g.source.contains("fill(ring, 8);"), "{}", g.source);
+        assert!(!g.source.contains("phase_chk_"), "{}", g.source);
+    }
+
+    #[test]
+    fn checked_mode_reports_rotate_split_and_join_to_the_runtime_checker() {
+        let program = phase_parser::parse(RING_SRC).unwrap();
+        phase_analysis::analyze(&program).unwrap();
+        let pir = phase_pir::build(&program).unwrap();
+        let g = generate_checked(&pir, "t");
+        for needle in ["phase_chk_rotate(", "phase_chk_split(", "phase_chk_join("] {
+            assert!(g.source.contains(needle), "missing {needle}:\n{}", g.source);
+        }
     }
 }

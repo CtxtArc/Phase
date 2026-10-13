@@ -451,6 +451,10 @@ struct VarState {
     ty: Option<TypeExpr>,
     /// Block nesting depth of the declaration (0 = function body).
     block: usize,
+    /// For a buffer that is currently split: its parts, and where.
+    split_into: Option<(Vec<String>, Span)>,
+    /// For a part of a split buffer: the parent and the part's index.
+    part_of: Option<(String, usize)>,
 
     // ---- where things happened, for diagnostics ----------------------
     /// Where this name was declared (for a borrow handle: the borrow).
@@ -481,6 +485,8 @@ impl VarState {
             read_only: false,
             ty: None,
             block: 0,
+            split_into: None,
+            part_of: None,
         }
     }
 
@@ -721,7 +727,8 @@ impl<'a> FnChecker<'a> {
                 }
                 continue;
             }
-            if var.destroyed || var.consumed.is_some() {
+            // A split buffer's storage is accounted for by its parts.
+            if var.destroyed || var.consumed.is_some() || var.split_into.is_some() {
                 continue;
             }
             match (var.param_exit, var.domain) {
@@ -845,24 +852,36 @@ impl<'a> FnChecker<'a> {
     /// Shared preconditions for `move` / `sync` / `destroy`: the name must be
     /// a live, owned entity (not a borrow handle, not destroyed, not
     /// consumed) with no outstanding borrow. Returns its state on success.
-    /// `swap a, b;` -- both must be live, unborrowed, owned local buffers of
-    /// the same type. Everything the checker knows about the two storages
-    /// (domain, history) moves with them.
-    fn check_swap(&mut self, a: &str, b: &str, errors: &mut Vec<AnalysisError>) {
-        if a == b {
-            errors.push(err(format!("cannot swap '{a}' with itself")).about(a));
+    /// `swap a, b;` and `rotate a, b, c, ..;` -- every name must be a live,
+    /// unborrowed, owned local buffer, all of the same type and declared in
+    /// the same block. Each name then takes the next one's storage (the last
+    /// takes the first's), together with everything the checker knows about
+    /// it (domain, history). `swap a, b` is the two-name rotation.
+    fn check_permute(&mut self, names: &[String], verb: &str, errors: &mut Vec<AnalysisError>) {
+        let stmt = format!("{verb} {}", names.join(", "));
+        if names.len() < 2 {
+            errors.push(err(format!("`{verb}` needs at least two buffers")));
             return;
         }
-        let va = self.owned_target(a, "swap", errors);
-        let vb = self.owned_target(b, "swap", errors);
-        let (Some(va), Some(vb)) = (va, vb) else {
+        for (i, a) in names.iter().enumerate() {
+            if names[..i].contains(a) {
+                errors.push(err(format!("cannot {verb} '{a}' with itself")).about(a));
+                return;
+            }
+        }
+        let mut vars = Vec::new();
+        for n in names {
+            vars.push(self.owned_target(n, verb, errors));
+        }
+        let Some(vars) = vars.into_iter().collect::<Option<Vec<VarState>>>() else {
             return;
         };
-        for (name, v) in [(a, &va), (b, &vb)] {
+        let what = if verb == "swap" { "swapped" } else { "rotated" };
+        for (name, v) in names.iter().zip(&vars) {
             if v.is_param() {
                 errors.push(
                     err(format!(
-                        "cannot swap parameter '{name}': its storage belongs to the caller"
+                        "cannot {verb} parameter '{name}': its storage belongs to the caller"
                     ))
                     .about(name)
                     .note(
@@ -875,7 +894,7 @@ impl<'a> FnChecker<'a> {
             if !matches!(v.ty, Some(TypeExpr::Buffer { .. })) {
                 errors.push(
                     err(format!(
-                        "'{name}' is not a buffer; only buffers can be swapped"
+                        "'{name}' is not a buffer; only buffers can be {what}"
                     ))
                     .about(name)
                     .note(v.origin, format!("'{name}' is declared here")),
@@ -883,46 +902,220 @@ impl<'a> FnChecker<'a> {
                 return;
             }
         }
-        // Swapping exchanges storage, so both storages must live exactly as
-        // long: a name declared outside a block must not end up pointing at
-        // storage that dies with the block.
-        if va.block != vb.block {
-            let (inner, outer, iv) = if va.block > vb.block {
-                (a, b, &va)
-            } else {
-                (b, a, &vb)
-            };
-            errors.push(
-                err(format!(
-                    "cannot swap '{a}' with '{b}': '{inner}' is declared in an inner block, so '{outer}' would be left pointing at storage that dies when that block ends"
-                ))
-                .about(inner)
-                .note(iv.origin, format!("'{inner}' is declared here")),
-            );
-            return;
-        }
-        if va.ty != vb.ty {
-            let show = |t: &Option<TypeExpr>| t.as_ref().map(fmt_type).unwrap_or_default();
-            errors.push(
-                err(format!(
-                    "cannot swap '{a}' ({}) with '{b}' ({}): the buffer types differ",
-                    show(&va.ty),
-                    show(&vb.ty)
-                ))
-                .about(a),
-            );
-            return;
+        let (a, va) = (&names[0], &vars[0]);
+        for (b, vb) in names.iter().zip(&vars).skip(1) {
+            // Storage moves between names, so all storages must live exactly
+            // as long: a name declared outside a block must not end up
+            // pointing at storage that dies with the block.
+            if va.block != vb.block {
+                let (inner, outer, iv) = if va.block > vb.block {
+                    (a, b, va)
+                } else {
+                    (b, a, vb)
+                };
+                errors.push(
+                    err(format!(
+                        "cannot {verb} '{a}' with '{b}': '{inner}' is declared in an inner block, so '{outer}' would be left pointing at storage that dies when that block ends"
+                    ))
+                    .about(inner)
+                    .note(iv.origin, format!("'{inner}' is declared here")),
+                );
+                return;
+            }
+            if va.ty != vb.ty {
+                let show = |t: &Option<TypeExpr>| t.as_ref().map(fmt_type).unwrap_or_default();
+                errors.push(
+                    err(format!(
+                        "cannot {verb} '{a}' ({}) with '{b}' ({}): the buffer types differ",
+                        show(&va.ty),
+                        show(&vb.ty)
+                    ))
+                    .about(a),
+                );
+                return;
+            }
         }
         let span = self.cur_span;
-        for (name, mut v) in [(a, vb), (b, va)] {
+        let n = names.len();
+        for (i, name) in names.iter().enumerate() {
+            let mut v = vars[(i + 1) % n].clone();
             if let Some(d) = v.domain {
                 v.domain_since = Some((
                     span,
-                    format!("'{name}' is @{} after `swap {a}, {b}` here", d.name()),
+                    format!("'{name}' is @{} after `{stmt}` here", d.name()),
                 ));
             }
-            self.locals.insert(name.to_string(), v);
+            self.locals.insert(name.clone(), v);
         }
+    }
+
+    /// `split parent into p0, p1, ..;` -- the parent must be a live,
+    /// unborrowed, owned local buffer whose fixed length divides evenly.
+    /// Each part is a new buffer of `len / n` in the parent's domain; the
+    /// parent is unusable until the parts are joined.
+    fn check_split(&mut self, parent: &str, parts: &[String], errors: &mut Vec<AnalysisError>) {
+        let Some(pv) = self.owned_target(parent, "split", errors) else {
+            return;
+        };
+        if pv.is_param() {
+            errors.push(
+                err(format!(
+                    "cannot split parameter '{parent}': its storage belongs to the caller"
+                ))
+                .about(parent),
+            );
+            return;
+        }
+        let n = parts.len();
+        let (elem, len) = match &pv.ty {
+            Some(TypeExpr::Buffer {
+                elem,
+                len: BufferLen::Fixed(len),
+            }) => (elem.clone(), *len),
+            _ => {
+                errors.push(
+                    err(format!(
+                        "'{parent}' cannot be split: only buffers with a fixed length can be"
+                    ))
+                    .about(parent)
+                    .note(pv.origin, format!("'{parent}' is declared here")),
+                );
+                return;
+            }
+        };
+        if n < 2 || len % n as u64 != 0 {
+            errors.push(
+                err(format!(
+                    "cannot split '{parent}' (buffer<{}, {len}>) into {n} equal parts",
+                    fmt_type(&elem)
+                ))
+                .about(parent),
+            );
+            return;
+        }
+        for (i, part) in parts.iter().enumerate() {
+            if parts[..i].contains(part) || part == parent {
+                errors.push(err(format!("'{part}' is named twice in this split")).about(part));
+                return;
+            }
+            if !self.check_no_shadowing(part, errors) {
+                return;
+            }
+        }
+        let span = self.cur_span;
+        let part_ty = TypeExpr::Buffer {
+            elem,
+            len: BufferLen::Fixed(len / n as u64),
+        };
+        for (i, part) in parts.iter().enumerate() {
+            let mut v = VarState::local(pv.domain, None, span);
+            v.ty = Some(part_ty.clone());
+            v.block = self.block_depth;
+            v.part_of = Some((parent.to_string(), i));
+            if let Some(d) = pv.domain {
+                v.domain_since = Some((
+                    span,
+                    format!(
+                        "'{part}' is part {i} of '{parent}', in @{}, from here",
+                        d.name()
+                    ),
+                ));
+            }
+            self.locals.insert(part.clone(), v);
+        }
+        let p = self.locals.get_mut(parent).unwrap();
+        p.split_into = Some((parts.to_vec(), span));
+    }
+
+    /// `join p0, p1, .. into parent;` -- exactly the parts `parent` was
+    /// split into, in order (a part that was swapped away no longer counts),
+    /// each live, unborrowed and owned, all in one domain -- which the
+    /// parent then has.
+    fn check_join(&mut self, parent: &str, parts: &[String], errors: &mut Vec<AnalysisError>) {
+        let Some(pv) = self.locals.get(parent).cloned() else {
+            errors.push(err(format!("unknown entity '{parent}'")).about(parent));
+            return;
+        };
+        let Some((expected, split_at)) = pv.split_into.clone() else {
+            errors.push(err(format!("cannot join into '{parent}': it is not split")).about(parent));
+            return;
+        };
+        if parts != expected.as_slice() {
+            errors.push(
+                err(format!(
+                    "'{parent}' was split into {}; join exactly those parts, in that order",
+                    expected.join(", ")
+                ))
+                .about(parent)
+                .note(split_at, format!("'{parent}' is split here")),
+            );
+            return;
+        }
+        let mut domain = None;
+        let mut vars = Vec::new();
+        for (i, part) in parts.iter().enumerate() {
+            let Some(v) = self.owned_target(part, "join", errors) else {
+                return;
+            };
+            if v.part_of != Some((parent.to_string(), i)) {
+                errors.push(
+                    err(format!(
+                        "'{part}' no longer holds part {i} of '{parent}' (it was swapped or rotated); join the parts in their original places"
+                    ))
+                    .about(part)
+                    .note_opt(v.domain_since.as_ref()),
+                );
+                return;
+            }
+            vars.push(v);
+        }
+        for (part, v) in parts.iter().zip(&vars) {
+            match (domain, v.domain) {
+                (None, d) => domain = d,
+                (Some(d), Some(e)) if d != e => {
+                    let mut e = err(format!(
+                        "cannot join '{}' (@{}) and '{part}' (@{}) into '{parent}': its parts must all be in the same domain",
+                        parts[0],
+                        d.name(),
+                        e.name()
+                    ))
+                    .about(part)
+                    .note_opt(v.domain_since.as_ref());
+                    e = e.note_opt(vars[0].domain_since.as_ref());
+                    errors.push(e);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let span = self.cur_span;
+        for part in parts {
+            let v = self.locals.get_mut(part).unwrap();
+            v.consumed = Some(format!("joined back into '{parent}'"));
+            v.consumed_at = Some(span);
+        }
+        let p = self.locals.get_mut(parent).unwrap();
+        p.split_into = None;
+        p.domain = domain;
+        if let Some(d) = domain {
+            p.domain_since = Some((
+                span,
+                format!("'{parent}' is joined back in @{} here", d.name()),
+            ));
+        }
+    }
+
+    /// If `name` is a split buffer, the error for using it as a whole.
+    fn split_error(var: &VarState, name: &str, what: &str) -> Option<AnalysisError> {
+        let (parts, at) = var.split_into.as_ref()?;
+        Some(
+            err(format!(
+                "'{name}' is split into {}; join them back first (cannot {what})",
+                parts.join(", ")
+            ))
+            .about(name)
+            .note(*at, format!("'{name}' is split here")),
+        )
     }
 
     /// A note pointing at a live borrow of `target`, if there is one.
@@ -999,6 +1192,10 @@ impl<'a> FnChecker<'a> {
                 .about(name)
                 .note_opt(Self::lifetime_note(var, name).as_ref()),
             );
+            return None;
+        }
+        if let Some(e) = Self::split_error(var, name, &format!("{verb} it")) {
+            errors.push(e);
             return None;
         }
         if self.has_live_borrow(name) {
@@ -1099,12 +1296,24 @@ impl<'a> FnChecker<'a> {
                 v.released_at = Some(span);
             }
 
-            Stmt::Swap { a, b } => self.check_swap(a, b, errors),
+            Stmt::Swap { a, b } => self.check_permute(&[a.clone(), b.clone()], "swap", errors),
+            Stmt::Rotate { names } => self.check_permute(names, "rotate", errors),
+            Stmt::Split { parent, parts } => self.check_split(parent, parts, errors),
+            Stmt::Join { parent, parts } => self.check_join(parent, parts, errors),
 
             Stmt::Destroy { name } => {
                 let Some(var) = self.owned_target(name, "destroy", errors) else {
                     return;
                 };
+                if let Some((parent, _)) = &var.part_of {
+                    errors.push(
+                        err(format!(
+                            "cannot destroy '{name}' on its own: it is part of '{parent}' (join the parts back, then destroy '{parent}')"
+                        ))
+                        .about(name),
+                    );
+                    return;
+                }
                 if var.is_param() {
                     errors.push(
                         err(format!(
@@ -1265,7 +1474,11 @@ impl<'a> FnChecker<'a> {
         names.sort();
         for name in names {
             let var = &self.locals[name];
-            if var.borrow_of.is_some() || var.destroyed || var.consumed.is_some() {
+            if var.borrow_of.is_some()
+                || var.destroyed
+                || var.consumed.is_some()
+                || var.split_into.is_some()
+            {
                 continue;
             }
             if let Some(d) = var.domain.filter(|d| is_device_owned(*d)) {
@@ -1523,6 +1736,33 @@ impl<'a> FnChecker<'a> {
                 (None, None) => unreachable!(),
             };
 
+            // Split state and part identity must agree too: `join` relies on
+            // both, and a loop body must leave them as it found them.
+            let split_of = |v: &VarState| v.split_into.as_ref().map(|(p, _)| p.clone());
+            if split_of(a) != split_of(b) {
+                errors.push(
+                    err(format!(
+                        "entity '{name}' is split on one path but not the other{loop_note}"
+                    ))
+                    .about(name)
+                    .note_opt(
+                        a.split_into
+                            .as_ref()
+                            .or(b.split_into.as_ref())
+                            .map(|(_, at)| (*at, format!("'{name}' is split here")))
+                            .as_ref(),
+                    ),
+                );
+            }
+            if a.part_of != b.part_of {
+                errors.push(
+                    err(format!(
+                        "entity '{name}' holds a different part of a split buffer on each path{loop_note}"
+                    ))
+                    .about(name),
+                );
+            }
+
             merged_locals.insert(
                 name.clone(),
                 VarState {
@@ -1536,6 +1776,8 @@ impl<'a> FnChecker<'a> {
                     read_only: base_var.read_only,
                     ty: base_var.ty.clone(),
                     block: base_var.block,
+                    split_into: a.split_into.clone(),
+                    part_of: a.part_of.clone(),
                     rejected_borrow: base_var.rejected_borrow,
                     origin: base_var.origin,
                     domain_since: a.domain_since.clone().or_else(|| b.domain_since.clone()),
@@ -1763,7 +2005,12 @@ impl<'a> FnChecker<'a> {
             errors.push(err(format!("unknown entity '{target}' for borrow")));
             return;
         };
-        let rejection = if target_var.destroyed {
+        let rejection = if let Some((parts, _)) = &target_var.split_into {
+            Some(format!(
+                "'{target}' is split into {}; join them back first (cannot borrow it)",
+                parts.join(", ")
+            ))
+        } else if target_var.destroyed {
             Some(format!("entity '{target}' was destroyed; cannot borrow"))
         } else if let Some(how) = &target_var.consumed {
             Some(format!(
@@ -1944,6 +2191,10 @@ impl<'a> FnChecker<'a> {
             return false;
         };
         let lifetime = Self::lifetime_note(var, name);
+        if let Some(e) = Self::split_error(var, name, usage) {
+            errors.push(e);
+            return false;
+        }
         if var.destroyed {
             errors.push(
                 err(format!("entity '{name}' was destroyed; cannot {usage}"))
@@ -4515,6 +4766,236 @@ mod buffer_type_tests {
         rejects(
             "extern fn mk() -> buffer<u8, _>; fn main() { }",
             "'mk' returns a buffer of length `_`",
+        );
+    }
+}
+
+/// v1.4: `rotate`, and `split`/`join` for half-buffer (circular) DMA.
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+
+    fn check(src: &str) -> Result<(), Vec<AnalysisError>> {
+        analyze(&phase_parser::parse(src).expect("fixture must parse"))
+    }
+
+    #[track_caller]
+    fn rejects(src: &str, needle: &str) {
+        match check(src) {
+            Ok(()) => panic!("expected an error containing {needle:?}, got Ok(())"),
+            Err(errs) => assert!(
+                errs.iter().any(|e| e.message.contains(needle)),
+                "expected {needle:?}, got {errs:?}"
+            ),
+        }
+    }
+
+    #[track_caller]
+    fn accepts(src: &str) {
+        assert_eq!(check(src), Ok(()));
+    }
+
+    const SIGS: &str = r#"
+        extern fn start(dst: write buffer<u8, 8> @RAM -> @DMA);
+        extern fn start4(dst: write buffer<u8, 4> @RAM -> @DMA);
+        extern fn wait4(dst: buffer<u8, 4> @DMA -> @RAM);
+        extern fn look4(x: read buffer<u8, 4> @RAM);
+        extern fn look(x: read buffer<u8, 8> @RAM);
+        extern fn get_n() -> u32;
+        fn wait(b: buffer<u8, 8> @DMA -> @RAM) { sync(b); }
+    "#;
+
+    fn with(body: &str) -> String {
+        format!("{SIGS}\n{body}")
+    }
+
+    // ---- rotate ----------------------------------------------------------
+
+    #[test]
+    fn triple_buffer_loop_is_accepted() {
+        accepts(&with(
+            r#"fn main() {
+                buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; buffer<u8, 8> c @RAM;
+                let n: u32 = 0;
+                start(a); start(b);
+                while n < 4 { wait(a); start(c); look(a); rotate a, b, c; n = n + 1; }
+                wait(a); wait(b);
+            }"#,
+        ));
+    }
+
+    #[test]
+    fn rotate_moves_each_name_to_the_next_buffer() {
+        // after `rotate a, b, c`: a has b's (in flight), c has a's (free)
+        accepts(&with(
+            "fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; buffer<u8, 8> c @RAM; start(b); rotate a, b, c; look(c); look(b); wait(a); }",
+        ));
+        rejects(
+            &with("fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; buffer<u8, 8> c @RAM; start(b); rotate a, b, c; look(a); wait(a); }"),
+            "entity 'a' is in domain @DMA but 'look' expects @RAM",
+        );
+    }
+
+    #[test]
+    fn rotate_needs_live_unborrowed_same_type_same_block_buffers() {
+        rejects(
+            &with("fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; buffer<u8, 4> c @RAM; rotate a, b, c; }"),
+            "cannot rotate 'a' (buffer<u8, 8>) with 'c' (buffer<u8, 4>): the buffer types differ",
+        );
+        rejects(
+            &with("fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; let r = borrow b read; rotate a, b; release r; }"),
+            "entity 'b' has a live borrow; cannot rotate",
+        );
+        rejects(
+            &with("fn main() { buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM; rotate a, b, a; }"),
+            "cannot rotate 'a' with itself",
+        );
+        rejects(
+            &with("fn main() { buffer<u8, 8> a @RAM; let f: u32 = get_n(); if f == 1 { buffer<u8, 8> t @RAM; rotate a, t; } }"),
+            "'t' is declared in an inner block",
+        );
+        rejects(
+            &with(
+                "fn f(p: buffer<u8, 8> @RAM) { buffer<u8, 8> q @RAM; rotate q, p; } fn main() { }",
+            ),
+            "cannot rotate parameter 'p'",
+        );
+    }
+
+    // ---- split / join ------------------------------------------------------
+
+    const CIRCULAR: &str = r#"
+        fn main() {
+            buffer<u8, 8> ring @RAM;
+            let n: u32 = 0;
+            split ring into lo, hi;
+            start4(lo); start4(hi);
+            while n < 3 {
+                wait4(lo); look4(lo); start4(lo);
+                wait4(hi); look4(hi); start4(hi);
+                n = n + 1;
+            }
+            wait4(lo); wait4(hi);
+            join lo, hi into ring;
+            look(ring);
+        }
+    "#;
+
+    #[test]
+    fn circular_half_buffer_loop_is_accepted() {
+        accepts(&with(CIRCULAR));
+    }
+
+    #[test]
+    fn the_whole_buffer_is_unusable_while_split() {
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; look(ring); join lo, hi into ring; }"),
+            "'ring' is split into lo, hi; join them back first (cannot use as argument to 'look')",
+        );
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; move ring -> @DMA; join lo, hi into ring; }"),
+            "join them back first (cannot move it)",
+        );
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; let r = borrow ring read; release r; join lo, hi into ring; }"),
+            "join them back first (cannot borrow it)",
+        );
+    }
+
+    #[test]
+    fn parts_have_the_parent_domain_and_a_fraction_of_its_length() {
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @DMA; split ring into lo, hi; look4(lo); wait4(lo); wait4(hi); join lo, hi into ring; }"),
+            "entity 'lo' is in domain @DMA but 'look4' expects @RAM",
+        );
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; look(lo); join lo, hi into ring; }"),
+            "'look' expects buffer<u8, 8> for 'x', but 'lo' is buffer<u8, 4>",
+        );
+    }
+
+    #[test]
+    fn join_requires_the_same_parts_in_order_in_one_domain() {
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; join hi, lo into ring; }"),
+            "'ring' was split into lo, hi; join exactly those parts, in that order",
+        );
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; start4(hi); join lo, hi into ring; wait4(hi); }"),
+            "cannot join 'lo' (@RAM) and 'hi' (@DMA) into 'ring'",
+        );
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; swap lo, hi; join lo, hi into ring; }"),
+            "'lo' no longer holds part 0 of 'ring'",
+        );
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @RAM; join ring, ring into ring; }"),
+            "cannot join into 'ring': it is not split",
+        );
+    }
+
+    #[test]
+    fn swapping_parts_back_restores_joinability() {
+        accepts(&with(
+            "fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; swap lo, hi; swap lo, hi; join lo, hi into ring; }",
+        ));
+    }
+
+    #[test]
+    fn split_needs_a_fixed_divisible_owned_local() {
+        rejects(
+            "fn main() { buffer<u8, 9> ring @RAM; split ring into a, b; }",
+            "cannot split 'ring' (buffer<u8, 9>) into 2 equal parts",
+        );
+        rejects(
+            "fn f(r: buffer<u8, 8> @RAM) { split r into a, b; join a, b into r; } fn main() { }",
+            "cannot split parameter 'r'",
+        );
+        rejects(
+            "fn f(r: buffer<u8, _> @RAM) { buffer<u8, 8> x @RAM; } fn main() { buffer<u8, 8> s @RAM; let w = borrow s write; split s into a, b; release w; }",
+            "entity 's' has a live borrow; cannot split",
+        );
+        rejects(
+            "fn main() { buffer<u8, 8> ring @RAM; split ring into a, b; split ring into c, d; }",
+            "join them back first (cannot split it)",
+        );
+    }
+
+    #[test]
+    fn a_part_cannot_be_destroyed_on_its_own() {
+        rejects(
+            "fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; destroy lo; }",
+            "cannot destroy 'lo' on its own: it is part of 'ring'",
+        );
+    }
+
+    #[test]
+    fn unjoined_parts_carry_the_exit_and_block_end_obligations() {
+        // never joined, but both halves back with the CPU: fine
+        accepts(&with(
+            "fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; start4(lo); wait4(lo); }",
+        ));
+        // a half left with the engine at the end of main
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @RAM; split ring into lo, hi; start4(lo); }"),
+            "entity 'lo' is still owned by @DMA when 'main' returns",
+        );
+        // ...or at the end of the block the split happened in
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @RAM; let n: u32 = get_n(); if n == 1 { split ring into lo, hi; start4(hi); } }"),
+            "entity 'hi' is still owned by @DMA when its block ends",
+        );
+    }
+
+    #[test]
+    fn split_on_one_path_or_unjoined_in_a_loop_is_rejected() {
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @RAM; let n: u32 = get_n(); if n == 1 { split ring into lo, hi; } look(ring); }"),
+            "entity 'ring' is split on one path but not the other",
+        );
+        rejects(
+            &with("fn main() { buffer<u8, 8> ring @RAM; let n: u32 = 0; while n < 2 { split ring into lo, hi; n = n + 1; } }"),
+            "entity 'ring' is split on one path but not the other; a `while` body must leave every entity exactly as it found it",
         );
     }
 }

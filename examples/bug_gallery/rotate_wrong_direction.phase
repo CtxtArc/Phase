@@ -1,0 +1,31 @@
+// Bug gallery #33: rotating a triple-buffer ring the wrong way. The free
+// buffer must become the next one filled; rotated backwards, the loop next
+// waits on a buffer nothing is filling and restarts one already in flight.
+// Expected: "entity 'b' is @RAM at the end of the `while` body but @DMA when the loop is entered"
+
+extern fn start_capture(dst: write buffer<f32, 128> @RAM -> @DMA);
+extern fn process(frame: read buffer<f32, 128> @RAM);
+
+fn wait_capture(x: buffer<f32, 128> @DMA -> @RAM) {
+    sync(x);
+}
+
+fn main() {
+    buffer<f32, 128> a @RAM;
+    buffer<f32, 128> b @RAM;
+    buffer<f32, 128> c @RAM;
+    let n: u32 = 0;
+
+    start_capture(a);
+    start_capture(b);
+    while n < 6 {
+        wait_capture(a);
+        start_capture(c);
+        process(a);
+        // BUG: should be `rotate a, b, c;`
+        rotate c, b, a;
+        n = n + 1;
+    }
+    wait_capture(a);
+    wait_capture(b);
+}

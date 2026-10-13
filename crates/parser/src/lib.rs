@@ -356,6 +356,9 @@ impl Parser {
             TokenKind::KwRelease => self.parse_release_stmt(),
             TokenKind::KwDestroy => self.parse_destroy_stmt(),
             TokenKind::KwSwap => self.parse_swap_stmt(),
+            TokenKind::KwRotate => self.parse_rotate_stmt(),
+            TokenKind::KwSplit => self.parse_split_stmt(),
+            TokenKind::KwJoin => self.parse_join_stmt(),
             TokenKind::KwReturn => self.parse_return_stmt(),
             TokenKind::KwIf => self.parse_if_stmt(),
             TokenKind::KwWhile => self.parse_while_stmt(),
@@ -486,6 +489,44 @@ impl Parser {
         let name = self.expect_ident()?;
         self.expect(TokenKind::Semi)?;
         Ok(Stmt::Release { name })
+    }
+
+    /// `a, b, c` -- one or more comma-separated names.
+    fn parse_name_list(&mut self) -> Result<Vec<String>, ParseError> {
+        let mut names = vec![self.expect_ident()?];
+        while self.at(&TokenKind::Comma) {
+            self.bump();
+            names.push(self.expect_ident()?);
+        }
+        Ok(names)
+    }
+
+    /// `rotate a, b, c;`
+    fn parse_rotate_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(TokenKind::KwRotate)?;
+        let names = self.parse_name_list()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(Stmt::Rotate { names })
+    }
+
+    /// `split buf into lo, hi;`
+    fn parse_split_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(TokenKind::KwSplit)?;
+        let parent = self.expect_ident()?;
+        self.expect(TokenKind::KwInto)?;
+        let parts = self.parse_name_list()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(Stmt::Split { parent, parts })
+    }
+
+    /// `join lo, hi into buf;`
+    fn parse_join_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(TokenKind::KwJoin)?;
+        let parts = self.parse_name_list()?;
+        self.expect(TokenKind::KwInto)?;
+        let parent = self.expect_ident()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(Stmt::Join { parent, parts })
     }
 
     /// `swap a, b;`
@@ -734,6 +775,36 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotate_split_and_join_are_parsed() {
+        let p = parse("fn main() { rotate a, b, c; split buf into lo, hi; join lo, hi into buf; }")
+            .unwrap();
+        let Item::Fn(f) = &p.items[0] else {
+            panic!("expected fn")
+        };
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            f.body.stmts[0].node,
+            Stmt::Rotate {
+                names: v(&["a", "b", "c"])
+            }
+        );
+        assert_eq!(
+            f.body.stmts[1].node,
+            Stmt::Split {
+                parent: "buf".into(),
+                parts: v(&["lo", "hi"])
+            }
+        );
+        assert_eq!(
+            f.body.stmts[2].node,
+            Stmt::Join {
+                parent: "buf".into(),
+                parts: v(&["lo", "hi"])
+            }
+        );
+    }
 
     #[test]
     fn swap_statement_is_parsed() {

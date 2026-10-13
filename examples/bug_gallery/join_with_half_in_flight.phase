@@ -1,0 +1,20 @@
+// Bug gallery #32: stopping the stream for one half only, then treating
+// the buffer as whole again. The engine still owns `hi`; a whole-buffer
+// view would hand the CPU memory that is still being written.
+// Expected: "cannot join 'lo' (@RAM) and 'hi' (@DMA) into 'ring': its parts must all be in the same domain"
+
+extern fn start_circular(lo: write buffer<f32, 64> @RAM -> @DMA,
+                         hi: write buffer<f32, 64> @RAM -> @DMA);
+extern fn wait_half(h: buffer<f32, 64> @DMA -> @RAM);
+extern fn summarize(x: read buffer<f32, 128> @RAM);
+
+fn main() {
+    buffer<f32, 128> ring @RAM;
+    split ring into lo, hi;
+    start_circular(lo, hi);
+    wait_half(lo);
+
+    // BUG: hi was never waited for.
+    join lo, hi into ring;
+    summarize(ring);
+}

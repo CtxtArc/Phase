@@ -99,6 +99,9 @@ fn radio_pipeline_main_body_statement_sequence() {
             Stmt::While { .. } => "While",
             Stmt::Assign { .. } => "Assign",
             Stmt::Swap { .. } => "Swap",
+            Stmt::Rotate { .. } => "Rotate",
+            Stmt::Split { .. } => "Split",
+            Stmt::Join { .. } => "Join",
         })
         .collect();
 

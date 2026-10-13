@@ -371,3 +371,82 @@ fn stub_externs_compile_without_c_warnings_when_no_extern_returns_a_value() {
         "C warnings in a stub build:\n{stderr}"
     );
 }
+
+fn build_and_run(stem: &str, checked: bool) -> String {
+    let root = workspace_root();
+    let mut cmd = phase();
+    cmd.current_dir(std::env::temp_dir())
+        .env_remove("PHASE_RUNTIME_DIR")
+        .arg("build");
+    if checked {
+        cmd.arg("--checked");
+    }
+    let out = cmd
+        .arg(root.join(format!("examples/{stem}.phase")))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = Command::new(root.join(format!("build/{stem}")))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    String::from_utf8_lossy(&run.stdout).into_owned()
+}
+
+#[test]
+fn triple_buffer_processes_every_frame_in_order_across_three_rotating_buffers() {
+    for checked in [false, true] {
+        let stdout = build_and_run("triple_buffer", checked);
+        let processed: Vec<&str> = stdout
+            .lines()
+            .filter(|l| l.contains("process: frame"))
+            .collect();
+        assert_eq!(processed.len(), 8, "{stdout}");
+        for (k, line) in processed.iter().enumerate() {
+            let buffer = ['A', 'B', 'C'][k % 3];
+            assert_eq!(
+                **line,
+                format!("[sim] process: frame {k} from buffer {buffer}"),
+                "{stdout}"
+            );
+        }
+        // Two frames are in flight while the CPU works on a third.
+        for k in 2..8 {
+            let started = stdout.find(&format!("start_capture: frame {k} ")).unwrap();
+            let processed = stdout.find(&format!("process: frame {} ", k - 2)).unwrap();
+            assert!(started < processed, "frame {k}:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn circular_dma_processes_alternating_halves_then_rejoins_the_whole_buffer() {
+    for checked in [false, true] {
+        let stdout = build_and_run("circular_dma", checked);
+        let processed: Vec<&str> = stdout
+            .lines()
+            .filter(|l| l.contains("process: block"))
+            .collect();
+        assert_eq!(processed.len(), 8, "{stdout}");
+        for (k, line) in processed.iter().enumerate() {
+            let half = if k % 2 == 0 { "lo" } else { "hi" };
+            assert_eq!(
+                **line,
+                format!("[sim] process: block {k} from {half}"),
+                "{stdout}"
+            );
+        }
+        assert!(
+            stdout.contains("summarize: 128 samples, halves hold blocks 8 and 9"),
+            "{stdout}"
+        );
+    }
+}

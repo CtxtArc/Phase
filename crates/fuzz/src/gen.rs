@@ -151,6 +151,19 @@ struct Buf {
     /// For a parameter: the domain it must be in at return.
     exit_dom: Option<Dom>,
     read_only: bool,
+    /// Block depth it was declared at (`swap`/`rotate` need one block).
+    depth: usize,
+    /// Split into these parts (and unusable whole until they are joined).
+    split: Option<Vec<String>>,
+    /// The slice of a split buffer this name's storage is: moves with the
+    /// storage on `swap`/`rotate`.
+    part_of: Option<(String, usize)>,
+}
+
+impl Buf {
+    fn usable(&self) -> bool {
+        !self.destroyed && self.split.is_none()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -382,7 +395,7 @@ impl FnGen<'_> {
     fn candidates(&self, dom: Option<Dom>, unborrowed: bool, writable: bool) -> Vec<String> {
         self.bufs
             .iter()
-            .filter(|b| !b.destroyed)
+            .filter(|b| b.usable())
             .filter(|b| dom.is_none_or(|d| b.dom == d))
             .filter(|b| !unborrowed || !self.borrowed(&b.name))
             .filter(|b| !writable || !b.read_only)
@@ -424,10 +437,20 @@ impl FnGen<'_> {
         if self.chaos() {
             return self.any_buf();
         }
+        // Using a split buffer whole is rare otherwise: a targeted deviation.
+        let split: Vec<String> = self
+            .bufs
+            .iter()
+            .filter(|b| !b.destroyed && b.split.is_some() && b.dom == dom && b.ty.fits(ty))
+            .map(|b| b.name.clone())
+            .collect();
+        if !split.is_empty() && self.rng.chance(self.cfg.chaos) {
+            return self.rng.pick(&split).cloned();
+        }
         let mut options: Vec<String> = self
             .bufs
             .iter()
-            .filter(|b| !b.destroyed && b.dom == dom && b.ty.fits(ty))
+            .filter(|b| b.usable() && b.dom == dom && b.ty.fits(ty))
             .filter(|b| !(write || handoff) || !b.read_only)
             .filter(|b| {
                 if write || handoff {
@@ -469,7 +492,7 @@ impl FnGen<'_> {
 
     /// Emit one statement. Returns true if it was a `return`.
     fn stmt(&mut self, depth: usize, in_loop: bool) -> bool {
-        match self.rng.below(130) {
+        match self.rng.below(146) {
             0..=11 => self.declare(depth),
             12..=19 => self.op_move(depth),
             20..=27 => self.op_sync(depth),
@@ -490,19 +513,26 @@ impl FnGen<'_> {
             102..=111 => self.ts_advance(depth),
             112..=118 => self.ts_inspect(depth),
             119..=125 => self.ts_finish(depth),
+            130..=135 => self.op_split(depth),
+            136..=140 => self.op_join(depth),
+            141..=145 => self.op_rotate(depth),
             _ => self.op_call(depth),
         }
         false
     }
 
     fn declare(&mut self, depth: usize) {
+        let ty = DECL_TYPES[self.rng.below(DECL_TYPES.len())];
+        self.declare_as(depth, ty);
+    }
+
+    fn declare_as(&mut self, depth: usize, ty: Ty) -> String {
         let name = self.fresh("b");
         let dom = if self.rng.chance(0.2) {
             Dom::Dma
         } else {
             Dom::Ram
         };
-        let ty = DECL_TYPES[self.rng.below(DECL_TYPES.len())];
         self.line(depth, &format!("{} {name} @{};", ty.text(), dom.name()));
         self.bufs.push(Buf {
             name,
@@ -511,7 +541,11 @@ impl FnGen<'_> {
             destroyed: false,
             exit_dom: None,
             read_only: false,
+            depth,
+            split: None,
+            part_of: None,
         });
+        self.bufs.last().unwrap().name.clone()
     }
 
     fn op_move(&mut self, depth: usize) {
@@ -639,7 +673,7 @@ impl FnGen<'_> {
     }
 
     fn new_pkt(&mut self, depth: usize, state: usize, init: &str) {
-        let name = self.fresh("p");
+        let name = self.fresh("k");
         // Under chaos, claim a state the initializer doesn't produce -- and
         // then use the value as if the claim were true, as a forger would.
         let claimed = if self.chaos() {
@@ -768,7 +802,7 @@ impl FnGen<'_> {
                 .filter(|n| {
                     self.bufs
                         .iter()
-                        .any(|b| &b.name == n && b.exit_dom.is_none())
+                        .any(|b| &b.name == n && b.exit_dom.is_none() && b.part_of.is_none())
                 })
                 .collect();
             self.rng.pick(&c).cloned()
@@ -780,34 +814,280 @@ impl FnGen<'_> {
         }
     }
 
-    fn op_swap(&mut self, depth: usize) {
-        let ignore_borrows = self.chaos();
-        let c: Vec<String> = self
-            .bufs
+    /// Buffers `swap`/`rotate` could permute together with `first`.
+    fn permutable(&self, ignore_borrows: bool) -> Vec<String> {
+        self.bufs
             .iter()
-            .filter(|b| b.exit_dom.is_none() && !b.destroyed && !b.read_only)
+            .filter(|b| b.exit_dom.is_none() && b.usable() && !b.read_only)
             .map(|b| b.name.clone())
             .filter(|n| ignore_borrows || !self.borrowed(n))
-            .collect();
-        if c.len() < 2 {
-            return;
+            .collect()
+    }
+
+    /// Up to `k` distinct names starting with a random one, all of its
+    /// type and block (unless chaos says otherwise).
+    fn permutation_group(&mut self, depth: usize, k: usize) -> Option<Vec<String>> {
+        let ignore_borrows = self.chaos();
+        let mut c = self.permutable(ignore_borrows);
+        if c.is_empty() {
+            let ty = DECL_TYPES[self.rng.below(DECL_TYPES.len())];
+            c.push(self.declare_as(depth, ty));
         }
-        let a = c[self.rng.below(c.len())].clone();
-        let ta = self.ty_of(&a);
-        let same: Vec<String> = c
+        // Usually start from a part of a split buffer, when there is one:
+        // that is where permutations interact with `join`.
+        let parts: Vec<String> = c
             .iter()
-            .filter(|n| **n != a && (self.chaos() || self.ty_of(n) == ta))
+            .filter(|n| {
+                self.bufs
+                    .iter()
+                    .any(|b| &b.name == *n && b.part_of.is_some())
+            })
             .cloned()
             .collect();
-        let Some(b) = self.rng.pick(&same).cloned() else {
+        let a = if !parts.is_empty() && self.rng.chance(0.6) {
+            parts[self.rng.below(parts.len())].clone()
+        } else {
+            c[self.rng.below(c.len())].clone()
+        };
+        let (ta, da) = {
+            let b = self.bufs.iter().find(|b| b.name == a).unwrap();
+            (b.ty, b.depth)
+        };
+        let mut same: Vec<String> = c
+            .iter()
+            .filter(|n| **n != a)
+            .filter(|n| {
+                self.chaos() || {
+                    let b = self.bufs.iter().find(|b| &b.name == *n).unwrap();
+                    b.ty == ta && b.depth == da
+                }
+            })
+            .cloned()
+            .collect();
+        let mut group = vec![a];
+        while group.len() < k && !same.is_empty() {
+            group.push(same.remove(self.rng.below(same.len())));
+        }
+        // Too few partners: declare some (in the first one's block, which
+        // is only possible when that is this block).
+        while group.len() < k && da == depth {
+            group.push(self.declare_as(depth, ta));
+        }
+        (group.len() >= 2).then_some(group)
+    }
+
+    /// Each name takes the next one's storage (the last takes the first's).
+    fn permute(&mut self, names: &[String]) {
+        let idx: Vec<usize> = names
+            .iter()
+            .map(|n| self.bufs.iter().position(|x| &x.name == n).unwrap())
+            .collect();
+        let moved: Vec<(Dom, Option<(String, usize)>)> = idx
+            .iter()
+            .map(|&i| (self.bufs[i].dom, self.bufs[i].part_of.clone()))
+            .collect();
+        for (k, &i) in idx.iter().enumerate() {
+            let (dom, part_of) = moved[(k + 1) % idx.len()].clone();
+            self.bufs[i].dom = dom;
+            self.bufs[i].part_of = part_of;
+        }
+    }
+
+    fn op_swap(&mut self, depth: usize) {
+        let Some(g) = self.permutation_group(depth, 2) else {
             return;
         };
-        self.line(depth, &format!("swap {a}, {b};"));
-        let ia = self.bufs.iter().position(|x| x.name == a).unwrap();
-        let ib = self.bufs.iter().position(|x| x.name == b).unwrap();
-        let (da, db) = (self.bufs[ia].dom, self.bufs[ib].dom);
-        self.bufs[ia].dom = db;
-        self.bufs[ib].dom = da;
+        self.line(depth, &format!("swap {};", g.join(", ")));
+        self.permute(&g);
+    }
+
+    fn op_rotate(&mut self, depth: usize) {
+        let k = 2 + self.rng.below(3);
+        let Some(g) = self.permutation_group(depth, k) else {
+            return;
+        };
+        self.line(depth, &format!("rotate {};", g.join(", ")));
+        self.permute(&g);
+    }
+
+    fn op_split(&mut self, depth: usize) {
+        let parent = if self.chaos() {
+            self.any_buf()
+        } else {
+            let c: Vec<String> = self
+                .candidates(None, true, true)
+                .into_iter()
+                .filter(|n| {
+                    self.bufs
+                        .iter()
+                        .any(|b| &b.name == n && b.exit_dom.is_none())
+                })
+                .collect();
+            self.rng.pick(&c).cloned().or_else(|| {
+                let ty = DECL_TYPES[self.rng.below(DECL_TYPES.len())];
+                Some(self.declare_as(depth, ty))
+            })
+        };
+        let Some(parent) = parent else { return };
+        let Some(i) = self.bufs.iter().position(|b| b.name == parent) else {
+            return;
+        };
+        let (ty, dom) = (self.bufs[i].ty, self.bufs[i].dom);
+        let Some(len) = ty.len else { return };
+        let n = if self.chaos() {
+            3
+        } else if len % 4 == 0 && self.rng.chance(0.3) {
+            4
+        } else {
+            2
+        };
+        let parts: Vec<String> = (0..n).map(|_| self.fresh("s")).collect();
+        self.line(depth, &format!("split {parent} into {};", parts.join(", ")));
+        if len % n as u32 != 0 {
+            return; // rejected; the model does not matter any more
+        }
+        let part_ty = Ty::new(ty.elem, len / n as u32);
+        self.bufs[i].split = Some(parts.clone());
+        for (k, name) in parts.into_iter().enumerate() {
+            self.bufs.push(Buf {
+                name,
+                ty: part_ty,
+                dom,
+                destroyed: false,
+                exit_dom: None,
+                read_only: false,
+                depth,
+                split: None,
+                part_of: Some((parent.clone(), k)),
+            });
+        }
+    }
+
+    /// Split buffers, innermost first.
+    fn split_parents(&self) -> Vec<usize> {
+        (0..self.bufs.len())
+            .rev()
+            .filter(|&i| !self.bufs[i].destroyed && self.bufs[i].split.is_some())
+            .collect()
+    }
+
+    /// Can `parent` be joined as things stand? (`strict` false: ignoring
+    /// whether each slice is in place and the parts share a domain.)
+    fn joinable(&self, parent: usize, strict: bool) -> bool {
+        let pname = &self.bufs[parent].name;
+        let parts = self.bufs[parent].split.as_ref().unwrap();
+        let mut dom = None;
+        for (k, name) in parts.iter().enumerate() {
+            let Some(b) = self.bufs.iter().find(|b| &b.name == name) else {
+                return false;
+            };
+            if !b.usable()
+                || self.borrowed(name)
+                || (strict && b.part_of.as_ref() != Some(&(pname.clone(), k)))
+                || (strict && dom.is_some_and(|d| d != b.dom))
+            {
+                return false;
+            }
+            dom = Some(b.dom);
+        }
+        true
+    }
+
+    fn join(&mut self, depth: usize, parent: usize) {
+        let pname = self.bufs[parent].name.clone();
+        let parts = self.bufs[parent].split.clone().unwrap();
+        self.line(depth, &format!("join {} into {pname};", parts.join(", ")));
+        // (Parts in different domains are an error; the model carries on
+        // with the first part's domain.)
+        let mut dom = None;
+        for name in &parts {
+            if let Some(b) = self.buf_mut(name) {
+                dom = dom.or(Some(b.dom));
+                b.destroyed = true;
+            }
+        }
+        let dom = dom.unwrap_or(self.bufs[parent].dom);
+        self.bufs[parent].dom = dom;
+        self.bufs[parent].split = None;
+    }
+
+    fn op_join(&mut self, depth: usize) {
+        let parents = self.split_parents();
+        let chaos = self.chaos();
+        // Joining parts out of place or across domains is rare otherwise,
+        // so that deviation gets a higher rate than the global chaos one.
+        let strict = !self.rng.chance((self.cfg.chaos * 3.0).min(0.5));
+        let c: Vec<usize> = parents
+            .into_iter()
+            .filter(|&i| chaos || self.joinable(i, strict))
+            .collect();
+        if let Some(&i) = self.rng.pick(&c) {
+            if !strict && self.joinable(i, true) {
+                self.unsettle_parts(depth, i);
+            }
+            self.join(depth, i);
+        } else if let Some(&i) = self.rng.pick(&self.split_parents()) {
+            // Not joinable yet: put its slices back in place first.
+            if self
+                .bufs
+                .iter()
+                .all(|b| b.destroyed || b.name == self.bufs[i].name || !self.borrowed(&b.name))
+            {
+                self.rejoin(depth, i);
+            }
+        }
+    }
+
+    /// A deviation just before a join: hand one part to the DMA engine, or
+    /// swap two of them out of place.
+    fn unsettle_parts(&mut self, depth: usize, parent: usize) {
+        let parts = self.bufs[parent].split.clone().unwrap();
+        let last = parts.last().unwrap().clone();
+        let Some(b) = self.bufs.iter().find(|b| b.name == last) else {
+            return;
+        };
+        if self.rng.chance(0.5) && b.dom == Dom::Ram {
+            let f = Self::handoff_extern(b.ty, Dom::Dma);
+            self.line(depth, &format!("{f}({last});"));
+            self.set_dom(&last, Dom::Dma);
+        } else {
+            let pair = [parts[0].clone(), last];
+            self.line(depth, &format!("swap {};", pair.join(", ")));
+            self.permute(&pair);
+        }
+    }
+
+    /// Put each slice of `parent` back under its own part's name, settle
+    /// the parts in @RAM, and join them.
+    fn rejoin(&mut self, depth: usize, parent: usize) {
+        let pname = self.bufs[parent].name.clone();
+        let parts = self.bufs[parent].split.clone().unwrap();
+        for (k, name) in parts.iter().enumerate() {
+            let slot = Some((pname.clone(), k));
+            let Some(holder) = self.bufs.iter().find(|b| b.part_of == slot && !b.destroyed) else {
+                return;
+            };
+            if &holder.name != name {
+                let pair = [name.clone(), holder.name.clone()];
+                self.line(depth, &format!("swap {};", pair.join(", ")));
+                self.permute(&pair);
+            }
+        }
+        for name in &parts {
+            let Some(b) = self.bufs.iter().find(|b| &b.name == name) else {
+                return;
+            };
+            if !b.destroyed && b.dom != Dom::Ram {
+                self.line(depth, &format!("sync({name});"));
+                self.set_dom(name, Dom::Ram);
+            }
+        }
+        if self.joinable(parent, true) {
+            if self.rng.chance((self.cfg.chaos * 3.0).min(0.5)) {
+                self.unsettle_parts(depth, parent);
+            }
+            self.join(depth, parent);
+        }
     }
 
     fn op_helper_call(&mut self, depth: usize) {
@@ -892,9 +1172,18 @@ impl FnGen<'_> {
                 self.handles[i].released = true;
             }
         }
+        for i in self.split_parents() {
+            let parts = self.bufs[i].split.clone().unwrap();
+            if parts
+                .iter()
+                .any(|p| self.bufs[nb..].iter().any(|b| &b.name == p))
+            {
+                self.rejoin(depth, i);
+            }
+        }
         for i in nb..self.bufs.len() {
             let b = &self.bufs[i];
-            if !b.destroyed && b.dom != Dom::Ram {
+            if b.usable() && b.dom != Dom::Ram {
                 let name = b.name.clone();
                 self.line(depth, &format!("sync({name});"));
                 self.bufs[i].dom = Dom::Ram;
@@ -908,7 +1197,7 @@ impl FnGen<'_> {
             let Some(i) = self.bufs.iter().position(|b| b.name == e.name) else {
                 continue;
             };
-            if self.bufs[i].destroyed || self.bufs[i].dom == e.dom {
+            if !self.bufs[i].usable() || e.split.is_some() || self.bufs[i].dom == e.dom {
                 continue;
             }
             let name = e.name.clone();
@@ -929,6 +1218,7 @@ impl FnGen<'_> {
         if self.rng.chance(self.cfg.skip_repair) {
             return;
         }
+        let rejoin = self.rng.chance(0.7);
         for i in 0..self.handles.len() {
             if !self.handles[i].released {
                 let h = self.handles[i].name.clone();
@@ -936,9 +1226,14 @@ impl FnGen<'_> {
                 self.handles[i].released = true;
             }
         }
+        if rejoin {
+            for i in self.split_parents() {
+                self.rejoin(depth, i);
+            }
+        }
         for i in 0..self.bufs.len() {
             let b = self.bufs[i].clone();
-            if b.destroyed {
+            if !b.usable() {
                 continue;
             }
             let want = b.exit_dom.unwrap_or(Dom::Ram);
@@ -995,6 +1290,9 @@ pub fn program(seed: u64, cfg: Config) -> String {
                 destroyed: false,
                 exit_dom: Some(p.exit),
                 read_only: p.read_only,
+                depth: 0,
+                split: None,
+                part_of: None,
             });
         }
         if !g.block(0, false) {
