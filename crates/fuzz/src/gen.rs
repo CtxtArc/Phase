@@ -2,11 +2,16 @@
 //!
 //! Programs are always syntactically valid and only use declared names
 //! (otherwise nearly everything would be rejected for boring reasons). Each
-//! operation is chosen against a rough model of every buffer's domain and
-//! borrows, and is *usually* consistent with it -- so a useful fraction of
-//! programs pass `phase check` -- but a small, tunable fraction of choices
-//! ignore the model, and blocks sometimes skip the "repair" that would put
-//! things back. Those are the programs that probe the analyzer's edges.
+//! operation is chosen against a rough model of every buffer's type, domain
+//! and borrows, and of every typestate value's state, and is *usually*
+//! consistent with it -- so a useful fraction of programs pass `phase
+//! check` -- but a small, tunable fraction of choices ignore the model, and
+//! blocks sometimes skip the "repair" that would put things back. Those are
+//! the programs that probe the analyzer's edges.
+//!
+//! Buffers come in three types (`u8` x 8, `u8` x 16, `f32` x 8) and meet
+//! externs and helpers with fixed and `_` lengths; typestate values follow
+//! a `Pkt { Raw -> Parsed -> Checked }` machine.
 
 use std::fmt::Write as _;
 
@@ -86,9 +91,61 @@ impl Dom {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Elem {
+    U8,
+    F32,
+}
+
+impl Elem {
+    fn name(self) -> &'static str {
+        match self {
+            Elem::U8 => "u8",
+            Elem::F32 => "f32",
+        }
+    }
+}
+
+/// A buffer's type; `len: None` is a `_` parameter (run-time length).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Ty {
+    elem: Elem,
+    len: Option<u32>,
+}
+
+impl Ty {
+    const fn new(elem: Elem, len: u32) -> Self {
+        Ty {
+            elem,
+            len: Some(len),
+        }
+    }
+
+    fn text(self) -> String {
+        match self.len {
+            Some(n) => format!("buffer<{}, {n}>", self.elem.name()),
+            None => format!("buffer<{}, _>", self.elem.name()),
+        }
+    }
+
+    /// Can a buffer of this type be passed where `want` is required?
+    fn fits(self, want: Ty) -> bool {
+        self.elem == want.elem && (want.len.is_none() || self.len == want.len)
+    }
+}
+
+/// The types declared buffers are given.
+const DECL_TYPES: &[Ty] = &[
+    Ty::new(Elem::U8, 8),
+    Ty::new(Elem::U8, 8),
+    Ty::new(Elem::U8, 16),
+    Ty::new(Elem::F32, 8),
+];
+
 #[derive(Clone, Debug)]
 struct Buf {
     name: String,
+    ty: Ty,
     dom: Dom,
     destroyed: bool,
     /// For a parameter: the domain it must be in at return.
@@ -100,50 +157,135 @@ struct Buf {
 struct Handle {
     name: String,
     target: String,
+    ty: Ty,
     write: bool,
     released: bool,
 }
+
+/// A typestate value: 0 = Raw, 1 = Parsed, 2 = Checked.
+#[derive(Clone, Debug)]
+struct Pkt {
+    name: String,
+    state: usize,
+    consumed: bool,
+}
+
+const PKT_STATES: [&str; 3] = ["Raw", "Parsed", "Checked"];
 
 /// One parameter shape a generated helper can have.
 #[derive(Clone, Copy, Debug)]
 struct ParamKind {
     text: &'static str,
+    ty: Ty,
     entry: Dom,
     exit: Dom,
     read_only: bool,
 }
 
+const fn pk(text: &'static str, ty: Ty, entry: Dom, exit: Dom, read_only: bool) -> ParamKind {
+    ParamKind {
+        text,
+        ty,
+        entry,
+        exit,
+        read_only,
+    }
+}
+
+const U8_8: Ty = Ty::new(Elem::U8, 8);
+const U8_ANY: Ty = Ty {
+    elem: Elem::U8,
+    len: None,
+};
+const F32_8: Ty = Ty::new(Elem::F32, 8);
+const F32_ANY: Ty = Ty {
+    elem: Elem::F32,
+    len: None,
+};
+
 const PARAM_KINDS: &[ParamKind] = &[
-    ParamKind {
-        text: "buffer<u8, 8> @RAM",
-        entry: Dom::Ram,
-        exit: Dom::Ram,
-        read_only: false,
-    },
-    ParamKind {
-        text: "read buffer<u8, 8> @RAM",
-        entry: Dom::Ram,
-        exit: Dom::Ram,
-        read_only: true,
-    },
-    ParamKind {
-        text: "buffer<u8, 8> @DMA -> @RAM",
-        entry: Dom::Dma,
-        exit: Dom::Ram,
-        read_only: false,
-    },
-    ParamKind {
-        text: "write buffer<u8, 8> @RAM -> @DMA",
-        entry: Dom::Ram,
-        exit: Dom::Dma,
-        read_only: false,
-    },
-    ParamKind {
-        text: "buffer<u8, 8> @DMA",
-        entry: Dom::Dma,
-        exit: Dom::Dma,
-        read_only: false,
-    },
+    pk("buffer<u8, 8> @RAM", U8_8, Dom::Ram, Dom::Ram, false),
+    pk("read buffer<u8, 8> @RAM", U8_8, Dom::Ram, Dom::Ram, true),
+    pk(
+        "buffer<u8, 8> @DMA -> @RAM",
+        U8_8,
+        Dom::Dma,
+        Dom::Ram,
+        false,
+    ),
+    pk(
+        "write buffer<u8, 8> @RAM -> @DMA",
+        U8_8,
+        Dom::Ram,
+        Dom::Dma,
+        false,
+    ),
+    pk("buffer<u8, 8> @DMA", U8_8, Dom::Dma, Dom::Dma, false),
+    pk("buffer<u8, _> @RAM", U8_ANY, Dom::Ram, Dom::Ram, false),
+    pk("read buffer<u8, _> @RAM", U8_ANY, Dom::Ram, Dom::Ram, true),
+    pk(
+        "write buffer<u8, _> @RAM -> @DMA",
+        U8_ANY,
+        Dom::Ram,
+        Dom::Dma,
+        false,
+    ),
+    pk(
+        "buffer<f32, _> @DMA -> @RAM",
+        F32_ANY,
+        Dom::Dma,
+        Dom::Ram,
+        false,
+    ),
+    pk("read buffer<f32, 8> @RAM", F32_8, Dom::Ram, Dom::Ram, true),
+];
+
+/// What an extern does to a buffer argument.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OpKind {
+    Look,
+    Poke,
+    Mix,
+    Cmp,
+    Start,
+    Finish,
+    Emit,
+    Kick,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExternOp {
+    name: &'static str,
+    ty: Ty,
+    kind: OpKind,
+}
+
+const fn eo(name: &'static str, ty: Ty, kind: OpKind) -> ExternOp {
+    ExternOp { name, ty, kind }
+}
+
+const EXTERN_OPS: &[ExternOp] = &[
+    eo("look", U8_8, OpKind::Look),
+    eo("poke", U8_8, OpKind::Poke),
+    eo("mix", U8_8, OpKind::Mix),
+    eo("cmp", U8_8, OpKind::Cmp),
+    eo("start", U8_8, OpKind::Start),
+    eo("finish", U8_8, OpKind::Finish),
+    eo("emit", U8_8, OpKind::Emit),
+    eo("kick", U8_8, OpKind::Kick),
+    eo("glook", U8_ANY, OpKind::Look),
+    eo("gpoke", U8_ANY, OpKind::Poke),
+    eo("gmix", U8_ANY, OpKind::Mix),
+    eo("gstart", U8_ANY, OpKind::Start),
+    eo("gfinish", U8_ANY, OpKind::Finish),
+    eo("gemit", U8_ANY, OpKind::Emit),
+    eo("flook", F32_ANY, OpKind::Look),
+    eo("flook8", F32_8, OpKind::Look),
+    eo("fpoke", F32_ANY, OpKind::Poke),
+    eo("fmix", F32_ANY, OpKind::Mix),
+    eo("fstart", F32_ANY, OpKind::Start),
+    eo("ffinish", F32_ANY, OpKind::Finish),
+    eo("femit", F32_ANY, OpKind::Emit),
 ];
 
 #[derive(Clone, Debug)]
@@ -152,7 +294,9 @@ struct Helper {
     params: Vec<ParamKind>,
 }
 
-/// The fixed extern vocabulary every generated program declares.
+/// The fixed vocabulary every generated program declares: externs for
+/// each buffer type (fixed and `_` lengths), and a typestate machine with
+/// its externs and three PHASE helpers.
 pub const EXTERNS: &str = "\
 extern fn flip() -> bool;
 extern fn count() -> u32;
@@ -164,6 +308,45 @@ extern fn start(x: write buffer<u8, 8> @RAM -> @DMA);
 extern fn finish(x: buffer<u8, 8> @DMA -> @RAM);
 extern fn emit(x: write buffer<u8, 8> @RAM -> @DEVICE);
 extern fn kick(x: buffer<u8, 8> @DMA);
+extern fn glook(x: read buffer<u8, _> @RAM);
+extern fn gpoke(x: write buffer<u8, _> @RAM);
+extern fn gmix(a: read buffer<u8, _> @RAM, b: write buffer<u8, _> @RAM);
+extern fn gstart(x: write buffer<u8, _> @RAM -> @DMA);
+extern fn gfinish(x: buffer<u8, _> @DMA -> @RAM);
+extern fn gemit(x: write buffer<u8, _> @RAM -> @DEVICE);
+extern fn flook(x: read buffer<f32, _> @RAM);
+extern fn flook8(x: read buffer<f32, 8> @RAM);
+extern fn fpoke(x: write buffer<f32, _> @RAM);
+extern fn fmix(a: read buffer<f32, _> @RAM, b: write buffer<f32, _> @RAM);
+extern fn fstart(x: write buffer<f32, _> @RAM -> @DMA);
+extern fn ffinish(x: buffer<f32, _> @DMA -> @RAM);
+extern fn femit(x: write buffer<f32, _> @RAM -> @DEVICE);
+
+entity Pkt : @RAM { seq: u32 }
+state Pkt { Raw -> Parsed -> Checked }
+extern fn recv() -> Pkt<Raw>;
+extern fn parse(p: Pkt<Raw>) -> Pkt<Parsed>;
+extern fn verify(p: Pkt<Parsed>) -> Pkt<Checked>;
+extern fn peekraw(p: read Pkt<Raw>);
+extern fn peek(p: read Pkt<Checked>);
+extern fn deliver(p: Pkt<Checked>);
+extern fn drop_raw(p: Pkt<Raw>);
+
+fn tadmit() -> Pkt<Checked> {
+    let a: Pkt<Raw> = recv();
+    let b: Pkt<Parsed> = parse(a);
+    let c: Pkt<Checked> = verify(b);
+    return c;
+}
+
+fn tparse(p: Pkt<Raw>) -> Pkt<Parsed> {
+    let q: Pkt<Parsed> = parse(p);
+    return q;
+}
+
+fn tshow(p: read Pkt<Checked>) {
+    peek(p);
+}
 ";
 
 struct FnGen<'a> {
@@ -174,6 +357,10 @@ struct FnGen<'a> {
     counter: usize,
     bufs: Vec<Buf>,
     handles: Vec<Handle>,
+    pkts: Vec<Pkt>,
+    /// Typestate values below this index were created outside the
+    /// innermost loop: consuming one there would reuse it next iteration.
+    pkt_floor: usize,
 }
 
 impl FnGen<'_> {
@@ -203,6 +390,14 @@ impl FnGen<'_> {
             .collect()
     }
 
+    fn ty_of(&self, name: &str) -> Option<Ty> {
+        self.bufs
+            .iter()
+            .find(|b| b.name == name)
+            .map(|b| b.ty)
+            .or_else(|| self.handles.iter().find(|h| h.name == name).map(|h| h.ty))
+    }
+
     fn borrowed(&self, name: &str) -> bool {
         self.handles.iter().any(|h| h.target == name && !h.released)
     }
@@ -225,14 +420,14 @@ impl FnGen<'_> {
     /// A buffer usable for a parameter needing `dom`, with `write` access
     /// (or read-only access when `write` is false). May return a borrow
     /// handle instead of an owner.
-    fn arg_for(&mut self, dom: Dom, write: bool, handoff: bool) -> Option<String> {
+    fn arg_for(&mut self, ty: Ty, dom: Dom, write: bool, handoff: bool) -> Option<String> {
         if self.chaos() {
             return self.any_buf();
         }
         let mut options: Vec<String> = self
             .bufs
             .iter()
-            .filter(|b| !b.destroyed && b.dom == dom)
+            .filter(|b| !b.destroyed && b.dom == dom && b.ty.fits(ty))
             .filter(|b| !(write || handoff) || !b.read_only)
             .filter(|b| {
                 if write || handoff {
@@ -244,7 +439,7 @@ impl FnGen<'_> {
             .map(|b| b.name.clone())
             .collect();
         if dom == Dom::Ram && !handoff {
-            for h in self.handles.iter().filter(|h| !h.released) {
+            for h in self.handles.iter().filter(|h| !h.released && h.ty.fits(ty)) {
                 if h.write || !write {
                     options.push(h.name.clone());
                 }
@@ -274,7 +469,7 @@ impl FnGen<'_> {
 
     /// Emit one statement. Returns true if it was a `return`.
     fn stmt(&mut self, depth: usize, in_loop: bool) -> bool {
-        match self.rng.below(100) {
+        match self.rng.below(130) {
             0..=11 => self.declare(depth),
             12..=19 => self.op_move(depth),
             20..=27 => self.op_sync(depth),
@@ -291,6 +486,10 @@ impl FnGen<'_> {
                 self.line(depth, "return;");
                 return true;
             }
+            94..=101 => self.ts_create(depth),
+            102..=111 => self.ts_advance(depth),
+            112..=118 => self.ts_inspect(depth),
+            119..=125 => self.ts_finish(depth),
             _ => self.op_call(depth),
         }
         false
@@ -303,9 +502,11 @@ impl FnGen<'_> {
         } else {
             Dom::Ram
         };
-        self.line(depth, &format!("buffer<u8, 8> {name} @{};", dom.name()));
+        let ty = DECL_TYPES[self.rng.below(DECL_TYPES.len())];
+        self.line(depth, &format!("{} {name} @{};", ty.text(), dom.name()));
         self.bufs.push(Buf {
             name,
+            ty,
             dom,
             destroyed: false,
             exit_dom: None,
@@ -344,57 +545,177 @@ impl FnGen<'_> {
     }
 
     fn op_call(&mut self, depth: usize) {
-        match self.rng.below(7) {
-            0 => {
-                if let Some(x) = self.arg_for(Dom::Ram, false, false) {
-                    self.line(depth, &format!("look({x});"));
+        let op = EXTERN_OPS[self.rng.below(EXTERN_OPS.len())];
+        let (name, ty) = (op.name, op.ty);
+        match op.kind {
+            OpKind::Look => {
+                if let Some(x) = self.arg_for(ty, Dom::Ram, false, false) {
+                    self.line(depth, &format!("{name}({x});"));
                 }
             }
-            1 => {
-                if let Some(x) = self.arg_for(Dom::Ram, true, false) {
-                    self.line(depth, &format!("poke({x});"));
+            OpKind::Poke => {
+                if let Some(x) = self.arg_for(ty, Dom::Ram, true, false) {
+                    self.line(depth, &format!("{name}({x});"));
                 }
             }
-            2 => {
-                let a = self.arg_for(Dom::Ram, false, false);
-                let b = self.arg_for(Dom::Ram, true, false);
+            OpKind::Mix => {
+                let a = self.arg_for(ty, Dom::Ram, false, false);
+                let b = self.arg_for(ty, Dom::Ram, true, false);
                 if let (Some(a), Some(b)) = (a, b) {
-                    self.line(depth, &format!("mix({a}, {b});"));
+                    self.line(depth, &format!("{name}({a}, {b});"));
                 }
             }
-            3 => {
-                let a = self.arg_for(Dom::Ram, false, false);
-                let b = self.arg_for(Dom::Ram, false, false);
+            OpKind::Cmp => {
+                let a = self.arg_for(ty, Dom::Ram, false, false);
+                let b = self.arg_for(ty, Dom::Ram, false, false);
                 if let (Some(a), Some(b)) = (a, b) {
-                    self.line(depth, &format!("cmp({a}, {b});"));
+                    self.line(depth, &format!("{name}({a}, {b});"));
                 }
             }
-            4 => {
-                if let Some(x) = self.arg_for(Dom::Ram, true, true) {
-                    self.line(depth, &format!("start({x});"));
+            OpKind::Start => {
+                if let Some(x) = self.arg_for(ty, Dom::Ram, true, true) {
+                    self.line(depth, &format!("{name}({x});"));
                     self.set_dom(&x, Dom::Dma);
                 }
             }
-            5 => {
-                if let Some(x) = self.arg_for(Dom::Dma, false, true) {
-                    let f = if self.rng.chance(0.5) {
-                        "finish"
-                    } else {
-                        "kick"
-                    };
-                    self.line(depth, &format!("{f}({x});"));
-                    if f == "finish" {
-                        self.set_dom(&x, Dom::Ram);
-                    }
+            OpKind::Finish => {
+                if let Some(x) = self.arg_for(ty, Dom::Dma, false, true) {
+                    self.line(depth, &format!("{name}({x});"));
+                    self.set_dom(&x, Dom::Ram);
                 }
             }
-            _ => {
-                if let Some(x) = self.arg_for(Dom::Ram, true, true) {
-                    self.line(depth, &format!("emit({x});"));
+            OpKind::Kick => {
+                if let Some(x) = self.arg_for(ty, Dom::Dma, false, true) {
+                    self.line(depth, &format!("{name}({x});"));
+                }
+            }
+            OpKind::Emit => {
+                if let Some(x) = self.arg_for(ty, Dom::Ram, true, true) {
+                    self.line(depth, &format!("{name}({x});"));
                     self.set_dom(&x, Dom::Device);
                 }
             }
         }
+    }
+
+    /// The extern that hands a buffer of `ty` to `dom` (for repairs).
+    fn handoff_extern(ty: Ty, dom: Dom) -> &'static str {
+        match (ty.elem, dom) {
+            (Elem::U8, Dom::Device) => "gemit",
+            (Elem::U8, _) => "gstart",
+            (Elem::F32, Dom::Device) => "femit",
+            (Elem::F32, _) => "fstart",
+        }
+    }
+
+    // ---- typestate values ----------------------------------------------
+
+    fn live_pkts(&self, state: Option<usize>, consumable: bool) -> Vec<usize> {
+        (0..self.pkts.len())
+            .filter(|&i| !self.pkts[i].consumed)
+            .filter(|&i| state.is_none_or(|s| self.pkts[i].state == s))
+            .filter(|&i| !consumable || i >= self.pkt_floor)
+            .collect()
+    }
+
+    /// A typestate value to use: usually one that fits. Under chaos, the
+    /// deviations that matter: a value already consumed, or (when it will
+    /// be consumed) one created outside the current loop.
+    fn pick_pkt(&mut self, state: Option<usize>, consumable: bool) -> Option<usize> {
+        // Typestate operations are a small share of statements, so their
+        // deviations get a higher rate than the global chaos setting.
+        let deviate = self.rng.chance((self.cfg.chaos * 3.0).min(0.5));
+        if deviate && !self.pkts.is_empty() {
+            let wrong: Vec<usize> = (0..self.pkts.len())
+                .filter(|&i| self.pkts[i].consumed || (consumable && i < self.pkt_floor))
+                .collect();
+            return match self.rng.pick(&wrong) {
+                Some(&i) => Some(i),
+                None => Some(self.rng.below(self.pkts.len())),
+            };
+        }
+        let c = self.live_pkts(state, consumable);
+        self.rng.pick(&c).copied()
+    }
+
+    fn new_pkt(&mut self, depth: usize, state: usize, init: &str) {
+        let name = self.fresh("p");
+        // Under chaos, claim a state the initializer doesn't produce -- and
+        // then use the value as if the claim were true, as a forger would.
+        let claimed = if self.chaos() {
+            self.rng.below(3)
+        } else {
+            state
+        };
+        self.line(
+            depth,
+            &format!("let {name}: Pkt<{}> = {init};", PKT_STATES[claimed]),
+        );
+        self.pkts.push(Pkt {
+            name,
+            state: claimed,
+            consumed: false,
+        });
+    }
+
+    fn ts_create(&mut self, depth: usize) {
+        match self.rng.below(4) {
+            0 => {
+                let seq = self.rng.below(100);
+                self.new_pkt(depth, 0, &format!("Pkt {{ seq: {seq} }}"));
+            }
+            1 => self.new_pkt(depth, 2, "tadmit()"),
+            _ => self.new_pkt(depth, 0, "recv()"),
+        }
+    }
+
+    fn ts_advance(&mut self, depth: usize) {
+        let Some(i) = self.pick_pkt(None, true) else {
+            return self.ts_create(depth);
+        };
+        let p = self.pkts[i].name.clone();
+        let (init, next) = match self.pkts[i].state {
+            0 if self.rng.chance(0.4) => (format!("tparse({p})"), 1),
+            0 => (format!("parse({p})"), 1),
+            1 => (format!("verify({p})"), 2),
+            _ => return self.ts_finish(depth),
+        };
+        self.pkts[i].consumed = true;
+        self.new_pkt(depth, next, &init);
+    }
+
+    fn ts_inspect(&mut self, depth: usize) {
+        let Some(i) = self.pick_pkt(None, false) else {
+            return;
+        };
+        let p = self.pkts[i].name.clone();
+        let f = match self.pkts[i].state {
+            0 => "peekraw",
+            2 if self.rng.chance(0.4) => "tshow",
+            _ => "peek",
+        };
+        if self.rng.chance(0.3) {
+            let r = self.fresh("r");
+            self.line(depth, &format!("let {r} = borrow {p} read;"));
+            self.line(depth, &format!("{f}({r});"));
+            self.line(depth, &format!("release {r};"));
+        } else {
+            self.line(depth, &format!("{f}({p});"));
+        }
+    }
+
+    fn ts_finish(&mut self, depth: usize) {
+        let Some(i) = self.pick_pkt(None, true) else {
+            return self.ts_create(depth);
+        };
+        let p = self.pkts[i].name.clone();
+        let f = match self.pkts[i].state {
+            0 => "drop_raw",
+            2 => "deliver",
+            _ => return,
+        };
+        self.line(depth, &format!("{f}({p});"));
+        self.pkts[i].consumed = true;
     }
 
     fn op_borrow(&mut self, depth: usize) {
@@ -410,12 +731,16 @@ impl FnGen<'_> {
             self.rng.pick(&c).cloned()
         };
         let Some(target) = target else { return };
+        let Some(ty) = self.ty_of(&target) else {
+            return;
+        };
         let name = self.fresh("h");
         let mode = if write { "write" } else { "read" };
         self.line(depth, &format!("let {name} = borrow {target} {mode};"));
         self.handles.push(Handle {
             name,
             target,
+            ty,
             write,
             released: false,
         });
@@ -467,12 +792,16 @@ impl FnGen<'_> {
         if c.len() < 2 {
             return;
         }
-        let a = self.rng.below(c.len());
-        let mut b = self.rng.below(c.len());
-        if a == b {
-            b = (b + 1) % c.len();
-        }
-        let (a, b) = (c[a].clone(), c[b].clone());
+        let a = c[self.rng.below(c.len())].clone();
+        let ta = self.ty_of(&a);
+        let same: Vec<String> = c
+            .iter()
+            .filter(|n| **n != a && (self.chaos() || self.ty_of(n) == ta))
+            .cloned()
+            .collect();
+        let Some(b) = self.rng.pick(&same).cloned() else {
+            return;
+        };
         self.line(depth, &format!("swap {a}, {b};"));
         let ia = self.bufs.iter().position(|x| x.name == a).unwrap();
         let ib = self.bufs.iter().position(|x| x.name == b).unwrap();
@@ -489,7 +818,7 @@ impl FnGen<'_> {
         let mut args = Vec::new();
         for p in &h.params {
             let handoff = p.entry != p.exit || !p.read_only;
-            let Some(a) = self.arg_for(p.entry, !p.read_only, handoff) else {
+            let Some(a) = self.arg_for(p.ty, p.entry, !p.read_only, handoff) else {
                 return;
             };
             args.push((a, p.exit));
@@ -505,10 +834,10 @@ impl FnGen<'_> {
         let c = self.fresh("c");
         self.line(depth, &format!("let {c}: bool = flip();"));
         self.line(depth, &format!("if {c} {{"));
-        let saved = (self.bufs.clone(), self.handles.clone());
+        let saved = (self.bufs.clone(), self.handles.clone(), self.pkts.clone());
         self.scoped_block(depth + 1, in_loop);
-        let then_state = (self.bufs.clone(), self.handles.clone());
-        (self.bufs, self.handles) = saved;
+        let then_state = (self.bufs.clone(), self.handles.clone(), self.pkts.clone());
+        (self.bufs, self.handles, self.pkts) = saved;
         if self.rng.chance(0.6) {
             self.line(depth, "} else {");
             self.scoped_block(depth + 1, in_loop);
@@ -517,7 +846,7 @@ impl FnGen<'_> {
         // Continue from one of the two branches' views (they should agree
         // if the program is going to be accepted).
         if self.rng.chance(0.5) {
-            (self.bufs, self.handles) = then_state;
+            (self.bufs, self.handles, self.pkts) = then_state;
         }
     }
 
@@ -528,8 +857,10 @@ impl FnGen<'_> {
         self.line(depth, &format!("let {lim}: u32 = count();"));
         self.line(depth, &format!("while {n} < {lim} {{"));
         let entry = self.bufs.clone();
+        let floor = std::mem::replace(&mut self.pkt_floor, self.pkts.len());
         // (no `return` inside loop bodies, so the body always falls through)
         self.scoped_block(depth + 1, true);
+        self.pkt_floor = floor;
         // Restore the loop invariant (usually).
         if !self.rng.chance(self.cfg.skip_repair) {
             self.restore(&entry, depth + 1);
@@ -542,12 +873,14 @@ impl FnGen<'_> {
     fn scoped_block(&mut self, depth: usize, in_loop: bool) {
         let nb = self.bufs.len();
         let nh = self.handles.len();
+        let np = self.pkts.len();
         let returned = self.block(depth, in_loop);
         if !returned && !self.rng.chance(self.cfg.skip_repair) {
             self.repair_locals(nb, nh, depth);
         }
         self.bufs.truncate(nb);
         self.handles.truncate(nh);
+        self.pkts.truncate(np);
     }
 
     /// Release this block's borrows and hand its buffers back to the CPU.
@@ -583,16 +916,10 @@ impl FnGen<'_> {
                 self.line(depth, &format!("sync({name});"));
                 self.bufs[i].dom = Dom::Ram;
             }
-            match e.dom {
-                Dom::Ram => {}
-                Dom::Dma => {
-                    self.line(depth, &format!("start({name});"));
-                    self.bufs[i].dom = Dom::Dma;
-                }
-                Dom::Device => {
-                    self.line(depth, &format!("emit({name});"));
-                    self.bufs[i].dom = Dom::Device;
-                }
+            if e.dom != Dom::Ram {
+                let f = Self::handoff_extern(self.bufs[i].ty, e.dom);
+                self.line(depth, &format!("{f}({name});"));
+                self.bufs[i].dom = e.dom;
             }
         }
     }
@@ -623,7 +950,8 @@ impl FnGen<'_> {
                 self.bufs[i].dom = Dom::Ram;
             }
             if want == Dom::Dma {
-                self.line(depth, &format!("start({});", b.name));
+                let f = Self::handoff_extern(b.ty, Dom::Dma);
+                self.line(depth, &format!("{f}({});", b.name));
                 self.bufs[i].dom = Dom::Dma;
             }
         }
@@ -653,6 +981,8 @@ pub fn program(seed: u64, cfg: Config) -> String {
             counter: 0,
             bufs: Vec::new(),
             handles: Vec::new(),
+            pkts: Vec::new(),
+            pkt_floor: 0,
         };
         let mut params = Vec::new();
         for (i, p) in h.params.iter().enumerate() {
@@ -660,6 +990,7 @@ pub fn program(seed: u64, cfg: Config) -> String {
             params.push(format!("{name}: {}", p.text));
             g.bufs.push(Buf {
                 name,
+                ty: p.ty,
                 dom: p.entry,
                 destroyed: false,
                 exit_dom: Some(p.exit),
@@ -686,6 +1017,8 @@ pub fn program(seed: u64, cfg: Config) -> String {
         counter: 0,
         bufs: Vec::new(),
         handles: Vec::new(),
+        pkts: Vec::new(),
+        pkt_floor: 0,
     };
     if !g.block(0, false) {
         g.repair_all(0);

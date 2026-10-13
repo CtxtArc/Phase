@@ -3,11 +3,16 @@
 //!
 //!   cargo run --release -p phase_fuzz -- [--count N] [--seed S] [--runs R]
 //!                                        [--chaos P] [--out DIR]
+//!   cargo run --release -p phase_fuzz -- --print SEED [--chaos P]
 //!
 //! Exit status is 1 if any accepted program tripped a runtime check (or
 //! failed later in the pipeline); each such program is written to DIR.
 
-use phase_fuzz::{fuzz, gen::Config, Runner};
+use phase_fuzz::{
+    fuzz,
+    gen::{program, Config},
+    Runner,
+};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -17,6 +22,7 @@ fn main() -> ExitCode {
     let mut runs = 4u32;
     let mut cfg = Config::default();
     let mut out = PathBuf::from("fuzz-findings");
+    let mut print: Option<u64> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -27,9 +33,16 @@ fn main() -> ExitCode {
             "--runs" => runs = val.parse().unwrap_or(runs),
             "--chaos" => cfg.chaos = val.parse().unwrap_or(cfg.chaos),
             "--out" => out = PathBuf::from(val),
+            "--print" => match val.parse() {
+                Ok(s) => print = Some(s),
+                Err(_) => {
+                    eprintln!("--print needs a seed");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--help" | "-h" => {
                 println!(
-                    "usage: phase-fuzz [--count N] [--seed S] [--runs R] [--chaos P] [--out DIR]"
+                    "usage: phase-fuzz [--count N] [--seed S] [--runs R] [--chaos P] [--out DIR]\n       phase-fuzz --print SEED [--chaos P]   (print one generated program)"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -39,6 +52,11 @@ fn main() -> ExitCode {
             }
         }
         i += 2;
+    }
+
+    if let Some(seed) = print {
+        print!("{}", program(seed, cfg));
+        return ExitCode::SUCCESS;
     }
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
