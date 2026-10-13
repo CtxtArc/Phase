@@ -4,6 +4,69 @@ All notable changes to PHASE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] — 2026-10-13
+
+Ring buffers: `rotate` for triple buffering and `split`/`join` for
+circular DMA with half-transfer interrupts. And the evidence from 1.3 now
+reaches the whole type system: the runtime checker verifies buffer sizes,
+typestate and splits, and the fuzzer generates them — each rule family
+validated by putting an analyzer bug back and watching the fuzzer catch
+it (spec §6.7).
+
+Every program 1.3 accepted is still accepted, unless it uses `rotate`,
+`split`, `join` or `into` as a name: they are keywords now.
+
+### Added
+
+- **`rotate a, b, c;`** (spec §3.14): each name takes the next one's
+  storage, with everything the checker knows about it; `swap` is the
+  two-name case and keeps its messages. Same rules as `swap`.
+- **`split buf into p0, p1, …;` and `join p0, p1, … into buf;`** (spec
+  §3.14): equal, consecutive slices of a fixed-length owned local become
+  separately tracked buffers in its domain; the whole is unusable until
+  the same parts — each still holding its own slice, all in one domain —
+  are joined back. Parts carry the block-end and exit obligations, and a
+  split must agree across merges and be undone within a loop body.
+- **Runtime checker** (`--checked`): every buffer argument is checked to
+  really have the bytes the callee is told it has; typestate values are
+  tracked (state from the callee's declared return state, never an
+  annotation; consumption; a direct construction must be in the initial
+  state); `rotate`, `split` and `join` are checked (slices in place, one
+  domain, no whole-buffer use while split).
+- **Fuzzer**: three buffer types with fixed and `_` lengths across 21
+  extern operations and 10 helper parameter shapes; a typestate machine
+  whose values are created, advanced, inspected and consumed; `rotate`,
+  `split` (into 2 or 4, nested) and `join`. Deviations for rare rules are
+  targeted (forged states then used as claimed, reuse of consumed values,
+  joining right after unsettling a part). `phase-fuzz --print SEED` prints
+  one generated program.
+- `examples/triple_buffer.phase` and `examples/circular_dma.phase` (+
+  runtimes), with end-to-end tests that check frame and block order in
+  normal and checked builds.
+- Bug gallery #30 `process_half_in_flight`, #31 `use_ring_while_split`,
+  #32 `join_with_half_in_flight`, #33 `rotate_wrong_direction`, with CWE
+  mappings.
+
+### Fixed
+
+- **A borrow of a typestate value passed to a by-value parameter** emitted
+  the pointer instead of the value (`peek(r)` for `peek(Pkt p)`), so an
+  accepted program failed to compile in C. It now passes `*r`.
+  *(Found by the new runtime-checker tests.)*
+- Two false alarms in the runtime checker's `split` support, both found
+  by the fuzzer before release: a buffer, its first part and that part's
+  own first part share one address, and a buffer split under a name
+  `rotate` had moved ends under its declared name. Split records are now
+  matched by name and call frame. Both programs are in
+  `crates/fuzz/regressions/`.
+
+### Changed
+
+- Internal crate APIs: `Stmt` gains `Rotate`, `Split` and `Join`;
+  `PirInst` gains `Rotate`, `Split`, `Join` and `TypestateInit`;
+  `PirFnSig` gains `param_states` and `return_state`. Normal (unchecked)
+  generated C is unchanged for every 1.3 program.
+
 ## [1.3.0] — 2026-10-13
 
 Evidence that the static guarantees hold: a runtime-checked build mode

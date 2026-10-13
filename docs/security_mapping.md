@@ -509,6 +509,68 @@ run time; such a buffer can only be passed on to another `_` parameter.
 
 ---
 
+## v1.4 additions
+
+v1.4 added `rotate` for rings of buffers and `split`/`join` for buffers a
+DMA engine fills in parts (spec §3.14). These four are the ways circular
+and triple-buffered streaming goes wrong.
+
+## #30 — Processing the half the engine is still filling
+
+**`examples/bug_gallery/process_half_in_flight.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html),
+[CWE-367](https://cwe.mitre.org/data/definitions/367.html).
+
+**Real-world precedent:** circular DMA with half-transfer interrupts is
+how most microcontroller ADC and audio drivers stream (on STM32, the HAL's
+`HAL_ADC_ConvHalfCpltCallback` / `HAL_ADC_ConvCpltCallback` pair). The
+callback for one half must process *that* half; processing the other one
+reads a block the engine is in the middle of writing — a torn block, the
+circular form of #22.
+
+**What PHASE does:** after `split ring into lo, hi;` each half is tracked
+on its own, so the half the engine owns is `@DMA` and can't be passed to
+a kernel that reads RAM.
+
+---
+
+## #31 — Using the whole buffer while it is split, #32 — joining it with a half in flight
+
+**`examples/bug_gallery/use_ring_while_split.phase`**,
+**`examples/bug_gallery/join_with_half_in_flight.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html),
+[CWE-367](https://cwe.mitre.org/data/definitions/367.html).
+
+**Real-world precedent:** a whole-buffer view (a summary, a log dump, a
+copy-out) of a circular buffer while the engine still owns part of it;
+or stopping the stream for one half only and then treating the buffer as
+whole. Either way the CPU reads memory that is still being written.
+
+**What PHASE does:** a split buffer can't be used at all until its parts
+are joined back, and `join` requires every part — in its original place —
+to be in the same domain, which the buffer then has.
+
+---
+
+## #33 — Rotating a triple-buffer ring the wrong way
+
+**`examples/bug_gallery/rotate_wrong_direction.phase`**
+
+**Category:** [CWE-696](https://cwe.mitre.org/data/definitions/696.html) —
+Incorrect Behavior Order.
+
+**Real-world precedent:** the three-buffer form of #23: the code's idea of
+which buffer is free, which is filling and which is next drifts from the
+hardware's, so the loop waits on a buffer nothing is filling and
+restarts one already in flight.
+
+**What PHASE does:** the loop invariant — a `while` body must leave every
+buffer as it found it — rejects a rotation that leaves the roles shifted.
+
+---
+
 ## Summary table
 
 | # | Bug-gallery file | CWE | Named real-world precedent |
@@ -542,3 +604,7 @@ run time; such a buffer can only be passed on to another `_` parameter.
 | 27 | `buffer_length_mismatch.phase` | CWE-787 | buffer overflow from a size mismatch |
 | 28 | `buffer_element_mismatch.phase` | CWE-843 | type confusion between byte and sample buffers |
 | 29 | `runtime_length_to_fixed.phase` | CWE-787 | unchecked length assumption |
+| 30 | `process_half_in_flight.phase` | CWE-362, CWE-367 | torn block in a circular (half-transfer) DMA stream |
+| 31 | `use_ring_while_split.phase` | CWE-362, CWE-367 | whole-buffer view over a half still being written |
+| 32 | `join_with_half_in_flight.phase` | CWE-362, CWE-367 | stream stopped for one half only |
+| 33 | `rotate_wrong_direction.phase` | CWE-696 | triple-buffer roles out of sync with the code |

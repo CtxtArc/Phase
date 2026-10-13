@@ -2,7 +2,7 @@
 
 **A physical-domain safety language for signal, RF, and embedded pipelines**
 
-Version 1.3
+Version 1.4
 
 ---
 
@@ -165,7 +165,8 @@ volatile access -- always observable, never eliminated by codegen
 
 Identifiers, integer/float literals, string literals, comments (`//`, `/* */`).
 Keywords: `entity`, `fn`, `extern`, `let`, `buffer`, `move`, `sync`, `borrow`,
-`release`, `destroy`, `swap`, `read`, `write`, `state`, `if`, `else`, `while`,
+`release`, `destroy`, `swap`, `rotate`, `split`, `join`, `into`, `read`,
+`write`, `state`, `if`, `else`, `while`,
 `return`, `true`, `false`.
 
 ### 3.2 Entities and domains
@@ -407,6 +408,73 @@ single-pass loop check remains sound. In C, a swapped buffer is a storage
 array plus a pointer, and `swap` exchanges the pointers. See
 `examples/ping_pong.phase`.
 
+### 3.14 rotate, split and join
+
+Two more buffer shapes come up in every streaming driver: more than two
+buffers in a ring, and one buffer the DMA engine fills a half at a time.
+
+**`rotate a, b, c;`** generalizes `swap` to any number of buffers: each
+name takes the *next* one's storage (`a` ← `b` ← `c` ← `a`), with
+everything the checker knows about it. The rules are `swap`'s: live,
+owned, unborrowed local buffers of one type, declared in one block, each
+named once. `swap a, b;` is `rotate a, b;`. Triple buffering keeps two
+captures in flight while the CPU works on a third, and `rotate` is what
+lets its loop body end exactly as it began (`examples/triple_buffer.phase`):
+
+```phase
+start_capture(a); start_capture(b);   // a, b in flight; c free
+while n < 6 {
+    wait_capture(a);                  // the oldest frame is ready
+    start_capture(c);                 // keep two in flight
+    process(a);
+    rotate a, b, c;                   // a, b in flight; c free -- as on entry
+    n = n + 1;
+}
+```
+
+Rotated the wrong way, the loop would next wait on a buffer nothing is
+filling; the loop invariant rejects it (#33).
+
+**`split buf into p0, p1, …;`** cuts a buffer into equal, consecutive
+slices and makes each one a separately tracked buffer: part *i* is
+`buffer<T, len/n>`, starts in `buf`'s domain, and from then on moves,
+syncs, borrows and is passed to calls on its own. The parent must be an
+owned local (not a parameter — its storage belongs to the caller) with a
+fixed length divisible by *n* ≥ 2, unborrowed. While split, the parent
+cannot be used at all — not passed, moved, borrowed, swapped or
+destroyed (#31) — and a part cannot be destroyed on its own.
+
+**`join p0, p1, … into buf;`** ends the split. It names exactly the parts
+`buf` was split into, in order, and each must still hold its own slice: a
+part that was swapped or rotated away has to be swapped back first. The
+parts must be live, unborrowed, and all in one domain (#32), which `buf`
+then has; the part names are consumed. A buffer may stay split until it
+goes out of scope — its parts carry the block-end and exit obligations —
+but it must be split, or not, on every path into a merge, and a `while`
+body that splits must join before it ends.
+
+This is what circular DMA with half-transfer interrupts needs
+(`examples/circular_dma.phase`): the engine runs over the whole buffer
+forever, and the CPU may touch only the half it just finished.
+
+```phase
+split ring into lo, hi;
+start_circular(lo, hi);               // the engine owns both halves
+while n < 4 {
+    wait_half(lo); process(lo); requeue(lo);   // engine is filling hi
+    wait_half(hi); process(hi); requeue(hi);   // engine wrapped to lo
+    n = n + 1;
+}
+stop_circular(lo, hi);
+join lo, hi into ring;
+summarize(ring);                      // the whole buffer is the CPU's again
+```
+
+Processing `hi` right after the half-transfer interrupt — the classic
+off-by-one-half bug in circular ADC drivers — is #30. In C, parts are
+pointers into the parent's storage (`lo = ring + 0; hi = ring + 64;`);
+`rotate` moves pointers like `swap`, and `join` emits nothing.
+
 ---
 
 <a name="part-4-type-system--static-analysis"></a>
@@ -474,7 +542,10 @@ For every program `phase check` accepts, within a function body:
   arguments, unless every occurrence is read-only (a `read` parameter or a
   read borrow). Entities cannot be copied with `let`, and names cannot be
   redeclared, so one location never has two independently tracked names;
-  `swap` exchanges two names' storage and their tracked state together.
+  `swap` and `rotate` move storage between names together with its
+  tracked state. The parts of a split buffer are disjoint slices of it,
+  and the buffer itself is unusable until they are joined (§3.14), so a
+  whole-buffer view never coexists with a part.
 - **Lifetimes.** No access after `destroy`. At every `return` (explicit or
   falling off the end): no local is still `@DMA`/`@DEVICE`-owned, no borrow
   is live, and every parameter is in the domain its signature promises —
@@ -673,21 +744,32 @@ that it holds.
 
 **`phase build --checked`** emits C that verifies the ownership rules
 while the program runs. `runtime/phase_check.c` keeps a shadow state for
-every buffer storage — its domain, whether it was destroyed, and the
-borrows taken of it (with the call frame each was taken in) — keyed by the
-storage's address, so it follows `swap` and borrows without extra
-bookkeeping. The generated code checks it at every buffer creation,
-`move`, `sync`, borrow, use and release of a borrow, `destroy`, `swap`,
-call argument (domain, access mode, borrows, aliasing), extern domain
-change, parameter exit, and scope exit (every block end and every
-`return`). A violation prints `PHASE runtime check failed: …` and exits
-with status 70.
+every buffer storage — its size in bytes, its domain, whether it was
+destroyed or is split, and the borrows taken of it (with the call frame
+each was taken in) — keyed by the storage's address, so it follows `swap`,
+`rotate` and borrows without extra bookkeeping. The generated code checks
+it at every buffer creation, `move`, `sync`, borrow, use and release of a
+borrow, `destroy`, `swap`, `rotate`, `split`, `join`, call argument
+(domain, access mode, borrows, aliasing, and that the buffer really has
+the bytes the callee is told it has — its declared length, or the length
+passed for a `_` parameter), extern domain change, parameter exit, and
+scope exit (every block end and every `return`). A split buffer's parts
+are checked to be its slices, and `join` checks that each part still
+holds its own slice and that all are in one domain.
+
+Typestate values are tracked by the address of the variable holding
+them: their state comes from the callee's *declared* return state (or,
+for a value built directly, must be the machine's initial state) — never
+from an annotation — and every state-requiring argument and `return`
+checks the state, checks that the value was not already consumed, and
+consumes it unless the parameter is `read`. A violation prints `PHASE
+runtime check failed: …` and exits with status 70.
 
 The checker is deliberately independent of the analyzer: it never reasons
 about branches, joins, or loop invariants — where static-analysis bugs
 live — it just watches one concrete execution. Borrow rules apply per
 call frame: a borrow a caller holds is what grants a callee its access to
-the parameter. Scope: buffers only; struct entities and typestate are not
+the parameter. Struct entities other than typestate values are not
 tracked at run time.
 
 **`phase build --stub-externs`** generates placeholder bodies for a
@@ -696,10 +778,17 @@ program's `extern fn`s. Scalar results come from a PRNG seeded by
 any C.
 
 **`phase-fuzz`** (crate `crates/fuzz`) combines the two. It generates
-random, well-formed programs — buffers in every domain, borrows, calls
-with access modes and domain changes, swaps, helper functions with every
-parameter shape, nested `if`/`while`, early returns — mostly consistent
-with a model of each buffer's state, partly not. Every program `phase
+random, well-formed programs — buffers of three types (`u8` × 8, `u8` ×
+16, `f32` × 8) in every domain, borrows, calls to externs and helpers
+with fixed and `_` lengths, access modes and domain changes, `swap`,
+`rotate`, `split` (into 2 or 4, nested) and `join`, a typestate machine
+whose values are created, advanced, inspected and consumed, nested
+`if`/`while`, early returns — mostly consistent with a model of each
+buffer's and value's state, partly not. Deviations for the rarer rules
+are targeted rather than left to chance: a forged state annotation is
+then used as the claim says, a consumed or outer-loop value is reused, a
+split buffer is joined right after one part is handed to the engine or
+two parts are swapped out of place. Every program `phase
 check` accepts *without warnings* is built with `--checked` and
 `--stub-externs` and run with several stub seeds. An accepted program that
 trips a runtime check is a soundness bug in the analyzer. Every program
@@ -709,7 +798,10 @@ by the test suite; CI fuzzes a fresh seed range on every run.
 Its first runs found four bugs, all fixed in v1.3: a buffer declared in a
 block leaving scope while DMA-owned, `swap` across blocks leaving a
 dangling name, an early `return` in `main` with an undefined exit status,
-and a false alarm in the runtime checker itself.
+and a false alarm in the runtime checker itself. In v1.4 it found two
+more false alarms in the runtime checker, both in `split` (a buffer, its
+first part and that part's first part share one address; a buffer split
+under a name `rotate` had moved), before the release.
 
 **Validating the fuzzer.** Silence is only evidence if the fuzzer would
 have spoken. With the block-end check (the first fix above) deliberately
@@ -722,10 +814,33 @@ caught that too, more often at a higher `--chaos` setting (3 findings in
 stub seeds each, including 1,500 at `--chaos 0.3`) produced no
 violations.
 
-**Scope of the evidence.** The runtime checker tracks buffers only, and
-the generator currently uses one buffer type (`buffer<u8, 8>`); typestate,
-struct entities, and buffer type checking are covered by the static tests
-and the bug gallery, not by fuzzing.
+Each rule family added to the generator in v1.4 was validated the same
+way, one analyzer check removed at a time, against seed ranges the real
+analyzer passes cleanly:
+
+| Check removed from the analyzer | Programs | Violations found |
+|---|---|---|
+| buffer element type / length at call sites | 500 | 1 (a size violation) |
+| typestate consumption | 500 | 3 (use after consume) |
+| typestate annotations checked against the producer | 500 | 1 (a forged state) |
+| a split buffer unusable while split | 1,000 | 1 |
+| `join`: parts in one domain | 1,000 | 5 |
+| `join`: each part holds its own slice | 1,000 | 5 |
+
+The first two typestate mutants were *not* caught until the generator was
+rebalanced (typestate values were created 0.7 times per program, and a
+consumed value reused in 1 program in 400; now 2.8 and 36 in 400), and
+the two `join` mutants not until the targeted deviations above existed —
+which is the point of checking. Whole-buffer use while split is caught
+least often: the analyzer's other rules usually reject such a program for
+a second reason. For the release, 6,000 freshly generated programs from the 1.4
+generator (2,619 accepted and run with several stub seeds each, including
+1,500 at `--chaos 0.3`) produced no violations.
+
+**Scope of the evidence.** Struct entities other than typestate values
+are not tracked at run time; the generator covers one typestate machine,
+three buffer types, and no MMIO. Those parts are covered by the static
+tests and the bug gallery, not by fuzzing.
 
 ---
 
@@ -749,6 +864,9 @@ ENTITY_RELEASE  id
 ENTITY_TRANSFORM id, from_state, to_state
 ENTITY_DESTROY  id
 ENTITY_CALL     fn, args[]           -- extern fn calls (DSP kernels)
+ENTITY_ROTATE   ids[]                -- swap is the two-name case
+ENTITY_SPLIT    id, parts[]
+ENTITY_JOIN     id, parts[]
 ENTITY_PHI      id, [ (block, domain, state) ... ]   -- merge point
 ```
 
@@ -815,6 +933,10 @@ for the analyzer and as the security narrative for the portfolio write-up.
 | 27 | A shorter buffer passed where a longer one is required | Buffer overflow in the kernel | "`f` expects buffer<f32, 256> for `p`, but `x` is buffer<f32, 64>" |
 | 28 | A buffer of the wrong element type | Type confusion, reading past the end | "`f` expects buffer<f32, 64> for `p`, but `x` is buffer<u8, 64>" |
 | 29 | A run-time-length buffer passed where a fixed length is required | Unchecked length assumption | "`f` expects buffer<f32, 128> for `p`, but `b` is buffer<f32, _>" |
+| 30 | Processing the half a circular DMA engine is still filling | Off-by-one-half in a circular ADC driver: a torn block | "entity `hi` is in domain @DMA but `process` expects @RAM" |
+| 31 | Using the whole buffer while it is split | A whole-buffer view over a half still being written | "`ring` is split into lo, hi; join them back first" |
+| 32 | Joining the halves while one is still in flight | Stopping the stream for one half only | "cannot join `lo` (@RAM) and `hi` (@DMA) into `ring`: its parts must all be in the same domain" |
+| 33 | Rotating a triple-buffer ring the wrong way | Waiting on an idle buffer, restarting one in flight | "entity `b` is @RAM at the end of the `while` body but @DMA when the loop is entered" |
 
 Every file in `examples/bug_gallery/` carries its expected error in an
 `// Expected: "..."` header, and a test asserts the analyzer produces it.
@@ -983,6 +1105,19 @@ Output: after the fixes, 6,500 fuzzed programs (2,973 accepted and run)
 with no violations, and a fuzzer shown to catch reintroduced analyzer bugs
 (§6.7); `examples/multi_rate.phase` runs one set of generic helpers over
 two buffer sizes; bug-gallery #25–#29.
+
+**v1.4 — Ring buffers, and fuzzing the whole type system**
+`rotate a, b, c;` generalizes `swap` to rings of buffers, and `split` /
+`join` give the halves of a circular DMA buffer their own ownership while
+the whole is off limits (§3.14). The runtime checker now verifies buffer
+sizes, typestate, and split/join, and the fuzzer generates three buffer
+types with fixed and `_` lengths, typestate values, rotations and nested
+splits — so every rule family except MMIO and plain struct entities is
+now exercised by differential fuzzing, with each validated by mutation
+(§6.7). Output: `examples/triple_buffer.phase` processes eight frames in
+order across three rotating buffers with two always in flight, and
+`examples/circular_dma.phase` processes eight blocks from alternating
+halves of one circular buffer, then uses it whole; bug-gallery #30–#33.
 
 **M12 — LLVM backend** *(not yet started)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead
