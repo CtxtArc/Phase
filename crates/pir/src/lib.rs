@@ -190,6 +190,15 @@ pub enum PirInst {
     EntityRelease {
         name: String,
     },
+    /// A typestate value created directly (struct literal or no
+    /// initializer) with the annotated `state`; `initial` is its machine's
+    /// first state, the only one a fresh value may claim. Erased in normal
+    /// builds; checked builds verify and track it.
+    TypestateInit {
+        name: String,
+        state: String,
+        initial: String,
+    },
     /// `swap a, b;` -- exchange which storage the two buffer names refer to.
     Swap {
         a: String,
@@ -246,7 +255,20 @@ pub struct PirFnSig {
     pub param_domains: Vec<Option<Domain>>,
     /// Per parameter: the `@TO` of a declared `@FROM -> @TO` change.
     pub param_domains_after: Vec<Option<Domain>>,
+    /// Per parameter: the required typestate, e.g. `Packet<Decoded>`.
+    /// Erased in normal builds; checked builds track it at run time.
+    pub param_states: Vec<Option<String>>,
     pub return_type: Option<PirType>,
+    /// The declared typestate of the return value, if any.
+    pub return_state: Option<String>,
+}
+
+/// `Name<State>` for a typestate type, `None` for anything else.
+fn state_label(ty: &TypeExpr) -> Option<String> {
+    match ty {
+        TypeExpr::Stateful { name, state } => Some(format!("{name}<{state}>")),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -336,6 +358,15 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
         .map(|(name, params)| (name, params.iter().map(|p| p.domain_after).collect()))
         .collect();
 
+    let initial_states: HashMap<String, String> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::State(s) => s.states.first().map(|st| (s.name.clone(), st.clone())),
+            _ => None,
+        })
+        .collect();
+
     let mut out = PirProgram::default();
 
     for item in &program.items {
@@ -362,6 +393,7 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
                 let sig = lower_fn_sig(&f.name, &f.params, &f.return_type, &known_entities)?;
                 let mut lowerer = Lowerer {
                     known_entities: &known_entities,
+                    initial_states: &initial_states,
                     domain_changes: &domain_changes,
                     domains: HashMap::new(),
                 };
@@ -481,12 +513,16 @@ fn lower_fn_sig(
         param_access: params.iter().map(|p| p.access).collect(),
         param_domains: params.iter().map(|p| p.domain).collect(),
         param_domains_after: params.iter().map(|p| p.domain_after).collect(),
+        param_states: params.iter().map(|p| state_label(&p.ty)).collect(),
         return_type: lowered_return,
+        return_state: return_type.as_ref().and_then(state_label),
     })
 }
 
 struct Lowerer<'a> {
     known_entities: &'a HashMap<&'a str, ()>,
+    /// machine name -> its initial state
+    initial_states: &'a HashMap<String, String>,
     domain_changes: &'a HashMap<&'a str, Vec<Option<Domain>>>,
     /// Tracks each local's *current* domain, just enough to know whether a
     /// `sync` is waiting on a DMA or a device transfer. Safety itself was
@@ -699,6 +735,7 @@ impl<'a> Lowerer<'a> {
                     domain,
                     fields: lowered_fields,
                 });
+                self.typestate_init(name, ty, out);
                 Ok(())
             }
             Some(Expr::Call { callee, args }) => {
@@ -746,8 +783,30 @@ impl<'a> Lowerer<'a> {
                     ty: resolved_ty,
                     domain,
                 });
+                self.typestate_init(name, ty, out);
                 Ok(())
             }
+        }
+    }
+
+    /// For a typestate value created directly, record its claimed state.
+    fn typestate_init(&self, name: &str, ty: &TypeExpr, out: &mut Vec<PirInst>) {
+        if let TypeExpr::Stateful {
+            name: machine,
+            state,
+        } = ty
+        {
+            out.push(PirInst::TypestateInit {
+                name: name.to_string(),
+                state: format!("{machine}<{state}>"),
+                initial: format!(
+                    "{machine}<{}>",
+                    self.initial_states
+                        .get(machine)
+                        .cloned()
+                        .unwrap_or_default()
+                ),
+            });
         }
     }
 

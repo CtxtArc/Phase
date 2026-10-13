@@ -284,6 +284,8 @@ enum ScopeItem {
     Storage(String, String),
     /// A borrow handle (its `<name>__h` id).
     Handle(String),
+    /// A typestate value: the C expression for its address, and its name.
+    TsValue(String, String),
 }
 
 /// Per-function state while emitting C.
@@ -296,6 +298,8 @@ struct FnCx<'a> {
     checked: bool,
     /// Buffer borrow handles in scope, with their mode.
     handles: HashMap<String, BorrowMode>,
+    /// Borrow handles of non-buffer entities (C pointers to the value).
+    struct_handles: HashSet<String>,
     /// One entry per open block, innermost last.
     scopes: Vec<Vec<ScopeItem>>,
 }
@@ -315,6 +319,24 @@ impl FnCx<'_> {
         matches!(self.locals.get(name), Some(PirType::Buffer { .. }))
     }
 
+    /// The runtime key of a typestate value: the address of the variable
+    /// holding it -- or, for a borrow handle, the address it points to.
+    fn ts_key(&self, name: &str) -> String {
+        if self.struct_handles.contains(name) {
+            format!("(const void *){name}")
+        } else {
+            format!("&{name}")
+        }
+    }
+
+    /// Start tracking typestate value `name` in the current scope.
+    fn track_ts(&mut self, name: &str) {
+        let key = format!("&{name}");
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.push(ScopeItem::TsValue(key, name.to_string()));
+        }
+    }
+
     /// Checks for one scope's items going out of scope.
     fn scope_end_checks(items: &[ScopeItem], pad: &str) -> String {
         let mut s = String::new();
@@ -325,6 +347,9 @@ impl FnCx<'_> {
                 }
                 ScopeItem::Storage(addr, name) => {
                     s.push_str(&format!("{pad}phase_chk_scope_end({addr}, \"{name}\");\n"))
+                }
+                ScopeItem::TsValue(addr, name) => {
+                    s.push_str(&format!("{pad}phase_chk_ts_end({addr}, \"{name}\");\n"))
                 }
             }
         }
@@ -375,6 +400,14 @@ impl FnCx<'_> {
         let mut alias_ro = Vec::new();
         for (i, arg) in args.iter().enumerate() {
             let CallArg::Entity(name) = arg else { continue };
+            if let Some(Some(state)) = sig.param_states.get(i) {
+                let consume = sig.param_access.get(i).copied().flatten() != Some(BorrowMode::Read);
+                before.push_str(&format!(
+                    "{pad}phase_chk_ts_use({}, \"{state}\", {}, \"{callee}\", \"{name}\");\n",
+                    self.ts_key(name),
+                    if consume { 1 } else { 0 }
+                ));
+            }
             if !self.is_buffer(name) {
                 continue;
             }
@@ -401,8 +434,23 @@ impl FnCx<'_> {
                 Some(BorrowMode::Write) => "PHASE_ACC_WRITE",
                 None => "PHASE_ACC_NONE",
             };
+            // The size the callee will believe the buffer has: its declared
+            // length, or -- for a `_` parameter -- the length it is passed.
+            let told = match sig.params.get(i).map(|(_, t)| t) {
+                Some(PirType::Buffer { elem, len }) => {
+                    let n = match len {
+                        Some(n) => n.to_string(),
+                        None => match self.locals.get(name) {
+                            Some(PirType::Buffer { len, .. }) => len_expr(name, *len),
+                            _ => format!("sizeof({name})/sizeof({name}[0])"),
+                        },
+                    };
+                    format!("(size_t)({n}) * sizeof({})", type_name(elem))
+                }
+                _ => format!("sizeof({name})"),
+            };
             before.push_str(&format!(
-                "{pad}phase_chk_arg({name}, {via}, {domain}, {access_c}, \"{callee}\", \"{name}\");\n"
+                "{pad}phase_chk_arg({name}, {told}, {via}, {domain}, {access_c}, \"{callee}\", \"{name}\");\n"
             ));
             alias_ptrs.push(name.clone());
             let ro = access == Some(BorrowMode::Read)
@@ -463,8 +511,21 @@ fn format_fn(
         swapped: swapped_buffers(&f.body),
         checked,
         handles: HashMap::new(),
+        struct_handles: HashSet::new(),
         scopes: vec![Vec::new()],
     };
+    if checked {
+        // A typestate parameter arrives in the state its signature names
+        // (the caller's check verified that).
+        for (i, (pname, _)) in f.sig.params.iter().enumerate() {
+            if let Some(Some(state)) = f.sig.param_states.get(i) {
+                out.push_str(&format!(
+                    "    phase_chk_ts_set(&{pname}, \"{state}\", \"{pname}\");\n"
+                ));
+                cx.track_ts(pname);
+            }
+        }
+    }
     for inst in &f.body {
         out.push_str(&format_inst(inst, &mut cx, 1));
     }
@@ -545,13 +606,25 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
             if cx.checked && matches!(ty, PirType::Buffer { .. }) {
                 let d = c_domain(domain.unwrap_or(Domain::Ram));
                 s.push_str(&format!(
-                    "{pad}phase_chk_create({storage}, {d}, \"{name}\");\n"
+                    "{pad}phase_chk_create({storage}, sizeof({storage}), {d}, \"{name}\");\n"
                 ));
                 if let Some(scope) = cx.scopes.last_mut() {
                     scope.push(ScopeItem::Storage(storage, name.clone()));
                 }
             }
             s
+        }
+
+        PirInst::TypestateInit {
+            name,
+            state,
+            initial,
+        } => {
+            if !cx.checked {
+                return String::new();
+            }
+            cx.track_ts(name);
+            format!("{pad}phase_chk_ts_fresh(&{name}, \"{state}\", \"{initial}\", \"{name}\");\n")
         }
 
         PirInst::Swap { a, b } => {
@@ -612,12 +685,21 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
                 return format!("{pad}{} = {reg};\n", declare(name, ty));
             }
             let call_sig = cx.sigs.get(callee.as_str()).copied();
-            let arg_text = format_args(args, call_sig, &cx.locals);
-            let (before, after) = if cx.checked {
+            let arg_text = format_args(args, call_sig, &cx.locals, &cx.struct_handles);
+            let (before, mut after) = if cx.checked {
                 cx.call_checks(callee, args, &pad)
             } else {
                 Default::default()
             };
+            // The result's state is the callee's *declared* return state.
+            if cx.checked {
+                if let Some(state) = call_sig.and_then(|s| s.return_state.clone()) {
+                    after.push_str(&format!(
+                        "{pad}phase_chk_ts_set(&{name}, \"{state}\", \"{name}\");\n"
+                    ));
+                    cx.track_ts(name);
+                }
+            }
             format!(
                 "{before}{pad}{} = {}({});\n{after}",
                 declare(name, ty),
@@ -699,6 +781,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
                 }
                 s
             } else {
+                cx.struct_handles.insert(name.clone());
                 format!("{pad}{ptr_ty} {name} = &{target}; /* borrow */\n")
             }
         }
@@ -742,7 +825,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
                 return format!("{pad}{reg} = {value};\n");
             }
             let call_sig = cx.sigs.get(callee.as_str()).copied();
-            let arg_text = format_args(args, call_sig, &cx.locals);
+            let arg_text = format_args(args, call_sig, &cx.locals, &cx.struct_handles);
             let (before, after) = if cx.checked {
                 cx.call_checks(callee, args, &pad)
             } else {
@@ -752,11 +835,19 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
         }
 
         PirInst::Return { value } => {
-            let checks = if cx.checked {
-                cx.exit_checks(&pad)
-            } else {
-                String::new()
-            };
+            let mut checks = String::new();
+            if cx.checked {
+                // Returning a typestate value hands it to the caller: it
+                // must be in the declared state, and is consumed here.
+                if let (Some(v), Some(state)) = (value, &cx.sig.return_state) {
+                    checks.push_str(&format!(
+                        "{pad}phase_chk_ts_use({}, \"{state}\", 1, \"{}\", \"{v}\");\n",
+                        cx.ts_key(v),
+                        cx.sig.name
+                    ));
+                }
+                checks.push_str(&cx.exit_checks(&pad));
+            }
             match value {
                 Some(v) => format!("{checks}{pad}return {v};\n"),
                 // PHASE's `main` is C's `int main(void)`: a bare `return;`
@@ -842,12 +933,19 @@ fn format_args(
     args: &[CallArg],
     sig: Option<&PirFnSig>,
     locals: &HashMap<String, PirType>,
+    struct_handles: &HashSet<String>,
 ) -> String {
     let mut parts = Vec::new();
     for (i, a) in args.iter().enumerate() {
         match a {
             CallArg::Entity(name) => {
-                parts.push(name.clone());
+                // A borrow of a (non-buffer) entity is a C pointer to it,
+                // but entity parameters take the value.
+                if struct_handles.contains(name) {
+                    parts.push(format!("*{name}"));
+                } else {
+                    parts.push(name.clone());
+                }
                 // Append the compile-time element count for any argument
                 // whose *declared parameter* is a buffer -- matches the
                 // trailing `size_t ..._len` convention in format_params.
@@ -882,6 +980,20 @@ fn format_literal(lit: &PirLiteral) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_borrowed_entity_is_passed_by_value() {
+        let src = r#"
+            entity Pkt : @RAM { seq: u32 }
+            state Pkt { Raw }
+            extern fn recv() -> Pkt<Raw>;
+            extern fn peek(p: read Pkt<Raw>);
+            fn main() { let p: Pkt<Raw> = recv(); let r = borrow p read; peek(r); release r; }
+        "#;
+        let g = generate_src(src, "t");
+        assert!(g.source.contains("const Pkt* r = &p;"), "{}", g.source);
+        assert!(g.source.contains("peek(*r);"), "{}", g.source);
+    }
 
     #[test]
     fn generic_length_parameters_pass_their_runtime_length_on() {

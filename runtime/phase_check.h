@@ -15,13 +15,17 @@
  * static analysis is unsound for that program. The fuzzer
  * (crates/fuzz) relies on exactly that.
  *
- * Buffers only: struct entities and typestate are not tracked here.
+ * Buffers are tracked by storage (domain, size, borrows, destroyed) and
+ * typestate values by their address (state, consumed). Struct entities
+ * that are not typestate values are not tracked.
  *
  * On a violation the process prints "PHASE runtime check failed: ..." to
  * stderr and exits with status 70.
  */
 
 #define PHASE_CHECK_EXIT_CODE 70
+
+#include <stddef.h>
 
 /* The checker only compares buffer *addresses*; it never reads or writes
  * the memory. Saying so stops GCC from warning that a not-yet-written
@@ -41,7 +45,8 @@ void phase_chk_enter(void);
 void phase_chk_leave(void);
 
 /* storage lifetime */
-PHASE_ADDR_ONLY(1) void phase_chk_create(const void *storage, int domain, const char *name);
+PHASE_ADDR_ONLY(1)
+void phase_chk_create(const void *storage, size_t bytes, int domain, const char *name);
 PHASE_ADDR_ONLY(1) void phase_chk_scope_end(const void *storage, const char *name);
 
 /* domain transitions */
@@ -58,11 +63,22 @@ void phase_chk_handle_use(int handle, const char *name);
 void phase_chk_handle_end(int handle, const char *name);
 
 /* calls */
+/* `told_bytes`: the size the callee is told the buffer has (its declared
+ * length, or the run-time length it is passed, times its element size). */
 PHASE_ADDR_ONLY(1)
-void phase_chk_arg(const void *p, int via, int param_domain, int access,
+void phase_chk_arg(const void *p, size_t told_bytes, int via, int param_domain, int access,
                    const char *callee, const char *name);
 void phase_chk_alias(const char *callee, int n, const void *const *ptrs, const int *read_only);
 PHASE_ADDR_ONLY(1) void phase_chk_transfer(const void *p, int to, const char *callee, const char *name);
 PHASE_ADDR_ONLY(1) void phase_chk_param_exit(const void *p, int domain, const char *fn, const char *name);
+
+/* typestate values: `state` is "Machine<State>" */
+PHASE_ADDR_ONLY(1) void phase_chk_ts_set(const void *v, const char *state, const char *name);
+PHASE_ADDR_ONLY(1)
+void phase_chk_ts_fresh(const void *v, const char *state, const char *initial, const char *name);
+PHASE_ADDR_ONLY(1)
+void phase_chk_ts_use(const void *v, const char *state, int consume, const char *user,
+                      const char *name);
+PHASE_ADDR_ONLY(1) void phase_chk_ts_end(const void *v, const char *name);
 
 #endif /* PHASE_CHECK_H */

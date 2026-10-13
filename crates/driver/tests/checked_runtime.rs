@@ -295,3 +295,151 @@ fn a_callee_still_conflicts_with_its_own_borrows() {
         "'p' passed to 'poke' while borrowed",
     );
 }
+
+// ---- v1.4: buffer sizes ---------------------------------------------------
+
+#[test]
+fn a_shorter_buffer_passed_to_a_fixed_length_parameter_is_caught() {
+    caught(
+        "rt_len_fixed",
+        "extern fn poke8(x: write buffer<u8, 8> @RAM); fn main() { buffer<u8, 4> x @RAM; poke8(x); }",
+        "'x' is 4 bytes, but 'poke8' is told it has 8",
+    );
+}
+
+#[test]
+fn a_runtime_length_passed_on_as_a_fixed_one_is_caught() {
+    caught(
+        "rt_len_generic",
+        r#"
+        extern fn poke8(x: write buffer<u8, 8> @RAM);
+        fn relay(b: write buffer<u8, _> @RAM) { poke8(b); }
+        fn main() { buffer<u8, 3> x @RAM; relay(x); }
+        "#,
+        "'b' is 3 bytes, but 'poke8' is told it has 8",
+    );
+}
+
+#[test]
+fn generic_lengths_and_matching_fixed_lengths_run_clean() {
+    let (code, stderr) = run_unanalyzed(
+        "rt_len_ok",
+        r#"
+        extern fn poke8(x: write buffer<u16, 8> @RAM);
+        extern fn pokeany(x: write buffer<u16, _> @RAM);
+        fn relay(b: write buffer<u16, _> @RAM) { pokeany(b); let r = borrow b read; release r; }
+        fn main() { buffer<u16, 8> x @RAM; buffer<u16, 3> y @RAM; poke8(x); relay(x); relay(y); }
+        "#,
+        1,
+    );
+    assert_eq!(code, 0, "{stderr}");
+}
+
+// ---- v1.4: typestate --------------------------------------------------------
+
+const PKT: &str = r#"
+    entity Pkt : @RAM { seq: u32 }
+    state Pkt { Raw -> Parsed -> Checked }
+    extern fn recv() -> Pkt<Raw>;
+    extern fn parse(p: Pkt<Raw>) -> Pkt<Parsed>;
+    extern fn verify(p: Pkt<Parsed>) -> Pkt<Checked>;
+    extern fn peek(p: read Pkt<Checked>);
+    extern fn deliver(p: Pkt<Checked>);
+    extern fn more() -> bool;
+"#;
+
+fn pkt(body: &str) -> String {
+    format!("{PKT}\n{body}")
+}
+
+#[test]
+fn a_state_forged_by_annotation_is_caught() {
+    // The annotation says Checked; recv()'s *declared* return state is Raw,
+    // and that is what the runtime checker records.
+    caught(
+        "rt_ts_forged",
+        &pkt("fn main() { let p: Pkt<Checked> = recv(); deliver(p); }"),
+        "'p' is Pkt<Raw>, but 'deliver' requires Pkt<Checked>",
+    );
+}
+
+#[test]
+fn a_fresh_value_claiming_a_later_state_is_caught() {
+    caught(
+        "rt_ts_fresh",
+        &pkt("fn main() { let p: Pkt<Checked> = Pkt { seq: 1 }; deliver(p); }"),
+        "'p' is created directly as Pkt<Checked>, but a new value starts as Pkt<Raw>",
+    );
+}
+
+#[test]
+fn reusing_a_consumed_value_is_caught() {
+    caught(
+        "rt_ts_reuse",
+        &pkt("fn main() { let a: Pkt<Raw> = recv(); let b: Pkt<Parsed> = parse(a); let c: Pkt<Parsed> = parse(a); }"),
+        "'a' was already consumed; 'parse' cannot use it",
+    );
+}
+
+#[test]
+fn consuming_an_outer_value_on_a_second_loop_iteration_is_caught() {
+    caught(
+        "rt_ts_loop",
+        &pkt(r#"
+            fn main() {
+                let a: Pkt<Raw> = recv();
+                let n: u32 = 0;
+                while n < 2 {
+                    let b: Pkt<Parsed> = parse(a);
+                    n = n + 1;
+                }
+            }
+            "#),
+        "'a' was already consumed; 'parse' cannot use it",
+    );
+}
+
+#[test]
+fn returning_a_value_in_the_wrong_state_is_caught() {
+    caught(
+        "rt_ts_return",
+        &pkt(r#"
+            fn admit() -> Pkt<Checked> { let a: Pkt<Raw> = recv(); return a; }
+            fn main() { let p: Pkt<Checked> = admit(); deliver(p); }
+            "#),
+        "'a' is Pkt<Raw>, but 'admit' requires Pkt<Checked>",
+    );
+}
+
+#[test]
+fn correct_typestate_use_runs_clean() {
+    let (code, stderr) = run_unanalyzed(
+        "rt_ts_ok",
+        &pkt(r#"
+            fn admit() -> Pkt<Checked> {
+                let a: Pkt<Raw> = recv();
+                let b: Pkt<Parsed> = parse(a);
+                let c: Pkt<Checked> = verify(b);
+                return c;
+            }
+            fn show(p: read Pkt<Checked>) { peek(p); }
+            fn main() {
+                let n: u32 = 0;
+                while n < 3 {
+                    let p: Pkt<Checked> = admit();
+                    peek(p);
+                    show(p);
+                    let r = borrow p read;
+                    peek(r);
+                    release r;
+                    deliver(p);
+                    n = n + 1;
+                }
+                let f: Pkt<Raw> = Pkt { seq: 7 };
+                let g: Pkt<Parsed> = parse(f);
+            }
+            "#),
+        1,
+    );
+    assert_eq!(code, 0, "{stderr}");
+}

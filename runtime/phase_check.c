@@ -14,9 +14,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define MAX_STORAGES 1024
 #define MAX_HANDLES 4096
+#define MAX_TSVALS 1024
 
 typedef uintptr_t Key;
 
@@ -25,10 +27,19 @@ typedef uintptr_t Key;
 typedef struct {
     Key key;
     const char *name;
+    size_t bytes;
     int domain;
     int destroyed;
     int in_use;
 } Storage;
+
+typedef struct {
+    Key key;
+    const char *name;
+    const char *state;
+    int consumed;
+    int in_use;
+} TsVal;
 
 typedef struct {
     Key key;
@@ -41,6 +52,7 @@ typedef struct {
 
 static Storage storages[MAX_STORAGES];
 static Handle handles[MAX_HANDLES];
+static TsVal tsvals[MAX_TSVALS];
 
 /* Call depth of the PHASE function currently running. Borrow rules are
  * per frame: a function only conflicts with borrows taken in its own
@@ -118,7 +130,7 @@ static void no_borrows(const Storage *s, const char *name, const char *what) {
     }
 }
 
-void phase_chk_create(const void *storage, int domain, const char *name) {
+void phase_chk_create(const void *storage, size_t bytes, int domain, const char *name) {
     Key key = KEY(storage);
     for (int i = 0; i < MAX_STORAGES; i++) {
         if (storages[i].in_use && storages[i].key == key) {
@@ -127,7 +139,7 @@ void phase_chk_create(const void *storage, int domain, const char *name) {
     }
     for (int i = 0; i < MAX_STORAGES; i++) {
         if (!storages[i].in_use) {
-            storages[i] = (Storage){key, name, domain, 0, 1};
+            storages[i] = (Storage){key, name, bytes, domain, 0, 1};
             return;
         }
     }
@@ -235,10 +247,14 @@ void phase_chk_handle_end(int h, const char *name) {
     hd->in_use = 0;
 }
 
-void phase_chk_arg(const void *p, int via, int param_domain, int access,
+void phase_chk_arg(const void *p, size_t told_bytes, int via, int param_domain, int access,
                    const char *callee, const char *name) {
     Key key = KEY(p);
     Storage *s = live(key, name, "pass it to a function");
+    if (told_bytes != s->bytes) {
+        fail("'%s' is %zu bytes, but '%s' is told it has %zu", name, s->bytes, callee,
+             told_bytes);
+    }
     if (param_domain >= 0 && s->domain != param_domain) {
         fail("'%s' is in %s but '%s' expects %s", name, dom_name(s->domain), callee,
              dom_name(param_domain));
@@ -292,4 +308,69 @@ void phase_chk_param_exit(const void *p, int domain, const char *fn, const char 
         fail("parameter '%s' leaves '%s' in %s, but its signature says %s", name, fn,
              dom_name(s->domain), dom_name(domain));
     }
+}
+
+/* ---- typestate values ---------------------------------------------------
+ *
+ * A typestate value is a struct passed by value, so it is identified by the
+ * address of the variable holding it. Its state is set from where it came
+ * from -- the callee's *declared* return state, or the machine's initial
+ * state for a value built directly -- never from an annotation, and every
+ * use is checked against what the callee requires. Passing it to a
+ * parameter that is not `read` (or returning it) consumes it.
+ */
+
+static TsVal *ts_find(Key key) {
+    for (int i = 0; i < MAX_TSVALS; i++) {
+        if (tsvals[i].in_use && tsvals[i].key == key) {
+            return &tsvals[i];
+        }
+    }
+    return NULL;
+}
+
+void phase_chk_ts_set(const void *v, const char *state, const char *name) {
+    Key key = KEY(v);
+    if (ts_find(key)) {
+        fail("typestate value '%s' created over a live value", name);
+    }
+    for (int i = 0; i < MAX_TSVALS; i++) {
+        if (!tsvals[i].in_use) {
+            tsvals[i] = (TsVal){key, name, state, 0, 1};
+            return;
+        }
+    }
+    fail("too many live typestate values (limit %d)", MAX_TSVALS);
+}
+
+void phase_chk_ts_fresh(const void *v, const char *state, const char *initial, const char *name) {
+    if (strcmp(state, initial) != 0) {
+        fail("'%s' is created directly as %s, but a new value starts as %s", name, state, initial);
+    }
+    phase_chk_ts_set(v, state, name);
+}
+
+void phase_chk_ts_use(const void *v, const char *state, int consume, const char *user,
+                      const char *name) {
+    TsVal *t = ts_find(KEY(v));
+    if (!t) {
+        fail("'%s' is not a live typestate value (used by '%s')", name, user);
+    }
+    if (t->consumed) {
+        fail("'%s' was already consumed; '%s' cannot use it", name, user);
+    }
+    if (strcmp(t->state, state) != 0) {
+        fail("'%s' is %s, but '%s' requires %s", name, t->state, user, state);
+    }
+    if (consume) {
+        t->consumed = 1;
+    }
+}
+
+void phase_chk_ts_end(const void *v, const char *name) {
+    TsVal *t = ts_find(KEY(v));
+    if (!t) {
+        fail("typestate value '%s' ends its scope but was never created", name);
+    }
+    t->in_use = 0;
 }
