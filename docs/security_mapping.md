@@ -446,6 +446,69 @@ restores it — and `swap` is rejected while either buffer is borrowed.
 
 ---
 
+## v1.3 additions
+
+v1.3 added a runtime-checked build mode and a differential fuzzer (spec
+§6.7). #25 and #26 are holes the fuzzer found in the analyzer; #27–#29
+come from checking buffer types at call sites, which PHASE had not done.
+
+## #25 — A buffer abandoned to DMA at the end of a block
+
+**`examples/bug_gallery/dma_into_dead_block.phase`**
+
+**Category:** [CWE-416](https://cwe.mitre.org/data/definitions/416.html),
+[CWE-825](https://cwe.mitre.org/data/definitions/825.html).
+
+**Real-world precedent:** the block-scoped form of #11: a transfer started
+into storage that goes out of scope, so the engine writes into stack
+memory the program is already reusing.
+
+**What PHASE does now:** entities declared in an `if`/`while` block must
+be CPU-owned when the block falls through to its end, exactly as at a
+function return. Up to 1.2 only function exits were checked.
+
+---
+
+## #26 — Swapping with a buffer from an inner block
+
+**`examples/bug_gallery/swap_across_blocks.phase`**
+
+**Category:** [CWE-825](https://cwe.mitre.org/data/definitions/825.html) —
+Expired Pointer Dereference.
+
+**Real-world precedent:** a long-lived handle redirected to short-lived
+storage — the classic dangling pointer. `swap` exchanges storage, so the
+outer name ended up pointing into a block that had ended.
+
+**What PHASE does now:** `swap` requires both buffers to be declared in
+the same block.
+
+---
+
+## #27 — A shorter buffer where a longer one is required, #28 — the wrong element type, #29 — a run-time length where a fixed one is assumed
+
+**`examples/bug_gallery/buffer_length_mismatch.phase`**,
+**`examples/bug_gallery/buffer_element_mismatch.phase`**,
+**`examples/bug_gallery/runtime_length_to_fixed.phase`**
+
+**Category:** [CWE-787](https://cwe.mitre.org/data/definitions/787.html) —
+Out-of-bounds Write (#27, #29), and
+[CWE-843](https://cwe.mitre.org/data/definitions/843.html) — Access of
+Resource Using Incompatible Type ("Type Confusion") (#28).
+
+**Real-world precedent:** the most common memory-safety bug class there
+is: a buffer handed to code that assumes it is bigger, or holds a
+different type, than it does. In PHASE's generated C a callee passes the
+length *it declared* on to kernels, so before 1.3 a 64-element buffer
+passed where 256 were declared became a 256-element write into 64 slots.
+
+**What PHASE does now:** every buffer argument must match its parameter's
+element type and length. A parameter can accept any length with
+`buffer<T, _>`, in which case the real length is what travels with it at
+run time; such a buffer can only be passed on to another `_` parameter.
+
+---
+
 ## Summary table
 
 | # | Bug-gallery file | CWE | Named real-world precedent |
@@ -474,3 +537,8 @@ restores it — and `swap` is rejected while either buffer is borrowed.
 | 22 | `refill_while_processing.phase` | CWE-362, CWE-367 | torn frame in a double-buffered stream |
 | 23 | `ping_pong_without_swap.phase` | CWE-696 | double-buffer roles out of sync with the code |
 | 24 | `swap_while_borrowed.phase` | CWE-362 | a view left pointing at the wrong buffer |
+| 25 | `dma_into_dead_block.phase` | CWE-416, CWE-825 | DMA into out-of-scope storage (as #11), found by fuzzing |
+| 26 | `swap_across_blocks.phase` | CWE-825 | dangling name after a swap, found by fuzzing |
+| 27 | `buffer_length_mismatch.phase` | CWE-787 | buffer overflow from a size mismatch |
+| 28 | `buffer_element_mismatch.phase` | CWE-843 | type confusion between byte and sample buffers |
+| 29 | `runtime_length_to_fixed.phase` | CWE-787 | unchecked length assumption |

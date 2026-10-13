@@ -3,7 +3,7 @@
 **A compiler that statically checks memory safety for hardware pipelines — DMA, MMIO, and zero-copy devices — before the code ever runs.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.0-success" alt="Version 1.2.0">
+  <img src="https://img.shields.io/badge/version-1.3.0-success" alt="Version 1.3.0">
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
 </p>
@@ -41,10 +41,12 @@ compiler guarantees:
    while a buffer is borrowed it can't be written, moved, or freed;
    released borrows are dead; one buffer is never passed twice to a call
    unless every use is read-only.
-3. **Lifetime safety** — nothing is used after `destroy`, and no function
-   returns while hardware still owns one of its buffers, a borrow is still
-   live, or a parameter is in a different domain than its signature
-   promises.
+3. **Lifetime and type safety** — nothing is used after `destroy`; no
+   function returns, and no block ends, while hardware still owns one of
+   its buffers or a borrow is still live; parameters end in the domain
+   their signature promises; and every buffer argument has exactly the
+   element type and length the callee expects (or the callee takes any
+   length, `buffer<T, _>`, and is told the real one).
 4. **Typestate enforcement** — data never skips a required step in a
    protocol/validation chain. A state comes only from a function that
    returns it — an annotation can't fake one — and each state value is
@@ -57,6 +59,41 @@ compiler guarantees:
 
 The precise rules, and the trust boundary they hold within, are in
 [`phase_specification.md`](phase_specification.md) §4.4.
+
+## Evidence, not just claims
+
+A static checker is only as good as its rules, so PHASE also checks
+itself at run time:
+
+```
+$ phase build --checked --stub-externs program.phase   # instrumented build
+$ cargo run --release -p phase_fuzz -- --count 1000     # differential fuzzing
+1000 programs generated, 499 accepted by `phase check` (0 more only with warnings, not run), 0 soundness violations, 0 pipeline failures
+```
+
+- **`phase build --checked`** emits C that verifies every ownership rule
+  on the path the program actually takes — a shadow state per buffer,
+  checked at every move, sync, borrow, call, swap and scope exit — and
+  exits with status 70 on any violation. It never reasons about branches
+  or loops, so it is independent of the analyzer.
+- **`phase-fuzz`** generates thousands of random programs, builds every
+  one the analyzer accepts in checked mode, and runs it down different
+  paths. An accepted program that trips a runtime check is an analyzer
+  soundness bug.
+
+Its first runs found four real bugs — two analyzer holes (a buffer left
+DMA-owned at the end of an `if` block, and `swap` across blocks leaving a
+dangling name), a codegen bug, and a false alarm in the checker itself —
+all fixed in 1.3 and replayed on every test run. Since the fixes, 6,500
+freshly generated programs (2,973 of them accepted and run) have produced
+no violations, and CI fuzzes a fresh batch on every push.
+
+And the fuzzer demonstrably finds bugs when they exist: with one of the
+fixed analyzer holes deliberately put back, it reported 8 violations in
+the same first 1,000 programs that the real analyzer passes cleanly; with
+the most basic rule disabled (a DMA-owned buffer passed where RAM is
+expected), it caught that too. Details in
+[`phase_specification.md`](phase_specification.md) §6.7.
 
 Once these checks pass, PHASE lowers the pipeline to plain, readable C.
 Domain, borrow, and typestate checks are all compile-time-only and fully
@@ -118,6 +155,8 @@ deliberately broken program per rule, each rejected at compile time:
 - **[CWE-696/691] Inconsistent paths** — [`branch_domain_disagreement.phase`](examples/bug_gallery/branch_domain_disagreement.phase): two branches leaving a buffer in different domains.
 - **[CWE-362] Writing through read-only views** — [`write_through_read_borrow.phase`](examples/bug_gallery/write_through_read_borrow.phase), [`read_param_handed_to_writer.phase`](examples/bug_gallery/read_param_handed_to_writer.phase): a read borrow or a `read` parameter handed to a kernel that writes.
 - **[CWE-362/367] Broken double buffering** — [`refill_while_processing.phase`](examples/bug_gallery/refill_while_processing.phase), [`ping_pong_without_swap.phase`](examples/bug_gallery/ping_pong_without_swap.phase), [`swap_while_borrowed.phase`](examples/bug_gallery/swap_while_borrowed.phase): refilling the buffer the CPU is processing (a torn frame), forgetting to trade buffers, or swapping one out from under a live view.
+- **[CWE-416/825] Found by the fuzzer** — [`dma_into_dead_block.phase`](examples/bug_gallery/dma_into_dead_block.phase), [`swap_across_blocks.phase`](examples/bug_gallery/swap_across_blocks.phase): a buffer abandoned to the DMA engine at the end of an `if` block, or swapped with one from an inner block and left dangling.
+- **[CWE-787/843] Wrong buffer type** — [`buffer_length_mismatch.phase`](examples/bug_gallery/buffer_length_mismatch.phase), [`buffer_element_mismatch.phase`](examples/bug_gallery/buffer_element_mismatch.phase), [`runtime_length_to_fixed.phase`](examples/bug_gallery/runtime_length_to_fixed.phase): a shorter buffer where a longer one is required (a real overflow), bytes where samples are expected, or a run-time length where an exact one is assumed.
 - **[CWE-758] Aliasing and silent MMIO optimization** — [`aliased_arguments.phase`](examples/bug_gallery/aliased_arguments.phase) passes one buffer as both input and output of a kernel; [`volatile_wrong_domain.phase`](examples/bug_gallery/volatile_wrong_domain.phase) points a register access at RAM. `@MMIO` registers always lower to `volatile` C globals, so the C standard itself — not convention or code review — forbids the compiler from deleting or reordering the access.
 
 Each gallery file states its expected error in an `// Expected:` header,
@@ -163,9 +202,11 @@ crates/
   pir/         Phase Intermediate Representation builder
   codegen_c/   lowers PIR to raw C source
   driver/      the `phase` CLI
+  fuzz/        phase-fuzz: differential fuzzer (+ regressions/, every past finding)
 
 runtime/
   phase_runtime.h/.c   generic sim_dma_wait/sim_device_wait, always linked
+  phase_check.h/.c     runtime ownership checker, linked by `phase build --checked`
   *_extern.c           one per demo program, implementing that program's extern fns
   hw/                  real ARM Cortex-M3 backend (startup, linker script,
                        real MMIO register map, real sim_dma_wait/sim_device_wait)
@@ -206,11 +247,14 @@ Plain `cargo test`, no custom runner — including end-to-end tests that
 invoke a real C compiler, run the resulting binaries, and inspect real
 `-O2` assembly output (including proving a `volatile_read` inside a
 `while` condition survives optimization); a real cross-compile to ARM
-Cortex-M3 run under QEMU; tests that drive the `phase` binary itself; and
-a sweep asserting every bug-gallery file is rejected with its documented
-error. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) also
-runs `cargo fmt --check`, `clippy -D warnings`, the volatile proof demo,
-and a staleness check on the transcript.
+Cortex-M3 run under QEMU; tests that drive the `phase` binary itself; a
+sweep asserting every bug-gallery file is rejected with its documented
+error; runtime-checker tests (each kind of violation, compiled without the
+analyzer, must be caught; every example must run clean when checked); and
+a fuzzing pass that replays every past finding and tries a fresh batch.
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) also runs
+`cargo fmt --check`, `clippy -D warnings`, the volatile proof demo, 1,500
+freshly fuzzed programs, and a staleness check on the transcript.
 
 ```bash
 # Check a file for safety without generating C (exit code 0 = safe, 1 = rejected)
@@ -225,6 +269,18 @@ phase build examples/sdr_session.phase
 
 phase build examples/mmio_registers.phase
 ./build/mmio_registers
+
+# The same program with every ownership rule checked at run time
+phase build --checked examples/ping_pong.phase
+./build/ping_pong-checked
+
+# Try a program without writing any C: placeholder externs, paths picked
+# by PHASE_STUB_SEED
+phase build --stub-externs my_program.phase
+PHASE_STUB_SEED=3 ./build/my_program
+
+# Differential fuzzing (findings are saved to fuzz-findings/)
+cargo run --release -p phase_fuzz -- --count 1000
 
 # The adversarial volatile proof (naive C vs. PHASE, both at -O2)
 ./demos/m6_volatile_proof/run_demo.sh
@@ -250,6 +306,11 @@ fills one buffer while the CPU processes the other, and `swap ping, pong;`
 trades them each frame. Seven frames, processed in order from alternating
 buffers, each next capture already in flight; the checker proves no frame
 is touched before it's synced or refilled while being processed.
+
+`examples/multi_rate.phase`: one set of helpers, written once with
+length-generic parameters (`buffer<Sample, _>`), used for a 64- and a
+256-sample capture — each kernel is told the real length — while a kernel
+that needs exactly 64 still gets an exact, checked length.
 
 `examples/overlapped_capture.phase`: one call starts a DMA capture
 (`start_capture(dst: buffer<..> @RAM -> @DMA)`), the CPU computes a window
@@ -308,7 +369,12 @@ has to discover the hard way:
   runtime file**, `runtime/<stem>_extern.c` (e.g. `sdr_session.phase` →
   `runtime/sdr_session_extern.c`). The compiler only ever generates a
   *prototype* for `extern fn`, never a body. `phase build` fails early
-  with a clear message naming the missing file.
+  with a clear message naming the missing file — or, with
+  `--stub-externs`, generates placeholders to try the program without one.
+- **The runtime checker and the fuzzer cover buffers.** Typestate and
+  struct entities are checked statically but not at run time, and the
+  fuzzer generates single-size `u8` buffers. Their silence is strong
+  evidence for the buffer rules, not a proof of everything.
 - **No real hardware target *by default*.** `phase build` links the
   simulated runtime; `examples/hw_uart_echo.phase` proves the swap to a
   real ARM Cortex-M3 target works (`./scripts/build_hw_demo.sh`, validated
@@ -333,12 +399,15 @@ Full rationale for all of these is in
 
 ## What's next
 
-1.2 adds `read`/`write` access modes and ping-pong double buffering on top
-of 1.1's diagnostics and signature domain changes (see
-[`CHANGELOG.md`](CHANGELOG.md)). Likely next steps:
+1.3 adds runtime-checked builds, differential fuzzing, and
+length-generic, type-checked buffer parameters on top of 1.2's access
+modes and double buffering (see [`CHANGELOG.md`](CHANGELOG.md)). Likely
+next steps:
 
-- **A runtime-checking build mode plus fuzzing**, as empirical evidence
-  that every program `check` accepts really keeps its guarantees.
+- **A tutorial** — "PHASE in 15 minutes", from a first buffer to a
+  ping-pong pipeline.
+- **Wider fuzzing** — typestate, entities, and varied buffer types and
+  sizes in the generator and the runtime checker.
 - **M12 — An LLVM backend**, removing the dependency on an external `cc`
   ([`phase_specification.md`](phase_specification.md) §9).
 - **A real DMA controller** — the ping-pong pipeline on a board with one

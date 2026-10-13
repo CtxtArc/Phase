@@ -4,6 +4,82 @@ All notable changes to PHASE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] — 2026-10-13
+
+Evidence that the static guarantees hold: a runtime-checked build mode
+and a differential fuzzer that runs thousands of random accepted programs
+through it. The fuzzer found two soundness holes in the analyzer and a
+codegen bug, all fixed here. Buffer types are now checked at call sites —
+closing a real overflow — and parameters may be length-generic.
+
+After the fixes, 6,500 freshly fuzzed programs (2,973 accepted and run)
+produced no violations, and the fuzzer was validated by putting fixed
+analyzer bugs back: it caught them (spec §6.7).
+
+As in 1.0, the fixes mean **some programs 1.2 accepted are now
+rejected**, each for a real bug: a buffer left hardware-owned at the end
+of a block, `swap` with a buffer from an inner block, and buffer arguments
+of the wrong element type or length. The fix for each is in the
+diagnostic.
+
+### Added
+
+- **`phase build --checked`** (spec §6.7): instruments the generated C to
+  verify every ownership rule on the path the program actually takes —
+  a shadow state per buffer storage (`runtime/phase_check.c`), checked at
+  every buffer creation, move, sync, borrow, use/release of a borrow,
+  destroy, swap, call argument (domain, access mode, borrows, aliasing),
+  extern domain change, parameter exit, and scope exit. A violation
+  prints `PHASE runtime check failed: …` and exits with status 70.
+  Independent of the analyzer; borrow rules apply per call frame.
+  Writes `<stem>.checked.gen.c` and the binary `<stem>-checked`.
+- **`phase build --stub-externs`**: generates placeholder bodies for a
+  program's `extern fn`s, with scalar results from a PRNG seeded by
+  `PHASE_STUB_SEED`, so a program can be tried without writing C.
+- **`phase-fuzz`** (new crate `crates/fuzz`): generates random programs,
+  builds every one `phase check` accepts without warnings in checked mode
+  with stub externs, and runs it with several seeds. Every past finding
+  lives in `crates/fuzz/regressions/` and is replayed by the tests; CI
+  fuzzes 1,500 fresh programs per run and uploads any findings.
+- **Length-generic buffer parameters**: `buffer<T, _>` accepts any
+  length; the real length (the `_len` argument every buffer parameter
+  already has in C) is passed on to callees, used by `sync`, and carried
+  by borrows. A run-time length only fits another `_` parameter.
+- `examples/multi_rate.phase` (+ runtime): one set of generic helpers for
+  a 64- and a 256-sample capture.
+- Bug gallery #25 `dma_into_dead_block`, #26 `swap_across_blocks`, #27
+  `buffer_length_mismatch`, #28 `buffer_element_mismatch`, #29
+  `runtime_length_to_fixed`, with CWE mappings.
+- Spec §6.7 (runtime-checked builds and fuzzing); §3.3 documents buffer
+  type checking and `_` lengths.
+
+### Fixed
+
+- **A buffer declared inside an `if`/`while` block could be left owned by
+  the DMA engine when the block ended** — DMA into reused stack memory.
+  Block ends are now checked like function returns. *(Found by the
+  fuzzer.)*
+- **`swap` with a buffer from an inner block left the outer name pointing
+  at storage that dies with the block.** `swap` now requires both buffers
+  to be declared in the same block. *(Found by the fuzzer.)*
+- **Buffer types were never compared at call sites.** A 4-element buffer
+  could be passed where 16 were declared — and the callee then told its
+  kernels the length was 16: a buffer overflow. A `u8` buffer was accepted
+  where `f32` samples were required. Element type and length are now
+  checked for every buffer argument (and a buffer can't stand in for a
+  scalar or entity, or one entity type for another).
+- **An early `return;` in `main`** was emitted as a bare `return;` in C's
+  `int main`, leaving the exit status undefined. It now returns 0.
+  *(Found by the fuzzer.)*
+
+### Changed
+
+- Internal crate APIs: `TypeExpr::Buffer`'s length is a `BufferLen`
+  (`Fixed(n)` or `Any`); `PirType::Buffer`'s is an `Option<u64>`;
+  `PirFnSig` gains `param_access`, `param_domains`, and
+  `param_domains_after`; `phase_codegen_c` gains `generate_checked` and
+  `generate_stubs`. Normal (unchecked) generated C is unchanged.
+
 ## [1.2.0] — 2026-10-12
 
 Parameters can say whether a function reads or writes what it's given,

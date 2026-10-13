@@ -2,7 +2,7 @@
 
 **A physical-domain safety language for signal, RF, and embedded pipelines**
 
-Version 1.2
+Version 1.3
 
 ---
 
@@ -189,6 +189,27 @@ buffer<Sample, 1024> radio_buf @DMA;
 A `buffer<T, N>` is the core aggregate type — a fixed-size, domain-tagged
 array of entities. This is the primary object DMA/DEVICE code manipulates.
 
+**Type checking.** A buffer passed to a function must match the
+parameter's element type and length exactly; a borrow has its target's
+type. (Scalars convert as in C; entity and typestate arguments must have
+the parameter's base type.)
+
+**Length-generic parameters.** In a *parameter* type the length may be
+`_`:
+
+```phase
+extern fn summarize(x: read buffer<Sample, _> @RAM);
+fn wait_capture(b: buffer<Sample, _> @DMA -> @RAM) { sync(b); }
+```
+
+Such a parameter accepts a buffer of any length. In C every buffer
+parameter already comes with a `<name>_len` argument; for a `_` parameter
+that run-time value is what gets passed on to callees and used by `sync`,
+and a borrow of it gets a `_len` of its own. A run-time length only fits
+another `_` parameter: passing one where a fixed length is required is an
+error, since nothing guarantees it matches. `_` is not allowed where
+storage is declared (locals, entity fields, return types).
+
 ### 3.4 move
 
 ```phase
@@ -370,9 +391,12 @@ wait_capture(ping);
 
 `swap a, b;` exchanges the storage two buffer names refer to, together
 with everything the checker knows about it (domain, history). Both must be
-live, owned, unborrowed local buffers of the same type — not borrow
-handles, `read` parameters, or parameters at all (their storage belongs to
-the caller).
+live, owned, unborrowed local buffers of the same type, declared in the
+same block — not borrow handles, `read` parameters, or parameters at all
+(their storage belongs to the caller). The same-block rule matters because
+storage moves with the name: swapping with a buffer from an inner block
+would leave the outer name pointing at storage that dies when the block
+ends.
 
 It exists for ping-pong double buffering, the standard way to stream from
 a DMA engine: one buffer is filled by hardware while the CPU processes the
@@ -455,7 +479,12 @@ For every program `phase check` accepts, within a function body:
   falling off the end): no local is still `@DMA`/`@DEVICE`-owned, no borrow
   is live, and every parameter is in the domain its signature promises —
   the one it arrived in, or the `@TO` of a declared change (§3.11).
-  Parameters cannot be destroyed (the caller owns them).
+  Likewise, an entity declared inside an `if`/`while` block is not
+  hardware-owned when the block ends. Parameters cannot be destroyed (the
+  caller owns them).
+- **Types.** Every buffer argument has exactly the parameter's element
+  type and length, or the parameter's length is `_` (§3.3) — so a callee,
+  and every kernel it forwards to, is told the buffer's real length.
 - **Typestate.** A value's state is established only by a function's
   declared return state, or — for a newly constructed value — the
   machine's initial state; a type annotation is checked against that and
@@ -550,8 +579,10 @@ phase/
     pir/            -- Phase IR data structures + builder
     codegen_c/      -- PIR -> C source
     driver/         -- the `phase` CLI
+    fuzz/           -- phase-fuzz: differential fuzzer (§6.7)
   runtime/
     phase_runtime.c / .h   -- sim_dma_wait / sim_device_wait (host)
+    phase_check.c / .h     -- runtime ownership checker for --checked (§6.7)
     <program>_extern.c     -- hand-written bodies for a program's extern fns
     hw/                    -- ARM Cortex-M3 backend (§5.3)
   examples/
@@ -560,9 +591,9 @@ phase/
 ```
 
 Name resolution and type checking happen inside `analysis` rather than a
-separate `sema` crate: the language has no user-defined generics or
-overloading, so a separate pass would only duplicate the symbol tables the
-analyzer already builds.
+separate `sema` crate: the language has no overloading and its only
+generic is a buffer's length (`buffer<T, _>`, §3.3), so a separate pass
+would only duplicate the symbol tables the analyzer already builds.
 
 ### 6.4 CLI
 
@@ -578,6 +609,10 @@ options:
   --error-format=human|short   (default: human, see §6.5)
   --color=auto|always|never    (default: auto -- respects NO_COLOR, and
                                 only colors a terminal)
+  --checked                    (build) runtime-checked build, see §6.7;
+                                writes <stem>.checked.gen.c and <stem>-checked
+  --stub-externs               (build) generate placeholder extern bodies
+                                instead of requiring runtime/<stem>_extern.c
 ```
 
 `build` locates the runtime by walking up from the source file to the
@@ -630,6 +665,67 @@ v1 keeps the domain-transition table (§2.4) as a hardcoded Rust `match` /
 static table inside `analysis`, not a plugin/config file. This is a
 deliberate scope cut versus KAIROS's `.hardware` file idea — making it
 data-driven is easy future work once the core analyzer is proven correct.
+
+### 6.7 Runtime-checked builds and differential fuzzing
+
+The static analysis is the guarantee; these two tools are the evidence
+that it holds.
+
+**`phase build --checked`** emits C that verifies the ownership rules
+while the program runs. `runtime/phase_check.c` keeps a shadow state for
+every buffer storage — its domain, whether it was destroyed, and the
+borrows taken of it (with the call frame each was taken in) — keyed by the
+storage's address, so it follows `swap` and borrows without extra
+bookkeeping. The generated code checks it at every buffer creation,
+`move`, `sync`, borrow, use and release of a borrow, `destroy`, `swap`,
+call argument (domain, access mode, borrows, aliasing), extern domain
+change, parameter exit, and scope exit (every block end and every
+`return`). A violation prints `PHASE runtime check failed: …` and exits
+with status 70.
+
+The checker is deliberately independent of the analyzer: it never reasons
+about branches, joins, or loop invariants — where static-analysis bugs
+live — it just watches one concrete execution. Borrow rules apply per
+call frame: a borrow a caller holds is what grants a callee its access to
+the parameter. Scope: buffers only; struct entities and typestate are not
+tracked at run time.
+
+**`phase build --stub-externs`** generates placeholder bodies for a
+program's `extern fn`s. Scalar results come from a PRNG seeded by
+`PHASE_STUB_SEED`, so a program's paths can be explored without writing
+any C.
+
+**`phase-fuzz`** (crate `crates/fuzz`) combines the two. It generates
+random, well-formed programs — buffers in every domain, borrows, calls
+with access modes and domain changes, swaps, helper functions with every
+parameter shape, nested `if`/`while`, early returns — mostly consistent
+with a model of each buffer's state, partly not. Every program `phase
+check` accepts *without warnings* is built with `--checked` and
+`--stub-externs` and run with several stub seeds. An accepted program that
+trips a runtime check is a soundness bug in the analyzer. Every program
+the fuzzer has flagged is kept in `crates/fuzz/regressions/` and replayed
+by the test suite; CI fuzzes a fresh seed range on every run.
+
+Its first runs found four bugs, all fixed in v1.3: a buffer declared in a
+block leaving scope while DMA-owned, `swap` across blocks leaving a
+dangling name, an early `return` in `main` with an undefined exit status,
+and a false alarm in the runtime checker itself.
+
+**Validating the fuzzer.** Silence is only evidence if the fuzzer would
+have spoken. With the block-end check (the first fix above) deliberately
+removed from the analyzer, the fuzzer reported 8 violations in the first
+1,000 programs of a seed range that the real analyzer passes with none.
+With the call-site domain check disabled — the most basic rule — it
+caught that too, more often at a higher `--chaos` setting (3 findings in
+300 programs at `--chaos 0.3`, versus 1 at the default). After the fixes,
+6,500 freshly generated programs (2,973 accepted and run with several
+stub seeds each, including 1,500 at `--chaos 0.3`) produced no
+violations.
+
+**Scope of the evidence.** The runtime checker tracks buffers only, and
+the generator currently uses one buffer type (`buffer<u8, 8>`); typestate,
+struct entities, and buffer type checking are covered by the static tests
+and the bug gallery, not by fuzzing.
 
 ---
 
@@ -714,6 +810,11 @@ for the analyzer and as the security narrative for the portfolio write-up.
 | 22 | Restarting the capture into the buffer being processed | Torn frame in a ping-pong pipeline | "entity `ping` is in domain @DMA but `process` expects @RAM" |
 | 23 | Ping-pong loop without trading the buffers | Waiting on the idle buffer, reprogramming a running transfer | "entity `ping` is @RAM at the end of the `while` body but @DMA when the loop is entered" |
 | 24 | `swap` while one buffer is borrowed | A view left pointing at the wrong buffer | "entity `X` has a live borrow; cannot swap" |
+| 25 | A buffer declared in a block, left DMA-owned at its end | DMA into reused stack memory | "entity `X` is still owned by @DMA when its block ends" |
+| 26 | `swap` with a buffer from an inner block | A name left pointing at dead storage | "cannot swap `X` with `Y`: `X` is declared in an inner block" |
+| 27 | A shorter buffer passed where a longer one is required | Buffer overflow in the kernel | "`f` expects buffer<f32, 256> for `p`, but `x` is buffer<f32, 64>" |
+| 28 | A buffer of the wrong element type | Type confusion, reading past the end | "`f` expects buffer<f32, 64> for `p`, but `x` is buffer<u8, 64>" |
+| 29 | A run-time-length buffer passed where a fixed length is required | Unchecked length assumption | "`f` expects buffer<f32, 128> for `p`, but `b` is buffer<f32, _>" |
 
 Every file in `examples/bug_gallery/` carries its expected error in an
 `// Expected: "..."` header, and a test asserts the analyzer produces it.
@@ -869,6 +970,19 @@ to keep 1.1 programs compiling, introduced warnings. `swap a, b;` (§3.13)
 makes ping-pong double buffering expressible and checkable as a loop
 invariant. Output: `examples/ping_pong.phase` builds and runs, processing
 seven frames in order from alternating buffers; bug-gallery #20–#24.
+
+**v1.3 — Evidence: runtime-checked builds and differential fuzzing**
+`phase build --checked` verifies the ownership rules on a concrete
+execution, independently of the analyzer, and `phase-fuzz` runs thousands
+of random programs the analyzer accepts through it (§6.7). It found two
+soundness holes in the analyzer (block-local hardware ownership, `swap`
+across blocks) and a codegen bug, all fixed. Buffer types are now checked
+at every call — closing a real overflow where a shorter buffer could be
+passed — and parameters may be length-generic, `buffer<T, _>` (§3.3).
+Output: after the fixes, 6,500 fuzzed programs (2,973 accepted and run)
+with no violations, and a fuzzer shown to catch reintroduced analyzer bugs
+(§6.7); `examples/multi_rate.phase` runs one set of generic helpers over
+two buffer sizes; bug-gallery #25–#29.
 
 **M12 — LLVM backend** *(not yet started)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead
