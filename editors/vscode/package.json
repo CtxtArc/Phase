@@ -1,0 +1,55 @@
+{
+  "name": "phase-language",
+  "displayName": "PHASE",
+  "description": "PHASE language support: syntax highlighting, and the compiler's own diagnostics inline through `phase lsp`.",
+  "version": "2.0.0",
+  "publisher": "phase-lang",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languages": [
+      {
+        "id": "phase",
+        "aliases": [
+          "PHASE",
+          "phase"
+        ],
+        "extensions": [
+          ".phase"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "phase",
+        "scopeName": "source.phase",
+        "path": "./syntaxes/phase.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "PHASE",
+      "properties": {
+        "phase.serverPath": {
+          "type": "string",
+          "default": "phase",
+          "description": "The `phase` compiler to run as a language server (`phase lsp`). Leave empty to turn the language server off and keep only highlighting."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "python3 test/grammar_check.py"
+  },
+  "dependencies": {
+    "vscode-languageclient": "9.0.1"
+  }
+}

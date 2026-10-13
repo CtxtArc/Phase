@@ -1,0 +1,167 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "PHASE",
+  "scopeName": "source.phase",
+  "fileTypes": [
+    "phase"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#device"
+    },
+    {
+      "include": "#code"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.phase",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.phase",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "device": {
+      "begin": "^\\s*(device)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "beginCaptures": {
+        "1": {
+          "name": "keyword.declaration.device.phase"
+        },
+        "2": {
+          "name": "entity.name.type.device.phase"
+        }
+      },
+      "end": "^\\}",
+      "patterns": [
+        {
+          "include": "#comments"
+        },
+        {
+          "match": "\\b(bits?)\\b",
+          "name": "keyword.other.bit.phase"
+        },
+        {
+          "match": "\\b(read|write)\\b",
+          "name": "storage.modifier.access.phase"
+        },
+        {
+          "match": "^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?=:)",
+          "captures": {
+            "1": {
+              "name": "variable.other.register.phase"
+            }
+          }
+        },
+        {
+          "include": "#code"
+        }
+      ],
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.section.block.end.phase"
+        }
+      }
+    },
+    "code": {
+      "patterns": [
+        {
+          "include": "#comments"
+        },
+        {
+          "name": "string.quoted.double.phase",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.phase",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "constant.other.domain.phase",
+          "match": "@(RAM|STACK|DMA|MMIO|DEVICE)\\b"
+        },
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.function.phase"
+            },
+            "2": {
+              "name": "entity.name.function.phase"
+            }
+          }
+        },
+        {
+          "match": "\\b(entity|state)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.type.phase"
+            },
+            "2": {
+              "name": "entity.name.type.phase"
+            }
+          }
+        },
+        {
+          "name": "keyword.declaration.phase",
+          "match": "\\b(extern|let)\\b"
+        },
+        {
+          "name": "keyword.control.phase",
+          "match": "\\b(if|else|while|return)\\b"
+        },
+        {
+          "name": "keyword.other.ownership.phase",
+          "match": "\\b(move|sync|borrow|release|destroy|swap|rotate|split|join|into)\\b"
+        },
+        {
+          "name": "storage.modifier.access.phase",
+          "match": "\\b(read|write)\\b"
+        },
+        {
+          "name": "support.function.builtin.phase",
+          "match": "\\b(volatile_read|volatile_write)\\b"
+        },
+        {
+          "name": "storage.type.buffer.phase",
+          "match": "\\bbuffer\\b"
+        },
+        {
+          "name": "storage.type.primitive.phase",
+          "match": "\\b(u8|u16|u32|u64|i8|i16|i32|i64|f32|f64|bool)\\b"
+        },
+        {
+          "name": "constant.language.boolean.phase",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "constant.numeric.hex.phase",
+          "match": "\\b0[xX][0-9A-Fa-f_]+\\b"
+        },
+        {
+          "name": "constant.numeric.phase",
+          "match": "\\b[0-9]+(\\.[0-9]+)?\\b"
+        },
+        {
+          "name": "keyword.operator.phase",
+          "match": "->|\\.\\.=|==|!=|<=|>=|[+\\-*/<>=]"
+        },
+        {
+          "name": "entity.name.function.call.phase",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"
+        }
+      ]
+    }
+  }
+}

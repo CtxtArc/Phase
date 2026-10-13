@@ -184,7 +184,7 @@ fn render_human(diag: &Diagnostic, path: &str, src: &str, st: &Style) -> String 
 }
 
 /// Columns `[start, end)` (1-based, in chars) to underline on `line_no`.
-fn underline_range(span: Span, line: &str, subject: Option<&str>) -> (usize, usize) {
+pub fn underline_range(span: Span, line: &str, subject: Option<&str>) -> (usize, usize) {
     let line_len = line.chars().count();
     let start = span.col.max(1) as usize;
     let end = if span.end_line == span.line && span.end_col as usize > start {

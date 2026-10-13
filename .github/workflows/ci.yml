@@ -52,6 +52,8 @@ jobs:
           name: fuzz-findings
           path: fuzz-findings/
           if-no-files-found: ignore
+      - name: Editor grammar highlights every example
+        run: python3 editors/vscode/test/grammar_check.py
       - name: Bug-gallery transcript is up to date
         run: |
           ./scripts/capture_bug_gallery.sh

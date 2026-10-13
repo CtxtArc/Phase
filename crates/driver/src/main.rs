@@ -6,9 +6,12 @@
 //!   phase [options] --dump-tokens <file>  lex and print the token stream
 //!   phase [options] --dump-ast <file>     parse and pretty-print the AST
 //!   phase [options] --dump-pir <file>     check and pretty-print the PIR
+//!   phase lsp                             language server on stdin/stdout
 //!   phase --version | --help
 
 mod diagnostics;
+mod json;
+mod lsp;
 
 use diagnostics::{Diagnostic, ErrorFormat};
 use std::env;
@@ -29,6 +32,7 @@ usage:
   phase [options] --dump-tokens <file>  print the token stream
   phase [options] --dump-ast <file>     print the parsed AST
   phase [options] --dump-pir <file>     check, then print the lowered PIR
+  phase lsp                             run the language server on stdin/stdout
   phase --version                       print the version
   phase --help                          print this message
 
@@ -202,6 +206,9 @@ fn main() -> ExitCode {
         Some("--help" | "-h" | "help") if positional.len() == 1 => {
             println!("{}", usage());
             return ExitCode::SUCCESS;
+        }
+        Some("lsp") if positional.len() == 1 => {
+            return ExitCode::from(lsp::serve() as u8);
         }
         _ => {}
     }
