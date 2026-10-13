@@ -844,18 +844,7 @@ note: 'raw' is declared in @DMA here
 12 |     buffer<Sample, 1024> raw @DMA;
    |     ------------------------------
 
-error: entity 'raw' is still owned by @DMA when 'main' returns; sync(raw) before it goes out of scope
-  --> examples/bug_gallery/use_before_sync.phase:17:1
-   |
-17 | }
-   | ^
-note: 'raw' is declared in @DMA here
-  --> examples/bug_gallery/use_before_sync.phase:12:5
-   |
-12 |     buffer<Sample, 1024> raw @DMA;
-   |     ------------------------------
-
-examples/bug_gallery/use_before_sync.phase: 2 errors found
+examples/bug_gallery/use_before_sync.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/use_owner_while_borrowed.phase`

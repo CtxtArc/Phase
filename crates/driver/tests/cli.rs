@@ -350,6 +350,44 @@ fn stub_externs_build_without_a_runtime_file() {
 }
 
 #[test]
+fn stubs_print_each_call_and_an_unused_let_is_not_a_c_warning() {
+    let dir = std::env::temp_dir().join("phase_cli_stub_trace");
+    std::fs::create_dir_all(dir.join("runtime")).unwrap();
+    let root = workspace_root();
+    for f in ["phase_runtime.h", "phase_runtime.c"] {
+        std::fs::copy(root.join("runtime").join(f), dir.join("runtime").join(f)).unwrap();
+    }
+    let file = dir.join("trace.phase");
+    std::fs::write(
+        &file,
+        "extern fn fill(dst: write buffer<f32, 8> @RAM);\nextern fn mean(src: read buffer<f32, 8> @RAM, k: u32) -> f32;\nfn main() {\n    buffer<f32, 8> s @RAM;\n    fill(s);\n    let m: f32 = mean(s, 3);\n}\n",
+    )
+    .unwrap();
+    let out = phase()
+        .args(["build", "--stub-externs", "--run"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `m` is never used: no C warning about it.
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[stub] fill(dst: 8 x f32)\n"), "{stdout}");
+    assert!(
+        stdout.contains("[stub] mean(src: 8 x f32, k: 3) -> "),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn stub_externs_compile_without_c_warnings_when_no_extern_returns_a_value() {
     // ping_pong's externs all return void, so the stubs' PRNG goes unused;
     // that must not produce a C compiler warning on every build.
