@@ -91,7 +91,7 @@ OK: examples/triple_buffer.phase parsed and passed domain/ownership analysis (1 
 ### `examples/uart_hello.phase`
 
 ```
-OK: examples/uart_hello.phase parsed and passed domain/ownership analysis (0 entities, 2 fns)
+OK: examples/uart_hello.phase parsed and passed domain/ownership analysis (0 entities, 2 fns, 2 files)
 ```
 
 ## Bug gallery (expected to fail, with the exact compiler output)
@@ -418,6 +418,25 @@ note: 'x' is borrowed by 'view' here
   |     -------------------------
 
 examples/bug_gallery/move_while_borrowed.phase: 1 error found
+```
+
+### `examples/bug_gallery/overlapping_devices.phase`
+
+Bug gallery #40: two devices at one address -- a copy-pasted base
+
+```
+error: devices 'DebugUart' (0x40005000..0x40005014) and 'ModemUart' (0x40005000..0x40005014) overlap
+  --> examples/bug_gallery/overlapping_devices.phase:15:8
+   |
+15 | device DebugUart: CmsdkUart @ 0x40005000;
+   |        ^^^^^^^^^
+note: 'ModemUart' is declared here
+  --> examples/bug_gallery/overlapping_devices.phase:13:8
+   |
+13 | device ModemUart: CmsdkUart @ 0x40005000;
+   |        ---------
+
+examples/bug_gallery/overlapping_devices.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/overlapping_registers.phase`

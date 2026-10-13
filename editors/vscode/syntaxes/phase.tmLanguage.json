@@ -10,6 +10,15 @@
       "include": "#comments"
     },
     {
+      "include": "#import"
+    },
+    {
+      "include": "#device_instance"
+    },
+    {
+      "include": "#device_type"
+    },
+    {
       "include": "#device"
     },
     {
@@ -160,6 +169,75 @@
         {
           "name": "entity.name.function.call.phase",
           "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"
+        }
+      ]
+    },
+    "import": {
+      "match": "^\\s*(import)\\s+(\"[^\"]*\")",
+      "captures": {
+        "1": {
+          "name": "keyword.control.import.phase"
+        },
+        "2": {
+          "name": "string.quoted.double.phase"
+        }
+      }
+    },
+    "device_instance": {
+      "match": "^\\s*(device)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.declaration.device.phase"
+        },
+        "2": {
+          "name": "entity.name.type.device.phase"
+        },
+        "3": {
+          "name": "entity.name.type.device-type.phase"
+        }
+      }
+    },
+    "device_type": {
+      "begin": "^\\s*(device)\\s+(type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "beginCaptures": {
+        "1": {
+          "name": "keyword.declaration.device.phase"
+        },
+        "2": {
+          "name": "keyword.declaration.device.phase"
+        },
+        "3": {
+          "name": "entity.name.type.device-type.phase"
+        }
+      },
+      "end": "^\\}",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.section.block.end.phase"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#comments"
+        },
+        {
+          "match": "\\b(bits?)\\b",
+          "name": "keyword.other.bit.phase"
+        },
+        {
+          "match": "\\b(read|write)\\b",
+          "name": "storage.modifier.access.phase"
+        },
+        {
+          "match": "^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?=:)",
+          "captures": {
+            "1": {
+              "name": "variable.other.register.phase"
+            }
+          }
+        },
+        {
+          "include": "#code"
         }
       ]
     }

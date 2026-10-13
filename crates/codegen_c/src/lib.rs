@@ -26,8 +26,8 @@
 
 use phase_ast::{BinOp, BorrowMode, Domain};
 use phase_pir::{
-    CallArg, PirDevice, PirEntityDef, PirExpr, PirFn, PirFnSig, PirInst, PirLiteral, PirProgram,
-    PirReg, PirType, RegRef,
+    CallArg, PirDevice, PirDeviceType, PirEntityDef, PirExpr, PirFn, PirFnSig, PirInst, PirLiteral,
+    PirProgram, PirReg, PirType, RegRef,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -247,6 +247,9 @@ fn generate_header(program: &PirProgram, stem: &str) -> String {
         out.push('\n');
     }
 
+    for t in &program.device_types {
+        out.push_str(&format_device_type(t));
+    }
     for d in &program.devices {
         out.push_str(&format_device(d));
     }
@@ -273,21 +276,23 @@ fn field_mask(lo: u32, hi: u32) -> u64 {
     }
 }
 
-/// A `device` register map (v2.0) as a CMSIS-style struct laid out at the
-/// declared offsets, and a macro naming the device: the real base address
-/// on a hardware target (`PHASE_TARGET_HW`), a simulated register block in
-/// a host build. `Pos`/`Msk` macros let hand-written C use the same fields.
-fn format_device(d: &PirDevice) -> String {
-    let mut regs: Vec<&PirReg> = d.regs.iter().collect();
+/// The C struct type a device's registers are laid out in: its own, or
+/// its type's (v2.1), shared by every device of that type.
+fn device_struct(d: &PirDevice) -> String {
+    match &d.of_type {
+        Some(t) => format!("phase_devtype_{t}_regs"),
+        None => format!("phase_dev_{}_regs", d.name),
+    }
+}
+
+/// A register map as a CMSIS-style struct: `volatile` members at the
+/// declared offsets (padded, and checked by `_Static_assert`), and
+/// `<prefix>_REG_FIELD_Pos`/`_Msk` macros so hand-written C can use the
+/// same fields.
+fn format_layout(ty: &str, prefix: &str, regs: &[PirReg]) -> String {
+    let mut regs: Vec<&PirReg> = regs.iter().collect();
     regs.sort_by_key(|r| r.offset);
-    let ty = format!("phase_dev_{}_regs", d.name);
-    let mut s = format!(
-        "/* --- device {} @ {:#x} ---\n * Registers at their declared offsets. On a hardware target \
-         (PHASE_TARGET_HW)\n * `{}` is the device's real address; in a host build, a simulated \
-         register block\n * starting from the declared reset values. */\n",
-        d.name, d.base, d.name
-    );
-    s.push_str("typedef struct {\n");
+    let mut s = String::from("typedef struct {\n");
     let mut at = 0u64;
     let mut pad = 0;
     for r in &regs {
@@ -311,28 +316,59 @@ fn format_device(d: &PirDevice) -> String {
     s.push_str(&format!("}} {ty};\n"));
     for r in &regs {
         s.push_str(&format!(
-            "_Static_assert(offsetof({ty}, {}) == {:#x}, \"{}.{} offset\");\n",
-            r.name, r.offset, d.name, r.name
+            "_Static_assert(offsetof({ty}, {}) == {:#x}, \"{prefix}.{} offset\");\n",
+            r.name, r.offset, r.name
         ));
+    }
+    for r in &regs {
+        for (f, lo, hi) in &r.fields {
+            s.push_str(&format!(
+                "#define {prefix}_{}_{f}_Pos {lo}u\n#define {prefix}_{}_{f}_Msk ({:#x}u << {lo}u)\n",
+                r.name,
+                r.name,
+                field_mask(*lo, *hi)
+            ));
+        }
+    }
+    s
+}
+
+/// A `device type` (v2.1): its layout, once for all its devices.
+fn format_device_type(t: &PirDeviceType) -> String {
+    let mut s = format!(
+        "/* --- device type {} ---\n * The register layout every device of this type shares. */\n",
+        t.name
+    );
+    s.push_str(&format_layout(
+        &format!("phase_devtype_{}_regs", t.name),
+        &t.name,
+        &t.regs,
+    ));
+    s.push('\n');
+    s
+}
+
+/// A `device` (v2.0): its layout, unless it is an instance of a type, and
+/// a macro naming it -- the real base address on a hardware target
+/// (`PHASE_TARGET_HW`), a simulated register block in a host build.
+fn format_device(d: &PirDevice) -> String {
+    let ty = device_struct(d);
+    let mut s = match &d.of_type {
+        Some(t) => format!("/* --- device {}: {t} @ {:#x} --- */\n", d.name, d.base),
+        None => format!(
+            "/* --- device {} @ {:#x} ---\n * Registers at their declared offsets. On a hardware target \
+             (PHASE_TARGET_HW)\n * `{}` is the device's real address; in a host build, a simulated \
+             register block\n * starting from the declared reset values. */\n",
+            d.name, d.base, d.name
+        ),
+    };
+    if d.of_type.is_none() {
+        s.push_str(&format_layout(&ty, &d.name, &d.regs));
     }
     s.push_str(&format!(
         "#ifdef PHASE_TARGET_HW\n#define {} (({ty} *){:#x}u)\n#else\nextern {ty} phase_dev_{}_sim;\n#define {} (&phase_dev_{}_sim)\n#endif\n",
         d.name, d.base, d.name, d.name, d.name
     ));
-    for r in &regs {
-        for (f, lo, hi) in &r.fields {
-            s.push_str(&format!(
-                "#define {}_{}_{}_Pos {lo}u\n#define {}_{}_{}_Msk ({:#x}u << {lo}u)\n",
-                d.name,
-                r.name,
-                f,
-                d.name,
-                r.name,
-                f,
-                field_mask(*lo, *hi)
-            ));
-        }
-    }
     s.push('\n');
     s
 }
@@ -443,8 +479,9 @@ fn generate_source(program: &PirProgram, stem: &str, checked: bool) -> String {
                 format!("{{ {} }}", inits.join(", "))
             };
             out.push_str(&format!(
-                "phase_dev_{}_regs phase_dev_{}_sim = {init};\n",
-                d.name, d.name
+                "{} phase_dev_{}_sim = {init};\n",
+                device_struct(d),
+                d.name
             ));
         }
         out.push_str("#endif\n\n");
@@ -1849,6 +1886,54 @@ mod tests {
             "Timer->LOAD = (uint32_t)(load);",
         ] {
             assert!(g.source.contains(needle), "missing {needle:?} in\n{}", g.source);
+        }
+    }
+
+    #[test]
+    fn devices_of_one_type_share_one_struct() {
+        let src = r#"
+            device type Uart {
+                DATA:  read write u32 @ 0x00;
+                CTRL:  read write u32 @ 0x08 = 0x1 { TX_EN: bit 0 }
+            }
+            device Uart0: Uart @ 0x40004000;
+            device Uart1: Uart @ 0x40005000;
+            fn main() {
+                volatile_write(Uart1.CTRL.TX_EN, 1);
+                volatile_write(Uart0.DATA, 65);
+            }
+        "#;
+        let g = generate_src(src, "t");
+        assert_eq!(
+            g.header.matches("typedef struct {").count(),
+            1,
+            "{}",
+            g.header
+        );
+        for needle in [
+            "} phase_devtype_Uart_regs;",
+            "#define Uart_CTRL_TX_EN_Pos 0u",
+            "#define Uart0 ((phase_devtype_Uart_regs *)0x40004000u)",
+            "#define Uart1 ((phase_devtype_Uart_regs *)0x40005000u)",
+            "extern phase_devtype_Uart_regs phase_dev_Uart1_sim;",
+        ] {
+            assert!(
+                g.header.contains(needle),
+                "missing {needle:?} in\n{}",
+                g.header
+            );
+        }
+        for needle in [
+            "phase_devtype_Uart_regs phase_dev_Uart0_sim = { .CTRL = 0x1u };",
+            "phase_devtype_Uart_regs phase_dev_Uart1_sim = { .CTRL = 0x1u };",
+            "Uart1->CTRL = (uint32_t)((Uart1->CTRL & ~(0x1u << 0u))",
+            "Uart0->DATA = (uint32_t)(65);",
+        ] {
+            assert!(
+                g.source.contains(needle),
+                "missing {needle:?} in\n{}",
+                g.source
+            );
         }
     }
 }

@@ -13,6 +13,8 @@ syn keyword phaseType       u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 bool
 syn keyword phaseBool       true false
 syn keyword phaseBuiltin    volatile_read volatile_write
 syn match   phaseDevice     "^\s*\zsdevice\ze\s\+\h"
+syn match   phaseDevice     "\(^\s*device\s\+\)\@<=type\ze\s\+\h"
+syn match   phaseImport     "^\s*\zsimport\ze\s\+\""
 syn match   phaseBit        "\<bits\=\>"
 syn match   phaseDomain     "@\(RAM\|STACK\|DMA\|MMIO\|DEVICE\)\>"
 syn match   phaseNumber     "\<\d\+\(\.\d\+\)\=\>"
@@ -24,6 +26,7 @@ syn region  phaseComment    start="/\*" end="\*/" contains=@Spell
 
 hi def link phaseDecl       Keyword
 hi def link phaseDevice     Keyword
+hi def link phaseImport     Include
 hi def link phaseControl    Conditional
 hi def link phaseOwnership  Statement
 hi def link phaseAccess     StorageClass

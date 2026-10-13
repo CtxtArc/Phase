@@ -31,8 +31,8 @@
 //!   reference as their first argument.
 
 use phase_ast::{
-    BorrowMode, BufferLen, DeviceDecl, Domain, Expr, FnDecl, Item, Program, RegDecl, RegField,
-    Span, Stmt, TypeExpr,
+    BorrowMode, BufferLen, DeviceDecl, DeviceTypeDecl, Domain, Expr, FnDecl, Item, Program,
+    RegDecl, RegField, Span, Stmt, TypeExpr,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -443,15 +443,42 @@ pub fn analyze_full(program: &Program) -> Report {
     Report { errors, warnings }
 }
 
-/// Validate every `device` register map (v2.0) and index them by name.
-/// A register is `u8`, `u16` or `u32`, aligned to its width, and doesn't
-/// overlap another; a field lies within its register and doesn't overlap
-/// another field; a reset value fits. Device names share the namespace of
-/// functions, entities and typestate machines.
+/// What the analyzer knows about one device: where it is, and its
+/// registers (its own, or its type's).
+#[derive(Clone, Copy)]
+struct DeviceView<'p> {
+    span: Span,
+    base: u64,
+    regs: &'p [RegDecl],
+}
+
+impl<'p> DeviceView<'p> {
+    fn reg(&self, name: &str) -> Option<&'p RegDecl> {
+        phase_ast::find_reg(self.regs, name)
+    }
+
+    /// Bytes from the base address to the end of the last register.
+    fn extent(&self) -> u64 {
+        self.regs
+            .iter()
+            .filter_map(|r| Some(r.offset + u64::from(r.bits()? / 8)))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Validate every `device` register map (v2.0) and `device type` (v2.1),
+/// and index the devices by name. A register is `u8`, `u16` or `u32`,
+/// aligned to its width, and doesn't overlap another; a field lies within
+/// its register and doesn't overlap another field; a reset value fits. An
+/// instance names a declared type; a device's base address keeps its
+/// registers aligned; and no two devices overlap in the address space.
+/// Device and type names share the namespace of functions, entities and
+/// typestate machines.
 fn check_devices<'p>(
     program: &'p Program,
     errors: &mut Vec<AnalysisError>,
-) -> HashMap<&'p str, &'p DeviceDecl> {
+) -> HashMap<&'p str, DeviceView<'p>> {
     let mut other_names: HashSet<&str> = HashSet::new();
     for item in &program.items {
         match item {
@@ -459,10 +486,37 @@ fn check_devices<'p>(
             Item::ExternFn(f) => other_names.insert(f.name.as_str()),
             Item::Entity(e) => other_names.insert(e.name.as_str()),
             Item::State(s) => other_names.insert(s.name.as_str()),
-            Item::Device(_) | Item::Import(_) => false,
+            Item::Device(_) | Item::DeviceType(_) | Item::Import(_) => false,
         };
     }
-    let mut devices: HashMap<&str, &DeviceDecl> = HashMap::new();
+    let mut types: HashMap<&str, &DeviceTypeDecl> = HashMap::new();
+    for item in &program.items {
+        let Item::DeviceType(t) = item else { continue };
+        if let Some(first) = types.get(t.name.as_str()) {
+            errors.push(
+                err(format!(
+                    "device type '{}' is declared more than once",
+                    t.name
+                ))
+                .at(t.span)
+                .note(first.span, format!("'{}' is first declared here", t.name)),
+            );
+            continue;
+        }
+        if other_names.contains(t.name.as_str()) {
+            errors.push(
+                err(format!(
+                    "'{}' is declared as a device type and as a function, entity or typestate",
+                    t.name
+                ))
+                .at(t.span),
+            );
+        }
+        check_reg_map("device type", &t.name, &t.regs, errors);
+        types.insert(t.name.as_str(), t);
+    }
+    let mut devices: HashMap<&str, DeviceView> = HashMap::new();
+    let mut order: Vec<(&DeviceDecl, DeviceView)> = Vec::new();
     for item in &program.items {
         let Item::Device(d) = item else { continue };
         if let Some(first) = devices.get(d.name.as_str()) {
@@ -473,127 +527,203 @@ fn check_devices<'p>(
             );
             continue;
         }
-        if other_names.contains(d.name.as_str()) {
+        if other_names.contains(d.name.as_str()) || types.contains_key(d.name.as_str()) {
             errors.push(
                 err(format!(
-                    "'{}' is declared as a device and as a function, entity or typestate",
+                    "'{}' is declared as a device and as a device type, function, entity or typestate",
                     d.name
                 ))
                 .at(d.span),
             );
         }
-        let mut placed: Vec<(&RegDecl, u64, u64)> = Vec::new();
-        for r in &d.regs {
-            let full = format!("{}.{}", d.name, r.name);
-            if let Some((first, _, _)) = placed.iter().find(|(p, _, _)| p.name == r.name) {
-                errors.push(
-                    err(format!(
-                        "device '{}' declares register '{}' more than once",
-                        d.name, r.name
-                    ))
-                    .at(r.span)
-                    .note(first.span, format!("'{full}' is first declared here")),
-                );
-                continue;
+        let regs: &[RegDecl] = match &d.of_type {
+            None => {
+                check_reg_map("device", &d.name, &d.regs, errors);
+                &d.regs
             }
-            let Some(bits) = r.bits() else {
-                errors.push(
-                    err(format!(
-                        "register '{full}' has type '{}'; a register is u8, u16 or u32",
-                        r.ty
-                    ))
-                    .at(r.span),
-                );
-                continue;
-            };
-            let bytes = u64::from(bits / 8);
-            if r.offset % bytes != 0 {
-                errors.push(
-                    err(format!(
-                        "register '{full}' is at offset {:#x}, which is not aligned to its {bytes} bytes",
-                        r.offset
-                    ))
-                    .at(r.span),
-                );
-            }
-            let (start, end) = (r.offset, r.offset.saturating_add(bytes));
-            if let Some((other, _, _)) = placed.iter().find(|(_, s, e)| start < *e && *s < end) {
-                errors.push(
-                    err(format!(
-                        "register '{full}' (bytes {:#x}..{:#x}) overlaps '{}.{}'",
-                        start, end, d.name, other.name
-                    ))
-                    .at(r.span)
-                    .note(
-                        other.span,
-                        format!("'{}.{}' is declared here", d.name, other.name),
-                    ),
-                );
-            }
-            placed.push((r, start, end));
-            let max = if bits == 64 {
-                u64::MAX
-            } else {
-                (1u64 << bits) - 1
-            };
-            if let Some(v) = r.reset.filter(|v| *v > max) {
-                errors.push(
-                    err(format!(
-                        "reset value {v:#x} does not fit in the {bits}-bit register '{full}'"
-                    ))
-                    .at(r.span),
-                );
-            }
-            let mut fields: Vec<&RegField> = Vec::new();
-            for f in &r.fields {
-                if f.lo > f.hi {
+            Some((ty, tspan)) => match types.get(ty.as_str()) {
+                Some(t) => &t.regs,
+                None => {
+                    let mut known: Vec<&str> = types.keys().copied().collect();
+                    known.sort();
                     errors.push(
                         err(format!(
-                            "field '{full}.{}' is `bits {}..={}`; the low bit comes first",
-                            f.name, f.lo, f.hi
+                            "device '{}' is of type '{ty}', which is not declared{}",
+                            d.name,
+                            if known.is_empty() {
+                                " (there are no device types)".to_string()
+                            } else {
+                                format!(" (device types: {})", known.join(", "))
+                            }
                         ))
-                        .at(f.span),
+                        .at(*tspan),
                     );
                     continue;
                 }
-                if f.hi >= bits {
-                    errors.push(
-                        err(format!(
-                            "field '{full}.{}' uses bit {}, outside the {bits}-bit register",
-                            f.name, f.hi
-                        ))
-                        .at(f.span),
-                    );
-                    continue;
-                }
-                if let Some(first) = fields.iter().find(|g| g.name == f.name) {
-                    errors.push(
-                        err(format!(
-                            "register '{full}' declares field '{}' more than once",
-                            f.name
-                        ))
-                        .at(f.span)
-                        .note(first.span, "first declared here"),
-                    );
-                    continue;
-                }
-                if let Some(g) = fields.iter().find(|g| f.lo <= g.hi && g.lo <= f.hi) {
-                    errors.push(
-                        err(format!(
-                            "fields '{full}.{}' and '{full}.{}' share bits",
-                            g.name, f.name
-                        ))
-                        .at(f.span)
-                        .note(g.span, format!("'{}' is declared here", g.name)),
-                    );
-                    continue;
-                }
-                fields.push(f);
-            }
+            },
+        };
+        let align = regs
+            .iter()
+            .filter_map(|r| r.bits())
+            .map(|b| u64::from(b / 8))
+            .max()
+            .unwrap_or(1);
+        if d.base % align != 0 {
+            errors.push(
+                err(format!(
+                    "device '{}' is at {:#x}, which is not aligned to its {align}-byte registers",
+                    d.name, d.base
+                ))
+                .at(d.span),
+            );
         }
-        devices.insert(d.name.as_str(), d);
+        let view = DeviceView {
+            span: d.span,
+            base: d.base,
+            regs,
+        };
+        devices.insert(d.name.as_str(), view);
+        order.push((d, view));
+    }
+    // Two devices sharing addresses: every write to one changes the other.
+    for (i, (d, v)) in order.iter().enumerate() {
+        let (start, end) = (v.base, v.base.saturating_add(v.extent()));
+        if start == end {
+            continue;
+        }
+        if let Some((e, w)) = order[..i].iter().find(|(_, w)| {
+            let (s2, e2) = (w.base, w.base.saturating_add(w.extent()));
+            s2 < e2 && start < e2 && s2 < end
+        }) {
+            errors.push(
+                err(format!(
+                    "devices '{}' ({:#x}..{:#x}) and '{}' ({:#x}..{:#x}) overlap",
+                    d.name,
+                    start,
+                    end,
+                    e.name,
+                    w.base,
+                    w.base + w.extent()
+                ))
+                .at(d.span)
+                .note(e.span, format!("'{}' is declared here", e.name)),
+            );
+        }
     }
     devices
+}
+
+/// Validate one register map: the registers of a device or device type.
+fn check_reg_map(what: &str, owner: &str, regs: &[RegDecl], errors: &mut Vec<AnalysisError>) {
+    let mut placed: Vec<(&RegDecl, u64, u64)> = Vec::new();
+    for r in regs {
+        let full = format!("{owner}.{}", r.name);
+        if let Some((first, _, _)) = placed.iter().find(|(p, _, _)| p.name == r.name) {
+            errors.push(
+                err(format!(
+                    "{what} '{owner}' declares register '{}' more than once",
+                    r.name
+                ))
+                .at(r.span)
+                .note(first.span, format!("'{full}' is first declared here")),
+            );
+            continue;
+        }
+        let Some(bits) = r.bits() else {
+            errors.push(
+                err(format!(
+                    "register '{full}' has type '{}'; a register is u8, u16 or u32",
+                    r.ty
+                ))
+                .at(r.span),
+            );
+            continue;
+        };
+        let bytes = u64::from(bits / 8);
+        if r.offset % bytes != 0 {
+            errors.push(
+                err(format!(
+                    "register '{full}' is at offset {:#x}, which is not aligned to its {bytes} bytes",
+                    r.offset
+                ))
+                .at(r.span),
+            );
+        }
+        let (start, end) = (r.offset, r.offset.saturating_add(bytes));
+        if let Some((other, _, _)) = placed.iter().find(|(_, s, e)| start < *e && *s < end) {
+            errors.push(
+                err(format!(
+                    "register '{full}' (bytes {:#x}..{:#x}) overlaps '{owner}.{}'",
+                    start, end, other.name
+                ))
+                .at(r.span)
+                .note(
+                    other.span,
+                    format!("'{owner}.{}' is declared here", other.name),
+                ),
+            );
+        }
+        placed.push((r, start, end));
+        let max = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        if let Some(v) = r.reset.filter(|v| *v > max) {
+            errors.push(
+                err(format!(
+                    "reset value {v:#x} does not fit in the {bits}-bit register '{full}'"
+                ))
+                .at(r.span),
+            );
+        }
+        let mut fields: Vec<&RegField> = Vec::new();
+        for f in &r.fields {
+            if f.lo > f.hi {
+                errors.push(
+                    err(format!(
+                        "field '{full}.{}' is `bits {}..={}`; the low bit comes first",
+                        f.name, f.lo, f.hi
+                    ))
+                    .at(f.span),
+                );
+                continue;
+            }
+            if f.hi >= bits {
+                errors.push(
+                    err(format!(
+                        "field '{full}.{}' uses bit {}, outside the {bits}-bit register",
+                        f.name, f.hi
+                    ))
+                    .at(f.span),
+                );
+                continue;
+            }
+            if let Some(first) = fields.iter().find(|g| g.name == f.name) {
+                errors.push(
+                    err(format!(
+                        "register '{full}' declares field '{}' more than once",
+                        f.name
+                    ))
+                    .at(f.span)
+                    .note(first.span, "first declared here"),
+                );
+                continue;
+            }
+            if let Some(g) = fields.iter().find(|g| f.lo <= g.hi && g.lo <= f.hi) {
+                errors.push(
+                    err(format!(
+                        "fields '{full}.{}' and '{full}.{}' share bits",
+                        g.name, f.name
+                    ))
+                    .at(f.span)
+                    .note(g.span, format!("'{}' is declared here", g.name)),
+                );
+                continue;
+            }
+            fields.push(f);
+        }
+    }
 }
 
 /// `Dev.REG` or `Dev.REG.FIELD` as written.
@@ -725,7 +855,7 @@ impl BorrowState {
 struct FnChecker<'a> {
     fn_name: String,
     /// `device` register maps (v2.0), by device name.
-    devices: &'a HashMap<&'a str, &'a DeviceDecl>,
+    devices: &'a HashMap<&'a str, DeviceView<'a>>,
     fn_sigs: &'a HashMap<&'a str, FnSig>,
     state_machines: &'a HashMap<&'a str, HashSet<&'a str>>,
     initial_states: &'a HashMap<&'a str, &'a str>,
@@ -832,7 +962,7 @@ enum MergeKind {
 impl<'a> FnChecker<'a> {
     fn new(
         fn_name: &str,
-        devices: &'a HashMap<&'a str, &'a DeviceDecl>,
+        devices: &'a HashMap<&'a str, DeviceView<'a>>,
         entity_domains: &'a HashMap<&'a str, Option<Domain>>,
         fn_sigs: &'a HashMap<&'a str, FnSig>,
         state_machines: &'a HashMap<&'a str, HashSet<&'a str>>,
@@ -5526,8 +5656,82 @@ mod device_tests {
         );
         rejects(
             "device main @ 0 { A: read u8 @ 0; } fn main() {}",
-            "'main' is declared as a device and as a function",
+            "'main' is declared as a device and as a device type, function",
         );
+    }
+
+    const TYPED: &str = r#"
+        device type Uart {
+            DATA:  read write u32 @ 0x00;
+            STATE: read u32 @ 0x04 { TXFULL: bit 0 }
+        }
+        device Uart0: Uart @ 0x40004000;
+        device Uart1: Uart @ 0x40005000;
+    "#;
+
+    #[test]
+    fn instances_have_their_types_registers() {
+        check(&format!(
+            "{TYPED} fn main() {{ volatile_write(Uart1.DATA, 65); let f: u32 = volatile_read(Uart0.STATE.TXFULL); }}"
+        ))
+        .unwrap();
+        rejects(
+            &format!("{TYPED} fn main() {{ volatile_write(Uart1.STATE, 0); }}"),
+            "'Uart1.STATE' is read-only; it cannot be written",
+        );
+        rejects(
+            &format!("{TYPED} fn main() {{ volatile_write(Uart0.CTRL, 0); }}"),
+            "device 'Uart0' has no register 'CTRL' (it has DATA, STATE)",
+        );
+    }
+
+    #[test]
+    fn device_types_and_instances_are_validated() {
+        rejects(
+            "device U0: Uart @ 0x1000; fn main() {}",
+            "device 'U0' is of type 'Uart', which is not declared (there are no device types)",
+        );
+        rejects(
+            &format!("{TYPED} device U2: Uarts @ 0x1000; fn main() {{}}"),
+            "device 'U2' is of type 'Uarts', which is not declared (device types: Uart)",
+        );
+        rejects(
+            "device type T { A: read u32 @ 2; } fn main() {}",
+            "register 'T.A' is at offset 0x2, which is not aligned to its 4 bytes",
+        );
+        rejects(
+            "device type T { A: read u32 @ 0; } device type T { B: read u8 @ 0; } fn main() {}",
+            "device type 'T' is declared more than once",
+        );
+        rejects(
+            "device type T { A: read u32 @ 0; A: read u32 @ 4; } fn main() {}",
+            "device type 'T' declares register 'A' more than once",
+        );
+        rejects(
+            &format!("{TYPED} device Uart2: Uart @ 0x40006002; fn main() {{}}"),
+            "device 'Uart2' is at 0x40006002, which is not aligned to its 4-byte registers",
+        );
+        rejects(
+            "device type T { A: read u32 @ 0; } device T: T @ 0; fn main() {}",
+            "'T' is declared as a device and as a device type",
+        );
+    }
+
+    #[test]
+    fn devices_may_not_overlap() {
+        rejects(
+            &format!("{TYPED} device Uart2: Uart @ 0x40005004; fn main() {{}}"),
+            "devices 'Uart2' (0x40005004..0x4000500c) and 'Uart1' (0x40005000..0x40005008) overlap",
+        );
+        rejects(
+            "device A @ 0x100 { R: read u32 @ 0x8; } device B @ 0x108 { S: read u8 @ 0; } fn main() {}",
+            "devices 'B' (0x108..0x109) and 'A' (0x100..0x10c) overlap",
+        );
+        // Back to back is fine.
+        check(&format!(
+            "{TYPED} device Uart2: Uart @ 0x40005008; fn main() {{}}"
+        ))
+        .unwrap();
     }
 
     #[test]

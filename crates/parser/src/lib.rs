@@ -154,7 +154,7 @@ impl Parser {
             TokenKind::KwFn => self.parse_fn_decl().map(Item::Fn),
             // `device` is a keyword only here, at the start of an item, so
             // existing programs may keep using it as a name.
-            TokenKind::Ident(w) if w == "device" => self.parse_device_decl().map(Item::Device),
+            TokenKind::Ident(w) if w == "device" => self.parse_device_item(),
             TokenKind::Ident(w) if w == "import" => {
                 let start = self.peek_span();
                 self.bump();
@@ -223,24 +223,55 @@ impl Parser {
     ///     CTRL:  read write u32 @ 0x08 = 0 { TX_EN: bit 0, BAUD: bits 4..=11 }
     /// }
     /// ```
-    fn parse_device_decl(&mut self) -> Result<DeviceDecl, ParseError> {
+    /// `device NAME @ BASE { REGS }`, `device NAME: TYPE @ BASE;`, or
+    /// `device type NAME { REGS }`.
+    fn parse_device_item(&mut self) -> Result<Item, ParseError> {
         self.expect_word("device")?;
+        // `device type X {` declares a layout; a device may still be
+        // *named* `type` (`device type @ ..`).
+        if matches!(self.peek(), TokenKind::Ident(w) if w == "type")
+            && matches!(self.peek_at(1), TokenKind::Ident(_))
+        {
+            self.bump();
+            let span = self.peek_span();
+            let name = self.expect_ident()?;
+            let regs = self.parse_reg_block()?;
+            return Ok(Item::DeviceType(DeviceTypeDecl { name, span, regs }));
+        }
         let name_span = self.peek_span();
         let name = self.expect_ident()?;
+        let of_type = if self.at(&TokenKind::Colon) {
+            self.bump();
+            let tspan = self.peek_span();
+            Some((self.expect_ident()?, tspan))
+        } else {
+            None
+        };
         self.expect(TokenKind::At)?;
         let base = self.expect_uint("a base address")?;
+        let regs = if of_type.is_some() {
+            self.expect(TokenKind::Semi)?;
+            Vec::new()
+        } else {
+            self.parse_reg_block()?
+        };
+        Ok(Item::Device(DeviceDecl {
+            name,
+            span: name_span,
+            base,
+            regs,
+            of_type,
+        }))
+    }
+
+    fn parse_reg_block(&mut self) -> Result<Vec<RegDecl>, ParseError> {
         self.expect(TokenKind::LBrace)?;
         let mut regs = Vec::new();
         while !self.at(&TokenKind::RBrace) {
             regs.push(self.parse_reg_decl()?);
         }
         self.expect(TokenKind::RBrace)?;
-        Ok(DeviceDecl {
-            name,
-            span: name_span,
-            base,
-            regs,
-        })
+        Ok(regs)
     }
 
     fn parse_reg_decl(&mut self) -> Result<RegDecl, ParseError> {
@@ -1539,5 +1570,30 @@ mod tests {
     fn a_register_without_an_access_mode_is_an_error() {
         let e = parse("device D @ 0 { R: u32 @ 0; }").unwrap_err();
         assert!(e.message.contains("needs an access mode"), "{}", e.message);
+    }
+
+    #[test]
+    fn device_types_and_instances_are_parsed() {
+        let p = parse(
+            "device type Uart { DATA: read write u32 @ 0; }
+             device Uart0: Uart @ 0x40004000;
+             device type @ 0x1000 { R: read u8 @ 0; }",
+        )
+        .unwrap();
+        let Item::DeviceType(t) = &p.items[0] else {
+            panic!()
+        };
+        assert_eq!((t.name.as_str(), t.regs.len()), ("Uart", 1));
+        let Item::Device(d) = &p.items[1] else {
+            panic!()
+        };
+        assert_eq!(d.of_type.as_ref().map(|(t, _)| t.as_str()), Some("Uart"));
+        assert_eq!((d.base, d.regs.len()), (0x4000_4000, 0));
+        assert_eq!(device_regs(&p, d).map(|r| r.len()), Some(1));
+        // A device may still be named `type`.
+        let Item::Device(odd) = &p.items[2] else {
+            panic!()
+        };
+        assert_eq!(odd.name, "type");
     }
 }

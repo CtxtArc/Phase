@@ -229,19 +229,52 @@ pub struct RegDecl {
     pub fields: Vec<RegField>,
 }
 
-/// `device Uart0 @ 0x40004000 { .. }` (v2.0): a peripheral's register map.
+/// `device Uart0 @ 0x40004000 { .. }` (v2.0): a peripheral's register map;
+/// or `device Uart0: CmsdkUart @ 0x40004000;` (v2.1): one instance of a
+/// `device type`, whose registers it has.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceDecl {
     pub name: String,
     pub span: Span,
     pub base: u64,
+    /// The registers, for a device declared with its own map; empty for an
+    /// instance of a type (see [`device_regs`]).
+    pub regs: Vec<RegDecl>,
+    /// `Some((type name, its span))` for an instance of a `device type`.
+    pub of_type: Option<(String, Span)>,
+}
+
+/// `device type CmsdkUart { .. }` (v2.1): a register map without an
+/// address, for devices that share one layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceTypeDecl {
+    pub name: String,
+    pub span: Span,
     pub regs: Vec<RegDecl>,
 }
 
-impl DeviceDecl {
-    pub fn reg(&self, name: &str) -> Option<&RegDecl> {
-        self.regs.iter().find(|r| r.name == name)
+/// The registers of `d`: its own, or those of its `device type` in
+/// `program` (`None` if that type isn't declared).
+pub fn device_regs<'a>(program: &'a Program, d: &'a DeviceDecl) -> Option<&'a [RegDecl]> {
+    match &d.of_type {
+        None => Some(&d.regs),
+        Some((ty, _)) => program.items.iter().find_map(|i| match i {
+            Item::DeviceType(t) if &t.name == ty => Some(t.regs.as_slice()),
+            _ => None,
+        }),
     }
+}
+
+impl DeviceDecl {
+    /// One of the device's own registers (none, for an instance of a type).
+    pub fn reg(&self, name: &str) -> Option<&RegDecl> {
+        find_reg(&self.regs, name)
+    }
+}
+
+/// Find a register by name.
+pub fn find_reg<'a>(regs: &'a [RegDecl], name: &str) -> Option<&'a RegDecl> {
+    regs.iter().find(|r| r.name == name)
 }
 
 impl RegDecl {
@@ -276,6 +309,7 @@ pub enum Item {
     Fn(FnDecl),
     ExternFn(ExternFnDecl),
     Device(DeviceDecl),
+    DeviceType(DeviceTypeDecl),
     /// Resolved (and removed) when a program is loaded from files; left in
     /// place by `parse` on a single source string.
     Import(ImportDecl),

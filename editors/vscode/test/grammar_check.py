@@ -119,7 +119,7 @@ def scopes_at(tokens, line_no, col, line):
 
 
 KEYWORDS = (
-    "entity fn let move sync borrow release destroy swap rotate split join into state "
+    "import entity fn let move sync borrow release destroy swap rotate split join into state "
     "if else while return extern read write buffer true false"
 ).split()
 
@@ -167,6 +167,13 @@ CASES = [
     ("device Uart0 @ 0x40004000 {\n    STATE: read u32 @ 0x04 { TXFULL: bit 0 }\n}", 2, "bit", "keyword.other.bit.phase"),
     ("device D @ 0 {\n    A: read u32 @ 0 { X: bits 4..=7 }\n}\nfn main() { }", 4, "main", "entity.name.function.phase"),
     ("/* block\n   fn */ fn f() {}", 2, "f()", "entity.name.function.phase"),
+    ('import "devices/board.phase";', 1, "import", "keyword.control.import.phase"),
+    ("device type Uart {\n    DATA: read write u32 @ 0x00;\n}", 1, "type", "keyword.declaration.device.phase"),
+    ("device type Uart {\n    DATA: read write u32 @ 0x00;\n}", 1, "Uart", "entity.name.type.device-type.phase"),
+    ("device type Uart {\n    DATA: read write u32 @ 0x00;\n}", 2, "DATA", "variable.other.register.phase"),
+    ("device Uart0: Uart @ 0x40004000;\nfn main() { move x -> @DMA; }", 1, "Uart0", "entity.name.type.device.phase"),
+    # An instance line has no block: the next line is ordinary code again.
+    ("device Uart0: Uart @ 0x40004000;\nfn main() { move x -> @DMA; }", 2, "main", "entity.name.function.phase"),
 ]
 
 

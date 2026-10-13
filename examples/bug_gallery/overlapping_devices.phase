@@ -1,0 +1,20 @@
+// Bug gallery #40: two devices at one address -- a copy-pasted base
+// address in a board file. Every write meant for one UART also lands in
+// the other: here, configuring the debug UART reconfigures the modem link.
+// Expected: "devices 'DebugUart' (0x40005000..0x40005014) and 'ModemUart' (0x40005000..0x40005014) overlap"
+
+device type CmsdkUart {
+    DATA:    read write u32 @ 0x00;
+    STATE:   read write u32 @ 0x04 { TXFULL: bit 0 }
+    CTRL:    read write u32 @ 0x08 = 0 { TX_EN: bit 0, RX_EN: bit 1 }
+    BAUDDIV: read write u32 @ 0x10 { DIV: bits 0..=19 }
+}
+
+device ModemUart: CmsdkUart @ 0x40005000;
+// BUG: copied from the line above; the board puts this one at 0x40006000.
+device DebugUart: CmsdkUart @ 0x40005000;
+
+fn main() {
+    volatile_write(ModemUart.BAUDDIV.DIV, 16);
+    volatile_write(DebugUart.BAUDDIV.DIV, 500);
+}

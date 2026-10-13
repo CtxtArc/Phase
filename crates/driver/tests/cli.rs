@@ -344,8 +344,9 @@ fn stub_externs_build_without_a_runtime_file() {
         String::from_utf8_lossy(&with.stderr)
     );
     assert!(Command::new(dir.join("build/stubby"))
-        .status()
+        .output()
         .unwrap()
+        .status
         .success());
 }
 
@@ -515,7 +516,10 @@ fn a_device_register_map_builds_and_runs_against_simulated_registers() {
         String::from_utf8_lossy(&out.stderr)
     );
     let header = std::fs::read_to_string(root.join("build/uart_hello.gen.h")).unwrap();
-    assert!(header.contains("} phase_dev_Uart0_regs;"), "{header}");
+    assert!(
+        header.contains("} phase_devtype_CmsdkUart_regs;"),
+        "{header}"
+    );
 }
 
 #[test]

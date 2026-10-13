@@ -36,7 +36,8 @@
 //! entity is in right now) to pick the correct runtime call for `sync`.
 
 use phase_ast::{
-    BinOp, BorrowMode, BufferLen, DeviceDecl, Domain, Expr, Item, Program, Stmt, TypeExpr,
+    device_regs, find_reg, BinOp, BorrowMode, BufferLen, Domain, Expr, Item, Program, RegDecl,
+    Stmt, TypeExpr,
 };
 use std::collections::HashMap;
 
@@ -136,11 +137,21 @@ pub struct RegRef {
     pub field: Option<(String, u32, u32)>,
 }
 
-/// A `device` register map, for codegen to lay out (v2.0).
+/// A `device` (v2.0), for codegen to lay out: its registers are its own,
+/// or -- for an instance (v2.1) -- those of `of_type`, which codegen lays
+/// out once for every device of that type.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PirDevice {
     pub name: String,
     pub base: u64,
+    pub regs: Vec<PirReg>,
+    pub of_type: Option<String>,
+}
+
+/// A `device type` (v2.1): a register layout shared by its devices.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PirDeviceType {
+    pub name: String,
     pub regs: Vec<PirReg>,
 }
 
@@ -341,6 +352,8 @@ pub struct PirProgram {
     pub mmio_registers: Vec<String>,
     /// Every `device` register map, in declaration order (v2.0).
     pub devices: Vec<PirDevice>,
+    /// Every `device type`, in declaration order (v2.1).
+    pub device_types: Vec<PirDeviceType>,
 }
 
 /// Map a PHASE scalar type name to its C representation. Returns `None`
@@ -424,36 +437,44 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
 
     let mut out = PirProgram::default();
 
+    let lower_regs = |regs: &[RegDecl]| -> Vec<PirReg> {
+        regs.iter()
+            .map(|r| PirReg {
+                name: r.name.clone(),
+                offset: r.offset,
+                bits: r.bits().unwrap_or(32),
+                reset: r.reset,
+                readable: r.readable,
+                writable: r.writable,
+                fields: r
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.lo, f.hi))
+                    .collect(),
+            })
+            .collect()
+    };
     for item in &program.items {
-        if let Item::Device(d) = item {
-            out.devices.push(PirDevice {
+        match item {
+            Item::Device(d) => out.devices.push(PirDevice {
                 name: d.name.clone(),
                 base: d.base,
-                regs: d
-                    .regs
-                    .iter()
-                    .map(|r| PirReg {
-                        name: r.name.clone(),
-                        offset: r.offset,
-                        bits: r.bits().unwrap_or(32),
-                        reset: r.reset,
-                        readable: r.readable,
-                        writable: r.writable,
-                        fields: r
-                            .fields
-                            .iter()
-                            .map(|f| (f.name.clone(), f.lo, f.hi))
-                            .collect(),
-                    })
-                    .collect(),
-            });
+                regs: lower_regs(device_regs(program, d).unwrap_or(&[])),
+                of_type: d.of_type.as_ref().map(|(t, _)| t.clone()),
+            }),
+            Item::DeviceType(t) => out.device_types.push(PirDeviceType {
+                name: t.name.clone(),
+                regs: lower_regs(&t.regs),
+            }),
+            _ => {}
         }
     }
-    let devices: HashMap<&str, &DeviceDecl> = program
+    // Each device's registers, resolved through its type.
+    let devices: HashMap<&str, &[RegDecl]> = program
         .items
         .iter()
         .filter_map(|i| match i {
-            Item::Device(d) => Some((d.name.as_str(), d)),
+            Item::Device(d) => Some((d.name.as_str(), device_regs(program, d)?)),
             _ => None,
         })
         .collect();
@@ -496,7 +517,7 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
                 out.fns.push(PirFn { sig, body });
             }
             Item::State(_) => {} // typestate is compile-time-only; nothing to lower
-            Item::Device(_) => {} // lowered above
+            Item::Device(_) | Item::DeviceType(_) => {} // lowered above
             Item::Import(_) => {} // resolved when the program was loaded
         }
     }
@@ -615,7 +636,7 @@ fn lower_fn_sig(
 }
 
 struct Lowerer<'a> {
-    devices: &'a HashMap<&'a str, &'a DeviceDecl>,
+    devices: &'a HashMap<&'a str, &'a [RegDecl]>,
     known_entities: &'a HashMap<&'a str, ()>,
     /// machine name -> its initial state
     initial_states: &'a HashMap<String, String>,
@@ -1013,7 +1034,7 @@ impl<'a> Lowerer<'a> {
             },
             _ => return None,
         };
-        let r = self.devices.get(d.as_str())?.reg(reg)?;
+        let r = find_reg(self.devices.get(d.as_str())?, reg)?;
         let field = match field {
             Some(f) => {
                 let f = r.field(f)?;

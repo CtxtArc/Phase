@@ -1,0 +1,36 @@
+// Board support for the ARM MPS2 AN385 (Cortex-M3): the register layouts
+// of its CMSDK peripherals, declared once as device types, and every
+// instance on the board at its address. Import it and use the devices:
+//
+//     import "devices/mps2_an385.phase";
+//     ...
+//     volatile_write(Uart1.CTRL.TX_EN, 1);
+//
+// Addresses as QEMU's model of the board (`-M mps2-an385`) places them;
+// each was checked by writing to it there.
+
+// CMSDK APB UART.
+device type CmsdkUart {
+    DATA:      read write u32 @ 0x00 { BYTE: bits 0..=7 }
+    STATE:     read write u32 @ 0x04 { TXFULL: bit 0, RXFULL: bit 1, TXOVR: bit 2, RXOVR: bit 3 }
+    CTRL:      read write u32 @ 0x08 = 0 { TX_EN: bit 0, RX_EN: bit 1, TX_IRQ_EN: bit 2, RX_IRQ_EN: bit 3 }
+    INTSTATUS: read write u32 @ 0x0C { TX: bit 0, RX: bit 1 }
+    BAUDDIV:   read write u32 @ 0x10 { DIV: bits 0..=19 }
+}
+
+device Uart0: CmsdkUart @ 0x40004000;
+device Uart1: CmsdkUart @ 0x40005000;
+device Uart2: CmsdkUart @ 0x40006000;
+device Uart3: CmsdkUart @ 0x40007000;
+device Uart4: CmsdkUart @ 0x40009000;
+
+// CMSDK APB timer: counts VALUE down to 0, then reloads from RELOAD.
+device type CmsdkTimer {
+    CTRL:   read write u32 @ 0x00 = 0 { ENABLE: bit 0, EXT_ENABLE: bit 1, EXT_CLOCK: bit 2, IRQ_ENABLE: bit 3 }
+    VALUE:  read write u32 @ 0x04;
+    RELOAD: read write u32 @ 0x08;
+    INT:    read write u32 @ 0x0C { PENDING: bit 0 }
+}
+
+device Timer0: CmsdkTimer @ 0x40000000;
+device Timer1: CmsdkTimer @ 0x40001000;
