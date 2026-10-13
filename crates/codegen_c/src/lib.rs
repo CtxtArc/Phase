@@ -71,7 +71,7 @@ pub fn generate_stubs(program: &PirProgram, stem: &str) -> String {
     out.push_str(&format!("#include \"{stem}.gen.h\"\n"));
     out.push_str("#include <stdlib.h>\n\n");
     out.push_str(
-        "static unsigned long phase_stub_next(void) {\n    static unsigned long state = 0;\n    if (state == 0) {\n        const char *seed = getenv(\"PHASE_STUB_SEED\");\n        state = seed ? strtoul(seed, NULL, 10) * 2654435761UL + 1 : 1;\n    }\n    state ^= state << 13;\n    state ^= state >> 7;\n    state ^= state << 17;\n    return state;\n}\n\n",
+        "/* Not every program has an extern that needs a random result. */\n#if defined(__GNUC__)\n__attribute__((unused))\n#endif\nstatic unsigned long phase_stub_next(void) {\n    static unsigned long state = 0;\n    if (state == 0) {\n        const char *seed = getenv(\"PHASE_STUB_SEED\");\n        state = seed ? strtoul(seed, NULL, 10) * 2654435761UL + 1 : 1;\n    }\n    state ^= state << 13;\n    state ^= state >> 7;\n    state ^= state << 17;\n    return state;\n}\n\n",
     );
     for sig in &program.extern_fns {
         let mut body = String::new();

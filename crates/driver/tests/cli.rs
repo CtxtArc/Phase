@@ -344,3 +344,30 @@ fn stub_externs_build_without_a_runtime_file() {
         .unwrap()
         .success());
 }
+
+#[test]
+fn stub_externs_compile_without_c_warnings_when_no_extern_returns_a_value() {
+    // ping_pong's externs all return void, so the stubs' PRNG goes unused;
+    // that must not produce a C compiler warning on every build.
+    let root = workspace_root();
+    let dir = std::env::temp_dir().join("phase_cli_stub_warn");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("void_externs.phase");
+    std::fs::copy(root.join("examples/ping_pong.phase"), &file).unwrap();
+    let out = phase()
+        .env("PHASE_RUNTIME_DIR", root.join("runtime"))
+        .args(["build", "--stub-externs"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("warning"),
+        "C warnings in a stub build:\n{stderr}"
+    );
+}
