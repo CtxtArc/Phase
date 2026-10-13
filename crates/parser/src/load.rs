@@ -135,11 +135,15 @@ fn normalize(p: &Path) -> PathBuf {
     for c in p.components() {
         match c {
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
+            // `..` cancels a preceding name, but not a preceding `..` (or
+            // the root): `../../x` stays two levels up.
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
                 }
-            }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
             other => out.push(other.as_os_str()),
         }
     }
@@ -236,5 +240,16 @@ mod tests {
         let e = load(Path::new("m.phase"), &mut read).unwrap_err();
         assert_eq!(e.error.span.file, 1);
         assert_eq!(e.files[1].path, PathBuf::from("bad.phase"));
+    }
+
+    #[test]
+    fn normalize_keeps_leading_parent_dirs() {
+        assert_eq!(
+            normalize(Path::new("../../a/b")),
+            PathBuf::from("../../a/b")
+        );
+        assert_eq!(normalize(Path::new("x/../../a")), PathBuf::from("../a"));
+        assert_eq!(normalize(Path::new("x/./y/../z")), PathBuf::from("x/z"));
+        assert_eq!(normalize(Path::new("/../a")), PathBuf::from("/a"));
     }
 }

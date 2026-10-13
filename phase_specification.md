@@ -2,7 +2,7 @@
 
 **A physical-domain safety language for signal, RF, and embedded pipelines**
 
-Version 2.0
+Version 2.1
 
 ---
 
@@ -300,6 +300,28 @@ block that starts from the declared reset values. A field write is a
 read-modify-write and is not atomic with respect to an interrupt handler
 writing the same register.
 
+**Device types (v2.1).** Several copies of one peripheral share a layout:
+
+```phase
+device type CmsdkUart {
+    DATA:  read write u32 @ 0x00;
+    STATE: read u32 @ 0x04 { TXFULL: bit 0 }
+}
+device Uart0: CmsdkUart @ 0x40004000;
+device Uart1: CmsdkUart @ 0x40005000;
+```
+
+A `device type` is a register map without an address, validated like a
+device's; `device NAME: TYPE @ BASE;` is a device with that type's
+registers. An instance must name a declared type. For every device, the
+base address must keep its registers aligned (`BASE` a multiple of its
+widest register), and no two devices may overlap in the address space
+(#40) — the extent of a device runs from its base to the end of its last
+register. In C, a type is one struct (`phase_devtype_T_regs`, with
+`T_REG_FIELD_Pos`/`_Msk` macros), and each of its devices a pointer of
+that type. `examples/devices/mps2_an385.phase` declares the MPS2 AN385
+board's UARTs and timers this way, for programs to `import` (§3.15).
+
 The pre-2.0 form, a bare register name tagged `@MMIO`, is still accepted
 and becomes a simulated `uint32_t` register:
 
@@ -532,6 +554,26 @@ Processing `hi` right after the half-transfer interrupt — the classic
 off-by-one-half bug in circular ADC drivers — is #30. In C, parts are
 pointers into the parent's storage (`lo = ring + 0; hi = ring + 64;`);
 `rotate` moves pointers like `swap`, and `join` emits nothing.
+
+### 3.15 Programs across files
+
+```phase
+import "devices/mps2_an385.phase";
+```
+
+`import "PATH";` (v2.1) makes every item of that file part of the
+program: its functions, externs, entities, typestate machines, devices
+and device types. `PATH` is relative to the directory of the file that
+imports it. A file is loaded once however many files import it, so
+imports may form cycles; there is one namespace, so two files declaring
+the same name is the same error as one file doing it twice. `main` must
+be in the file being compiled. `import` is a keyword only at the start of
+an item.
+
+Every source location records its file, so an error inside an imported
+file is reported in that file, and a note can point into any of them
+(§6.5). An `extern fn` declared in an imported file is implemented like
+any other: in `runtime/<stem>_extern.c` of the program being built.
 
 ---
 
@@ -804,7 +846,9 @@ note: 'frame' is moved to @DMA by 'start_capture' here
 
 `short` format prints one `file:line:col: error|warning|note: message`
 line per diagnostic and note, for editors and scripts. Parse errors use
-the same renderer.
+the same renderer. In a program of several files (§3.15), each location
+— the error and each note — is shown in the file it is in; a missing
+import is reported at the `import` that names it.
 
 **Warnings** (v1.2) use the same format with a `warning` label. They never
 reject a program or change the exit status; `check` reports their count on
@@ -818,7 +862,10 @@ into the compiler. On every open and change of a document it runs the
 same parser and analysis as `phase check` and publishes the result as LSP
 diagnostics: the same underlined range (narrowed to the entity a message
 is about), errors and warnings with their severities, and every note as
-related information. It answers `textDocument/documentSymbol` with the
+related information. Imports are read from open documents first (so unsaved edits count),
+then from disk; a problem inside an imported file is shown on the
+`import` line that brought it in, prefixed with its file and line and
+linked to the real location. It answers `textDocument/documentSymbol` with the
 file's functions and devices (with their registers), follows the
 `shutdown`/`exit` protocol, and converts columns to UTF-16 as the
 protocol requires. Nothing else is implemented yet; other requests get
@@ -936,7 +983,8 @@ a second reason. For the release, 6,000 freshly generated programs from the 1.4
 generator (2,619 accepted and run with several stub seeds each, including
 1,500 at `--chaos 0.3`) produced no violations. After the 2.0
 changes, another 4,000 (1,710 accepted and run, including 1,000 at
-`--chaos 0.3`) produced none either.
+`--chaos 0.3`) produced none either, and after 2.1's, another 4,000
+(1,740 accepted and run).
 
 **Scope of the evidence.** Struct entities other than typestate values
 are not tracked at run time; the generator covers one typestate machine,
@@ -1044,6 +1092,7 @@ for the analyzer and as the security narrative for the portfolio write-up.
 | 37 | A value too wide for its field | Spilling into the neighbouring field (here, the enable bit) | "16 does not fit in `Timer.CTRL.PRESCALE` (4 bits, at most 15)" |
 | 38 | Two registers at one offset | A copy-pasted register map | "register `Timer.VALUE` (bytes 0x4..0x8) overlaps `Timer.CTRL`" |
 | 39 | Read-only data passed to a parameter with no access mode | A legacy API that may write what it is given | "`checksum` doesn't declare whether it writes its parameter `x`, but `view` is read-only" |
+| 40 | Two devices at one address | A copy-pasted base address in a board file | "devices `DebugUart` (0x40005000..0x40005014) and `ModemUart` (0x40005000..0x40005014) overlap" |
 
 Every file in `examples/bug_gallery/` carries its expected error in an
 `// Expected: "..."` header, and a test asserts the analyzer produces it.
@@ -1241,6 +1290,16 @@ to a parameter with no access mode is an error. Output:
 `examples/uart_hello.phase` — a UART driver written entirely in PHASE —
 prints "Hello from PHASE" from the real UART0 data register on QEMU's
 board model; bug-gallery #34–#39.
+
+**v2.1 — Programs across files, device types, and a tutorial**
+`import` (§3.15) splits a program across files, with every diagnostic
+shown in its own file, in the terminal and in the editor. `device type`
+(§3.7) declares a peripheral's layout once for all its copies, and
+devices may no longer overlap or be misaligned. Output:
+`examples/devices/mps2_an385.phase`, board support for the MPS2 AN385
+with each address checked on QEMU's board model, imported by
+`examples/uart_hello.phase`; bug-gallery #40; and "PHASE in 15 minutes"
+(`docs/tutorial/`), generated by running its programs.
 
 **M12 — LLVM backend** *(not yet started)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead

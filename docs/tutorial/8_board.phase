@@ -1,0 +1,16 @@
+import "../../examples/devices/mps2_an385.phase";   // the board's devices
+
+fn send(c: u32) {
+    while volatile_read(Uart1.STATE.TXFULL) == 1 {
+    }
+    volatile_write(Uart1.DATA, c);
+}
+
+fn main() {
+    volatile_write(Uart1.BAUDDIV.DIV, 16);
+    volatile_write(Uart1.CTRL.TX_EN, 1);
+    send(79);
+    send(75);
+    volatile_write(Timer0.RELOAD, 48000);
+    volatile_write(Timer0.CTRL.ENABLE, 1);
+}

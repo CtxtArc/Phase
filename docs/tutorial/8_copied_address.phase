@@ -1,0 +1,11 @@
+device type Uart {
+    DATA:  read write u32 @ 0x00;
+    STATE: read u32 @ 0x04 { TXFULL: bit 0 }
+}
+
+device ModemUart: Uart @ 0x40005000;
+device DebugUart: Uart @ 0x40005000;   // copied from the line above
+
+fn main() {
+    volatile_write(DebugUart.DATA, 33);
+}

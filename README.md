@@ -3,7 +3,7 @@
 **A compiler that statically checks memory safety for hardware pipelines — DMA, MMIO, and zero-copy devices — before the code ever runs.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.0.0-success" alt="Version 2.0.0">
+  <img src="https://img.shields.io/badge/version-2.1.0-success" alt="Version 2.1.0">
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
 </p>
@@ -181,6 +181,13 @@ note: 'Timer.CTRL.PRESCALE' is declared here
    |                                       --------
 ```
 
+A chip's identical peripherals share one `device type`
+(`device Uart1: CmsdkUart @ 0x40005000;`), and a board's devices live in
+a file programs `import` — like
+[`examples/devices/mps2_an385.phase`](examples/devices/mps2_an385.phase),
+whose addresses were each checked on QEMU's model of the board. Two
+devices at one address are an error.
+
 `phase build --target=mps2-an385 --run examples/uart_hello.phase` compiles
 a UART driver written entirely in PHASE for an ARM Cortex-M3 board and
 runs it on QEMU's model of it — `Hello from PHASE` comes out of the real
@@ -211,7 +218,7 @@ deliberately broken program per rule, each rejected at compile time:
 - **[CWE-362] Writing through read-only views** — [`write_through_read_borrow.phase`](examples/bug_gallery/write_through_read_borrow.phase), [`read_param_handed_to_writer.phase`](examples/bug_gallery/read_param_handed_to_writer.phase), [`read_only_to_unannotated_param.phase`](examples/bug_gallery/read_only_to_unannotated_param.phase): a read borrow or a `read` parameter handed to a kernel that writes, or to one that never said it only reads.
 - **[CWE-362/367] Broken double buffering** — [`refill_while_processing.phase`](examples/bug_gallery/refill_while_processing.phase), [`ping_pong_without_swap.phase`](examples/bug_gallery/ping_pong_without_swap.phase), [`swap_while_borrowed.phase`](examples/bug_gallery/swap_while_borrowed.phase): refilling the buffer the CPU is processing (a torn frame), forgetting to trade buffers, or swapping one out from under a live view.
 - **[CWE-362/367] Ring buffers and circular DMA** — [`process_half_in_flight.phase`](examples/bug_gallery/process_half_in_flight.phase), [`use_ring_while_split.phase`](examples/bug_gallery/use_ring_while_split.phase), [`join_with_half_in_flight.phase`](examples/bug_gallery/join_with_half_in_flight.phase), [`rotate_wrong_direction.phase`](examples/bug_gallery/rotate_wrong_direction.phase): processing the half the engine is still filling (the classic off-by-one-half in circular ADC drivers), using the whole buffer while half of it is in flight, treating it as whole again with one half still streaming, or rotating a triple-buffer ring the wrong way.
-- **[CWE-684/908/197] Hardware register misuse** — [`write_read_only_register.phase`](examples/bug_gallery/write_read_only_register.phase), [`read_write_only_register.phase`](examples/bug_gallery/read_write_only_register.phase), [`field_write_on_write_only_register.phase`](examples/bug_gallery/field_write_on_write_only_register.phase), [`field_value_too_wide.phase`](examples/bug_gallery/field_value_too_wide.phase), [`overlapping_registers.phase`](examples/bug_gallery/overlapping_registers.phase): clearing a flag through a read-only status register, trusting what a write-only register reads back as, `CMD |= START` on a write-only register, a prescaler value spilling into the enable bit, and a copy-pasted register map with two registers at one address.
+- **[CWE-684/908/197] Hardware register misuse** — [`write_read_only_register.phase`](examples/bug_gallery/write_read_only_register.phase), [`read_write_only_register.phase`](examples/bug_gallery/read_write_only_register.phase), [`field_write_on_write_only_register.phase`](examples/bug_gallery/field_write_on_write_only_register.phase), [`field_value_too_wide.phase`](examples/bug_gallery/field_value_too_wide.phase), [`overlapping_registers.phase`](examples/bug_gallery/overlapping_registers.phase), [`overlapping_devices.phase`](examples/bug_gallery/overlapping_devices.phase): clearing a flag through a read-only status register, trusting what a write-only register reads back as, `CMD |= START` on a write-only register, a prescaler value spilling into the enable bit, and copy-pasted register maps with two registers — or two whole devices — at one address.
 - **[CWE-416/825] Found by the fuzzer** — [`dma_into_dead_block.phase`](examples/bug_gallery/dma_into_dead_block.phase), [`swap_across_blocks.phase`](examples/bug_gallery/swap_across_blocks.phase): a buffer abandoned to the DMA engine at the end of an `if` block, or swapped with one from an inner block and left dangling.
 - **[CWE-787/843] Wrong buffer type** — [`buffer_length_mismatch.phase`](examples/bug_gallery/buffer_length_mismatch.phase), [`buffer_element_mismatch.phase`](examples/bug_gallery/buffer_element_mismatch.phase), [`runtime_length_to_fixed.phase`](examples/bug_gallery/runtime_length_to_fixed.phase): a shorter buffer where a longer one is required (a real overflow), bytes where samples are expected, or a run-time length where an exact one is assumed.
 - **[CWE-758] Aliasing and silent MMIO optimization** — [`aliased_arguments.phase`](examples/bug_gallery/aliased_arguments.phase) passes one buffer as both input and output of a kernel; [`volatile_wrong_domain.phase`](examples/bug_gallery/volatile_wrong_domain.phase) points a register access at RAM. `@MMIO` registers always lower to `volatile` C globals, so the C standard itself — not convention or code review — forbids the compiler from deleting or reordering the access.
@@ -275,6 +282,7 @@ editors/
 
 examples/
   *.phase              programs that pass analysis (sdr_session.phase is the fullest)
+  devices/             board support: device types and devices to `import`
   bug_gallery/         one deliberately-broken file per bug class
 
 demos/
@@ -465,10 +473,13 @@ has to discover the hard way:
   exercise, not a proof of everything.
 - **One hardware target.** `--target=mps2-an385` (ARM Cortex-M3, validated
   on QEMU's model of the board). Another board needs its own startup code,
-  linker script and wait functions under `runtime/`. A register map
-  describes one device instance; there are no arrays of registers or
-  device templates yet, and a field write is a read-modify-write that is
-  not atomic against an interrupt handler.
+  linker script and wait functions under `runtime/`. There are no arrays
+  of registers yet (a FIFO of 16 identical registers is 16 declarations),
+  and a field write is a read-modify-write that is not atomic against an
+  interrupt handler — PHASE has no interrupt handlers yet.
+- **Imports share one namespace.** `import` brings in every item of a
+  file; there are no modules, qualified names or private items, so two
+  files can't both declare a `send`.
 - **The language server reports diagnostics and symbols only.** No hover,
   go-to-definition or completion yet.
 - **No LLVM backend.** Compiling to readable C was a deliberate choice so
@@ -493,10 +504,13 @@ Full rationale for all of these is in
 
 ## What's next
 
-2.0 adds device register maps, a Cortex-M3 build target and editor
-support, and makes read-only data passed to a parameter with no access
-mode an error — on top of 1.4's ring buffers and 1.3's runtime-checked
-builds and fuzzing (see [`CHANGELOG.md`](CHANGELOG.md)). Likely next:
+2.1 splits programs across files and lets several devices share one
+register layout, on top of 2.0's register maps, Cortex-M3 target and
+language server (see [`CHANGELOG.md`](CHANGELOG.md)). Likely next:
+
+- **Interrupts** — handlers for DMA half-transfer and UART interrupts,
+  with rules for what they may share with the code they interrupt; today
+  the circular DMA example has to wait for each half instead.
 
 - **M12 — An LLVM backend**, removing the dependency on an external `cc`
   ([`phase_specification.md`](phase_specification.md) §9).

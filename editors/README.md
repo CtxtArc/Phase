@@ -16,6 +16,11 @@ Two pieces, usable separately:
 
 ## VS Code
 
+> **Untested so far.** The grammar is checked against every example, and
+> `phase lsp` by a full session in the test suite, but the extension
+> itself hasn't been run in VS Code yet. Neovim (below) is the tested
+> setup.
+
 The extension in [`vscode/`](vscode/) highlights `.phase` files and starts
 `phase lsp`. With `phase` on your `PATH` (or `phase.serverPath` set to it):
 
@@ -28,16 +33,41 @@ code --install-extension phase-language-2.0.0.vsix
 
 Setting `phase.serverPath` to an empty string keeps highlighting only.
 
-## Neovim (0.11+)
+## Neovim (0.11+), including LazyVim
+
+Tested with Neovim 0.11 and lazy.nvim. Save as
+`~/.config/nvim/lua/plugins/phase.lua` (LazyVim loads every file there),
+with your clone's path on the first line:
 
 ```lua
+local phase_repo = vim.fn.expand("~/path/to/phase")
+
+-- Language server: needs only the `phase` binary on PATH.
 vim.filetype.add({ extension = { phase = "phase" } })
-vim.lsp.config("phase", { cmd = { "phase", "lsp" }, filetypes = { "phase" } })
+vim.lsp.config("phase", {
+  cmd = { "phase", "lsp" },
+  filetypes = { "phase" },
+  root_markers = { "runtime", ".git" },
+})
 vim.lsp.enable("phase")
+
+-- Highlighting: the repo's Vim syntax files, skipped if the path is wrong.
+local syntax_dir = phase_repo .. "/editors/vim"
+return {
+  {
+    dir = syntax_dir,
+    name = "phase-syntax",
+    lazy = false,
+    cond = vim.fn.isdirectory(syntax_dir) == 1,
+  },
+}
 ```
 
-For highlighting, add `editors/vim` to `runtimepath`
-(`vim.opt.rtp:append("/path/to/phase/editors/vim")`).
+Without lazy.nvim, put the first block in your `init.lua` and add
+`editors/vim` to `runtimepath` (`vim.opt.rtp:append(...)`). Errors appear
+inline; `vim.diagnostic.open_float()` (LazyVim: `<leader>cd`) shows one
+with its notes, and `]d`/`[d` jump between them. An error inside an
+imported file is shown on its `import` line.
 
 ## Vim
 

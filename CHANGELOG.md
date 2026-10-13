@@ -4,18 +4,59 @@ All notable changes to PHASE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.1.0] — 2026-10-13
+
+Programs can span several files, and a chip's identical peripherals share
+one register layout — so a board's devices are declared once, in a file
+every program imports, and checked against each other. Plus a tutorial.
+
+Every program 2.0 accepted is still accepted, unless two of its devices
+overlap or a device's base address misaligns its registers (each a real
+bug), or it uses `import` as the first word of an item.
+
+After the changes, 4,000 freshly fuzzed programs (1,740 accepted and run
+in checked mode) produced no soundness violations.
 
 ### Added
 
+- **`import "path.phase";`** (spec §3.15): every item of that file becomes
+  part of the program; paths are relative to the importing file, each
+  file is loaded once (cycles are harmless), and there is one namespace.
+  `main` must be in the file being compiled. Every source location now
+  records its file: errors and notes are shown in the file they point
+  into, in both output formats, and a missing import is reported at the
+  `import` that names it. `phase check` counts the files.
+- **`phase lsp` and imports**: imported files are read from open
+  documents first, then from disk; a problem inside one is shown on the
+  `import` line that brought it in, linked to the real location.
+- **Device types** (spec §3.7): `device type CmsdkUart { .. }` declares a
+  register layout once; `device Uart1: CmsdkUart @ 0x40005000;` is a
+  device with it. In C, one struct per type.
+- **Devices may not overlap** in the address space, and a device's base
+  address must keep its registers aligned (bug gallery #40).
+- `examples/devices/mps2_an385.phase`: board support for the MPS2 AN385 —
+  CMSDK UART and timer types, all five UARTs and both timers, each
+  address checked on QEMU's model of the board. `examples/uart_hello.phase`
+  imports it.
+- Editor grammar and Vim syntax for `import`, `device type` and device
+  instances; the Neovim/LazyVim setup in `editors/README.md`, as tested.
 - **[PHASE in 15 minutes](docs/tutorial/README.md)**: a tutorial from a
   first buffer to DMA across calls, borrows, ping-pong streaming,
-  circular DMA, typestate and hardware registers. Its 20 programs are in
+  circular DMA, typestate, hardware registers and board files. Its 22 programs are in
   `docs/tutorial/`; the page is generated from them by
   `scripts/render_tutorial.py`, which runs every command it shows, and CI
   fails if it no longer matches the compiler.
 - `--stub-externs` builds print each extern call, its arguments, and the
   result the stub returns.
+
+### Changed
+
+- `editors/README.md` marks the VS Code extension as not yet tested in
+  VS Code.
+- Internal crate APIs: `Span` has a `file`; `Item::Import` and
+  `Item::DeviceType`; `DeviceDecl::of_type`; `phase_parser::load`;
+  `PirDevice::of_type` and `PirProgram::device_types`; the diagnostics
+  renderer takes a list of source files.
 
 ### Fixed
 
@@ -23,6 +64,8 @@ uses [Semantic Versioning](https://semver.org/).
   (with GCC) about a buffer only ever filled by hardware.
 - Bug gallery #1 had a second, unrelated error (a missing `sync` at the
   end of `main`).
+- Stray `[stub]` output from one CLI test leaked into `cargo test`'s
+  output.
 
 ## [2.0.0] — 2026-10-13
 

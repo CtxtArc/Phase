@@ -662,6 +662,29 @@ in the signature, `read`, fixes it when the function really only reads.
 
 ---
 
+## v2.1 additions
+
+v2.1 added `device type`s (spec §3.7) and `import` (§3.15), so a board's
+devices are declared once, in a file programs share — and checked
+against each other.
+
+## #40 — Two devices at one address
+
+**`examples/bug_gallery/overlapping_devices.phase`**
+
+**Category:** [CWE-684](https://cwe.mitre.org/data/definitions/684.html).
+
+**Real-world precedent:** #38 at the scale of a whole peripheral: a
+board-support header with a copy-pasted base address, so two driver
+instances program the same UART — configuring one silently reconfigures
+the other.
+
+**What PHASE does:** every device spans from its base address to the end
+of its last register, and no two devices may overlap; a device's base
+must also keep its registers aligned.
+
+---
+
 ## Summary table
 
 | # | Bug-gallery file | CWE | Named real-world precedent |
@@ -705,3 +728,4 @@ in the signature, `read`, fixes it when the function really only reads.
 | 37 | `field_value_too_wide.phase` | CWE-197 | a field value spilling into (or masked out of) its register |
 | 38 | `overlapping_registers.phase` | CWE-684 | a copy-pasted register map |
 | 39 | `read_only_to_unannotated_param.phase` | CWE-362 | a legacy API that may write what it is given |
+| 40 | `overlapping_devices.phase` | CWE-684 | a copy-pasted base address in a board file |
