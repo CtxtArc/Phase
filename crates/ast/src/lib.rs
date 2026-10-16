@@ -189,6 +189,17 @@ pub struct FnDecl {
     pub params: Vec<Param>,
     pub return_type: Option<TypeExpr>,
     pub body: Block,
+    /// `interrupt fn name() @ irq N` (v2.2): the IRQ number the hardware
+    /// calls this handler for, and its span.
+    pub irq: Option<(u32, Span)>,
+}
+
+/// `event tick;` (v2.2): a flag an interrupt handler raises with `signal`
+/// and other code waits for with `wait`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventDecl {
+    pub name: String,
+    pub span: Span,
 }
 
 /// `extern fn fir_filter(input: buffer<Sample,1024> @RAM, ...);`
@@ -310,6 +321,7 @@ pub enum Item {
     ExternFn(ExternFnDecl),
     Device(DeviceDecl),
     DeviceType(DeviceTypeDecl),
+    Event(EventDecl),
     /// Resolved (and removed) when a program is loaded from files; left in
     /// place by `parse` on a single source string.
     Import(ImportDecl),
@@ -373,6 +385,12 @@ pub enum Stmt {
     /// `name = expr;` (M9) -- reassigns an already-declared scalar local.
     /// Only a bare identifier target; no field/index lvalues.
     Assign { name: String, value: Expr },
+    /// `signal tick;` (v2.2) -- raise an event.
+    Signal { name: String },
+    /// `wait tick;` (v2.2) -- sleep until the event is raised, then clear it.
+    Wait { name: String },
+    /// `critical { .. }` (v2.2) -- the block runs with interrupts disabled.
+    Critical { body: Block },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -83,6 +83,58 @@
     "code": {
       "patterns": [
         {
+          "match": "\\b(interrupt)\\s+(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.interrupt.phase"
+            },
+            "2": {
+              "name": "keyword.declaration.function.phase"
+            },
+            "3": {
+              "name": "entity.name.function.handler.phase"
+            }
+          }
+        },
+        {
+          "match": "@\\s*(irq)\\b",
+          "captures": {
+            "1": {
+              "name": "keyword.other.irq.phase"
+            }
+          }
+        },
+        {
+          "match": "^\\s*(event)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*;",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.event.phase"
+            },
+            "2": {
+              "name": "variable.other.event.phase"
+            }
+          }
+        },
+        {
+          "match": "^\\s*(signal|wait)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*;",
+          "captures": {
+            "1": {
+              "name": "keyword.control.event.phase"
+            },
+            "2": {
+              "name": "variable.other.event.phase"
+            }
+          }
+        },
+        {
+          "match": "^\\s*(critical)\\s*(?=\\{)",
+          "captures": {
+            "1": {
+              "name": "keyword.control.critical.phase"
+            }
+          }
+        },
+        {
           "include": "#comments"
         },
         {

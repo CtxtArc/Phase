@@ -12,6 +12,11 @@ syn keyword phaseBuffer     buffer
 syn keyword phaseType       u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 bool
 syn keyword phaseBool       true false
 syn keyword phaseBuiltin    volatile_read volatile_write
+syn match   phaseInterrupt  "\<interrupt\ze\s\+fn\>"
+syn match   phaseInterrupt  "@\s*\zsirq\>"
+syn match   phaseInterrupt  "^\s*\zsevent\ze\s\+\h\w*\s*;"
+syn match   phaseInterrupt  "^\s*\zs\(signal\|wait\)\ze\s\+\h\w*\s*;"
+syn match   phaseInterrupt  "^\s*\zscritical\ze\s*{"
 syn match   phaseDevice     "^\s*\zsdevice\ze\s\+\h"
 syn match   phaseDevice     "\(^\s*device\s\+\)\@<=type\ze\s\+\h"
 syn match   phaseImport     "^\s*\zsimport\ze\s\+\""
@@ -27,6 +32,7 @@ syn region  phaseComment    start="/\*" end="\*/" contains=@Spell
 hi def link phaseDecl       Keyword
 hi def link phaseDevice     Keyword
 hi def link phaseImport     Include
+hi def link phaseInterrupt  Statement
 hi def link phaseControl    Conditional
 hi def link phaseOwnership  Statement
 hi def link phaseAccess     StorageClass

@@ -1,0 +1,27 @@
+// Bug gallery #41: a read-modify-write an interrupt handler can split. The
+// handler turns its own interrupt off (a one-shot timer) by clearing a bit
+// of CTRL; `main` starts the timer by setting another bit of CTRL. Setting
+// a bit reads CTRL, changes it and writes it back -- if the interrupt
+// lands between the read and the write, main writes back the old IRQ_EN
+// and the handler's change is lost: the "one-shot" timer fires forever.
+// Expected: "writing field 'Timer0.CTRL.ENABLE' reads 'Timer0.CTRL', changes the field and writes it back -- and interrupt handler 'on_timer0' (IRQ 8) also writes 'Timer0.CTRL': if it runs in between, its write is lost; do this inside `critical { }`"
+
+device Timer0 @ 0x40000000 {
+    CTRL: read write u32 @ 0x00 = 0 { ENABLE: bit 0, IRQ_EN: bit 3 }
+    INT:  read write u32 @ 0x0C { PENDING: bit 0 }
+}
+
+event fired;
+
+interrupt fn on_timer0() @ irq 8 {
+    volatile_write(Timer0.INT.PENDING, 1);
+    volatile_write(Timer0.CTRL.IRQ_EN, 0);   // one shot
+    signal fired;
+}
+
+fn main() {
+    volatile_write(Timer0.CTRL, 0x8);          // IRQ_EN only: a whole write
+    // BUG: the handler may run in the middle of this read-modify-write.
+    volatile_write(Timer0.CTRL.ENABLE, 1);
+    wait fired;
+}

@@ -1,0 +1,32 @@
+// Bug gallery #42: waiting inside an interrupt handler. The handler waits
+// for the transmitter to report it's done -- but that report is itself an
+// interrupt, which can't run while this handler is running. The CPU sleeps
+// in the handler forever, with every interrupt of its priority blocked.
+// Expected: "`wait tx_done` in interrupt handler code would never return: nothing can interrupt a handler to signal it (called from interrupt handler 'on_rx': on_rx -> echo)"
+
+device Uart0 @ 0x40004000 {
+    DATA:      read write u32 @ 0x00;
+    INTSTATUS: read write u32 @ 0x0C { TX: bit 0, RX: bit 1 }
+}
+
+event tx_done;
+
+interrupt fn on_tx() @ irq 1 {
+    volatile_write(Uart0.INTSTATUS.TX, 1);
+    signal tx_done;
+}
+
+fn echo(c: u32) {
+    volatile_write(Uart0.DATA, c);
+    // BUG: echo runs inside on_rx; on_tx can't run until on_rx returns.
+    wait tx_done;
+}
+
+interrupt fn on_rx() @ irq 0 {
+    let c: u32 = volatile_read(Uart0.DATA);
+    volatile_write(Uart0.INTSTATUS.RX, 1);
+    echo(c);
+}
+
+fn main() {
+}

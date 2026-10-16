@@ -627,3 +627,49 @@ fn a_program_split_across_files_is_checked_and_built_as_one() {
         String::from_utf8_lossy(&main_in_lib.stderr).contains("an imported file defines 'main'")
     );
 }
+
+#[test]
+fn a_host_build_runs_handlers_when_main_waits_and_stops_a_wait_nothing_signals() {
+    let root = workspace_root();
+    let ok = phase()
+        .current_dir(std::env::temp_dir())
+        .env_remove("PHASE_RUNTIME_DIR")
+        .args(["build", "--run"])
+        .arg(root.join("examples/timer_ticks.phase"))
+        .output()
+        .unwrap();
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(
+        ok.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    let dir = std::env::temp_dir().join("phase_cli_stuck_wait");
+    std::fs::create_dir_all(dir.join("runtime")).unwrap();
+    for f in ["phase_runtime.h", "phase_runtime.c"] {
+        std::fs::copy(root.join("runtime").join(f), dir.join("runtime").join(f)).unwrap();
+    }
+    let file = dir.join("stuck.phase");
+    // The handler never signals `done`.
+    std::fs::write(
+        &file,
+        "event done;\nevent other;\ninterrupt fn h() @ irq 3 {\n    signal other;\n}\nfn main() {\n    wait done;\n}\n",
+    )
+    .unwrap();
+    let stuck = phase()
+        .args(["build", "--run"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(!stuck.status.success());
+    let stderr = String::from_utf8_lossy(&stuck.stderr);
+    assert!(
+        stderr.contains("PHASE: `wait done` never returns: no interrupt handler signals it"),
+        "{stderr}"
+    );
+}

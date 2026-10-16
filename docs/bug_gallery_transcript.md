@@ -82,6 +82,12 @@ OK: examples/radio_pipeline.phase parsed and passed domain/ownership analysis (1
 OK: examples/sdr_session.phase parsed and passed domain/ownership analysis (2 entities, 1 fn)
 ```
 
+### `examples/timer_ticks.phase`
+
+```
+OK: examples/timer_ticks.phase parsed and passed domain/ownership analysis (0 entities, 3 fns, 2 files)
+```
+
 ### `examples/triple_buffer.phase`
 
 ```
@@ -353,6 +359,25 @@ error: no legal transition from @DMA to @DEVICE in the signature of 'forward' (p
   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 examples/bug_gallery/illegal_signature_transition.phase: 1 error found
+```
+
+### `examples/bug_gallery/interrupted_field_write.phase`
+
+Bug gallery #41: a read-modify-write an interrupt handler can split. The
+
+```
+error: writing field 'Timer0.CTRL.ENABLE' reads 'Timer0.CTRL', changes the field and writes it back -- and interrupt handler 'on_timer0' (IRQ 8) also writes 'Timer0.CTRL': if it runs in between, its write is lost; do this inside `critical { }`
+  --> examples/bug_gallery/interrupted_field_write.phase:25:5
+   |
+25 |     volatile_write(Timer0.CTRL.ENABLE, 1);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: 'on_timer0' writes 'Timer0.CTRL' here
+  --> examples/bug_gallery/interrupted_field_write.phase:18:5
+   |
+18 |     volatile_write(Timer0.CTRL.IRQ_EN, 0);   // one shot
+   |     --------------------------------------
+
+examples/bug_gallery/interrupted_field_write.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/join_with_half_in_flight.phase`
@@ -916,6 +941,20 @@ error: 'volatile_read' requires an @MMIO register reference, but 'FAKE_REG' is t
   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 examples/bug_gallery/volatile_wrong_domain.phase: 1 error found
+```
+
+### `examples/bug_gallery/wait_in_handler.phase`
+
+Bug gallery #42: waiting inside an interrupt handler. The handler waits
+
+```
+error: `wait tx_done` in interrupt handler code would never return: nothing can interrupt a handler to signal it (called from interrupt handler 'on_rx': on_rx -> echo)
+  --> examples/bug_gallery/wait_in_handler.phase:22:5
+   |
+22 |     wait tx_done;
+   |     ^^^^^^^^^^^^^
+
+examples/bug_gallery/wait_in_handler.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/write_borrow_conflict.phase`

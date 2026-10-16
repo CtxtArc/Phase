@@ -326,6 +326,8 @@ fn hardware_examples_run_on_the_mps2_an385_board_under_qemu() {
     for (example, expected) in [
         ("uart_hello", "Hello from PHASE\n"),
         ("hw_uart_echo", "PHASE"),
+        // Five real timer interrupts, each waking `wait tick`.
+        ("timer_ticks", ".....\n"),
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_phase"))
             .current_dir(std::env::temp_dir())

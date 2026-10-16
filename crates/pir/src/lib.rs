@@ -293,6 +293,18 @@ pub enum PirInst {
         cond: PirExpr,
         body: Vec<PirInst>,
     },
+    /// `signal E;` (v2.2).
+    Signal {
+        event: String,
+    },
+    /// `wait E;` (v2.2).
+    Wait {
+        event: String,
+    },
+    /// `critical { .. }` (v2.2): `body` with interrupts disabled.
+    Critical {
+        body: Vec<PirInst>,
+    },
     /// `name = expr;` (M9). The real prerequisite for a `while` loop that
     /// can terminate on its own -- e.g. a counter incremented each pass.
     Assign {
@@ -339,6 +351,8 @@ fn state_label(ty: &TypeExpr) -> Option<String> {
 pub struct PirFn {
     pub sig: PirFnSig,
     pub body: Vec<PirInst>,
+    /// For an `interrupt fn` (v2.2): the IRQ it handles.
+    pub irq: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -354,6 +368,8 @@ pub struct PirProgram {
     pub devices: Vec<PirDevice>,
     /// Every `device type`, in declaration order (v2.1).
     pub device_types: Vec<PirDeviceType>,
+    /// Every `event`, in declaration order (v2.2).
+    pub events: Vec<String>,
 }
 
 /// Map a PHASE scalar type name to its C representation. Returns `None`
@@ -514,10 +530,15 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
                     }
                 }
                 let body = lowerer.lower_block(&f.body, &f.name)?;
-                out.fns.push(PirFn { sig, body });
+                out.fns.push(PirFn {
+                    sig,
+                    body,
+                    irq: f.irq.map(|(n, _)| n),
+                });
             }
             Item::State(_) => {} // typestate is compile-time-only; nothing to lower
             Item::Device(_) | Item::DeviceType(_) => {} // lowered above
+            Item::Event(e) => out.events.push(e.name.clone()),
             Item::Import(_) => {} // resolved when the program was loaded
         }
     }
@@ -593,6 +614,7 @@ fn collect_mmio_registers(fns: &[PirFn]) -> Vec<String> {
                     note_expr(cond, seen, out);
                     walk(body, seen, out);
                 }
+                PirInst::Critical { body } => walk(body, seen, out),
                 PirInst::Assign { value, .. } => note_expr(value, seen, out),
                 _ => {}
             }
@@ -837,6 +859,24 @@ impl<'a> Lowerer<'a> {
                     cond: pir_cond,
                     body: lowered_body,
                 });
+                Ok(())
+            }
+
+            Stmt::Signal { name } => {
+                out.push(PirInst::Signal {
+                    event: name.clone(),
+                });
+                Ok(())
+            }
+            Stmt::Wait { name } => {
+                out.push(PirInst::Wait {
+                    event: name.clone(),
+                });
+                Ok(())
+            }
+            Stmt::Critical { body } => {
+                let body = self.lower_block(body, fn_name)?;
+                out.push(PirInst::Critical { body });
                 Ok(())
             }
 

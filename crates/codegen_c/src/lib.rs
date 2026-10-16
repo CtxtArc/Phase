@@ -506,12 +506,88 @@ fn generate_source(program: &PirProgram, stem: &str, checked: bool) -> String {
     }
     let externs: HashSet<&str> = program.extern_fns.iter().map(|f| f.name.as_str()).collect();
 
+    if uses_interrupts(program) {
+        out.push_str(&format_interrupt_support(program));
+    }
+
     for f in &program.fns {
         out.push_str(&format_fn(f, &sigs, &externs, checked));
         out.push('\n');
     }
 
+    for f in program.fns.iter().filter(|f| f.irq.is_some()) {
+        out.push_str(&format!(
+            "#ifdef PHASE_TARGET_HW\n/* The vector table's entry for IRQ {} (runtime/hw/startup.c). */\nvoid IRQ{}_Handler(void) {{\n    {}();\n}}\n#endif\n\n",
+            f.irq.unwrap_or(0),
+            f.irq.unwrap_or(0),
+            f.sig.name
+        ));
+    }
+
     out
+}
+
+fn has_critical(body: &[PirInst]) -> bool {
+    body.iter().any(|i| match i {
+        PirInst::Critical { .. } => true,
+        PirInst::If {
+            then_body,
+            else_body,
+            ..
+        } => has_critical(then_body) || has_critical(else_body),
+        PirInst::While { body, .. } => has_critical(body),
+        _ => false,
+    })
+}
+
+fn uses_interrupts(program: &PirProgram) -> bool {
+    !program.events.is_empty()
+        || program
+            .fns
+            .iter()
+            .any(|f| f.irq.is_some() || has_critical(&f.body))
+}
+
+/// v2.2: event flags, interrupts off/on, and `wait`. On a hardware target
+/// these are PRIMASK and `wfi`; in a host build nothing raises interrupts,
+/// so sleeping runs every handler once, in IRQ order -- as if each one's
+/// interrupt had just arrived -- and a `wait` nothing signals stops the
+/// program instead of hanging it.
+fn format_interrupt_support(program: &PirProgram) -> String {
+    let mut handlers: Vec<&PirFn> = program.fns.iter().filter(|f| f.irq.is_some()).collect();
+    handlers.sort_by_key(|f| f.irq);
+    let mut s = String::from("/* --- interrupts --- */\n");
+    for e in &program.events {
+        s.push_str(&format!("volatile bool phase_event_{e} = false;\n"));
+    }
+    for h in &handlers {
+        s.push_str(&format!("void {}(void);\n", h.sig.name));
+    }
+    let unused = "#if defined(__GNUC__)\n__attribute__((unused))\n#endif\n";
+    s.push_str("#ifdef PHASE_TARGET_HW\n");
+    s.push_str(&format!("{unused}static uint32_t phase_irq_save(void) {{\n    uint32_t m;\n    __asm__ volatile(\"mrs %0, primask\\n\\tcpsid i\" : \"=r\"(m) : : \"memory\");\n    return m;\n}}\n"));
+    s.push_str(&format!("{unused}static void phase_irq_restore(uint32_t m) {{\n    __asm__ volatile(\"msr primask, %0\" : : \"r\"(m) : \"memory\");\n}}\n"));
+    s.push_str("/* Sleep until an interrupt is pending (even a masked one). */\n");
+    s.push_str(&format!("{unused}static void phase_sleep(void) {{\n    __asm__ volatile(\"wfi\" : : : \"memory\");\n}}\n"));
+    s.push_str("#else\n#include <stdio.h>\n#include <stdlib.h>\n");
+    s.push_str(&format!(
+        "{unused}static uint32_t phase_irq_save(void) {{\n    return 0;\n}}\n"
+    ));
+    s.push_str(&format!(
+        "{unused}static void phase_irq_restore(uint32_t m) {{\n    (void)m;\n}}\n"
+    ));
+    s.push_str("/* Host build: nothing raises interrupts, so sleeping runs every handler\n * once, in IRQ order, as if each one's interrupt had just arrived. */\n");
+    s.push_str(&format!("{unused}static void phase_sleep(void) {{\n"));
+    for h in &handlers {
+        s.push_str(&format!("    {}();\n", h.sig.name));
+    }
+    s.push_str("}\n#endif\n");
+    s.push_str("/* `wait E`: sleep until a handler signals E, then clear it. The check and\n * the clear happen with interrupts off, so no signal is lost in between. */\n");
+    s.push_str(&format!(
+        "{unused}static void phase_wait(volatile bool *event, const char *name) {{\n"
+    ));
+    s.push_str("    uint32_t m = phase_irq_save();\n#ifndef PHASE_TARGET_HW\n    int rounds = 0;\n#endif\n    (void)name;\n    while (!*event) {\n#ifndef PHASE_TARGET_HW\n        if (rounds++ == 1000) {\n            fprintf(stderr, \"PHASE: `wait %s` never returns: no interrupt handler signals it (this host build ran every handler 1000 times)\\n\", name);\n            exit(1);\n        }\n#endif\n        phase_sleep();\n        phase_irq_restore(m); /* let the pending handler run */\n        m = phase_irq_save();\n    }\n    *event = false;\n    phase_irq_restore(m);\n}\n\n");
+    s
 }
 
 /// Something that goes out of scope at the end of a block, for the checked
@@ -796,7 +872,9 @@ fn swapped_buffers(body: &[PirInst]) -> HashSet<String> {
                 out.extend(swapped_buffers(then_body));
                 out.extend(swapped_buffers(else_body));
             }
-            PirInst::While { body, .. } => out.extend(swapped_buffers(body)),
+            PirInst::While { body, .. } | PirInst::Critical { body } => {
+                out.extend(swapped_buffers(body))
+            }
             _ => {}
         }
     }
@@ -826,6 +904,16 @@ fn format_block(insts: &[PirInst], cx: &mut FnCx, indent: usize) -> String {
 fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
     let pad = "    ".repeat(indent);
     match inst {
+        PirInst::Signal { event } => format!("{pad}phase_event_{event} = true;\n"),
+        PirInst::Wait { event } => {
+            format!("{pad}phase_wait(&phase_event_{event}, \"{event}\");\n")
+        }
+        PirInst::Critical { body } => {
+            let inner = format_block(body, cx, indent + 1);
+            format!(
+                "{pad}{{ /* critical: interrupts off */\n{pad}    uint32_t phase_irq_state = phase_irq_save();\n{inner}{pad}    phase_irq_restore(phase_irq_state);\n{pad}}}\n"
+            )
+        }
         PirInst::EntityCreate { name, ty, domain } => {
             cx.locals.insert(name.clone(), ty.clone());
             let (mut s, storage) = match ty {
@@ -1935,5 +2023,49 @@ mod tests {
                 g.source
             );
         }
+    }
+
+    #[test]
+    fn interrupts_lower_to_flags_primask_and_the_vector_table() {
+        let src = r#"
+            device Timer @ 0x40000000 { INT: read write u32 @ 0x0C { PENDING: bit 0 } }
+            event tick;
+            interrupt fn on_timer() @ irq 8 {
+                volatile_write(Timer.INT.PENDING, 1);
+                signal tick;
+            }
+            fn main() {
+                wait tick;
+                critical {
+                    volatile_write(Timer.INT, 0);
+                }
+            }
+        "#;
+        let g = generate_src(src, "t");
+        for needle in [
+            "volatile bool phase_event_tick = false;",
+            "void on_timer(void);",
+            "__asm__ volatile(\"mrs %0, primask\\n\\tcpsid i\"",
+            "__asm__ volatile(\"wfi\" : : : \"memory\");",
+            // Host: sleeping runs the handlers.
+            "static void phase_sleep(void) {\n    on_timer();\n}",
+            "phase_event_tick = true;",
+            "phase_wait(&phase_event_tick, \"tick\");",
+            "uint32_t phase_irq_state = phase_irq_save();",
+            "phase_irq_restore(phase_irq_state);",
+            "void IRQ8_Handler(void) {\n    on_timer();\n}",
+        ] {
+            assert!(
+                g.source.contains(needle),
+                "missing {needle:?} in\n{}",
+                g.source
+            );
+        }
+    }
+
+    #[test]
+    fn a_program_without_interrupts_has_no_interrupt_support() {
+        let g = generate_src("fn main() { }", "t");
+        assert!(!g.source.contains("phase_wait"), "{}", g.source);
     }
 }

@@ -172,6 +172,13 @@ CASES = [
     ("device type Uart {\n    DATA: read write u32 @ 0x00;\n}", 1, "Uart", "entity.name.type.device-type.phase"),
     ("device type Uart {\n    DATA: read write u32 @ 0x00;\n}", 2, "DATA", "variable.other.register.phase"),
     ("device Uart0: Uart @ 0x40004000;\nfn main() { move x -> @DMA; }", 1, "Uart0", "entity.name.type.device.phase"),
+    ("event tick;", 1, "event", "keyword.declaration.event.phase"),
+    ("interrupt fn on_t() @ irq 8 {\n    signal tick;\n}", 1, "interrupt", "keyword.declaration.interrupt.phase"),
+    ("interrupt fn on_t() @ irq 8 {\n    signal tick;\n}", 1, "on_t", "entity.name.function.handler.phase"),
+    ("interrupt fn on_t() @ irq 8 {\n    signal tick;\n}", 1, "irq", "keyword.other.irq.phase"),
+    ("interrupt fn on_t() @ irq 8 {\n    signal tick;\n}", 2, "signal", "keyword.control.event.phase"),
+    ("fn main() {\n    wait tick;\n    critical {\n    }\n}", 2, "wait", "keyword.control.event.phase"),
+    ("fn main() {\n    wait tick;\n    critical {\n    }\n}", 3, "critical", "keyword.control.critical.phase"),
     # An instance line has no block: the next line is ordinary code again.
     ("device Uart0: Uart @ 0x40004000;\nfn main() { move x -> @DMA; }", 2, "main", "entity.name.function.phase"),
 ]

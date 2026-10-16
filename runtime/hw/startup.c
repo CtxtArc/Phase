@@ -44,16 +44,49 @@ void Reset_Handler(void) {
     phase_hw_exit();
 }
 
-static void Default_Handler(void) {
+void Default_Handler(void) {
     for (;;) {
     }
 }
 
-/* Cortex-M3 only strictly requires entries 0 (initial SP) and 1 (Reset)
- * to boot; this demo never enables interrupts or triggers a fault, so
- * the remaining vector slots are never actually dispatched through, but
- * the CMSDK/ARMv7-M convention still reserves the first 16 words. */
-__attribute__((section(".isr_vector"), used)) const uint32_t vector_table[16] = {
+/* The vector table: 16 system exceptions, then the board's 32 external
+ * interrupts (IRQ 0 is entry 16). Each IRQn_Handler is a weak alias of
+ * Default_Handler; a PHASE `interrupt fn h() @ irq N` defines IRQN_Handler
+ * (in the generated C), which replaces it. */
+void IRQ0_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ1_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ2_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ3_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ4_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ5_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ6_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ7_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ8_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ9_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ10_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ11_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ12_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ13_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ14_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ15_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ16_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ17_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ18_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ19_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ20_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ21_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ22_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ23_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ24_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ25_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ26_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ27_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ28_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ29_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ30_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void IRQ31_Handler(void) __attribute__((weak, alias("Default_Handler")));
+
+__attribute__((section(".isr_vector"), used)) const uint32_t vector_table[16 + 32] = {
     (uint32_t)&_estack,
     (uint32_t)Reset_Handler,
     (uint32_t)Default_Handler, /* NMI */
@@ -70,4 +103,36 @@ __attribute__((section(".isr_vector"), used)) const uint32_t vector_table[16] = 
     0,
     (uint32_t)Default_Handler, /* PendSV */
     (uint32_t)Default_Handler, /* SysTick */
+    (uint32_t)IRQ0_Handler,
+    (uint32_t)IRQ1_Handler,
+    (uint32_t)IRQ2_Handler,
+    (uint32_t)IRQ3_Handler,
+    (uint32_t)IRQ4_Handler,
+    (uint32_t)IRQ5_Handler,
+    (uint32_t)IRQ6_Handler,
+    (uint32_t)IRQ7_Handler,
+    (uint32_t)IRQ8_Handler,
+    (uint32_t)IRQ9_Handler,
+    (uint32_t)IRQ10_Handler,
+    (uint32_t)IRQ11_Handler,
+    (uint32_t)IRQ12_Handler,
+    (uint32_t)IRQ13_Handler,
+    (uint32_t)IRQ14_Handler,
+    (uint32_t)IRQ15_Handler,
+    (uint32_t)IRQ16_Handler,
+    (uint32_t)IRQ17_Handler,
+    (uint32_t)IRQ18_Handler,
+    (uint32_t)IRQ19_Handler,
+    (uint32_t)IRQ20_Handler,
+    (uint32_t)IRQ21_Handler,
+    (uint32_t)IRQ22_Handler,
+    (uint32_t)IRQ23_Handler,
+    (uint32_t)IRQ24_Handler,
+    (uint32_t)IRQ25_Handler,
+    (uint32_t)IRQ26_Handler,
+    (uint32_t)IRQ27_Handler,
+    (uint32_t)IRQ28_Handler,
+    (uint32_t)IRQ29_Handler,
+    (uint32_t)IRQ30_Handler,
+    (uint32_t)IRQ31_Handler,
 };

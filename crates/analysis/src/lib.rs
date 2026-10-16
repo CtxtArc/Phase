@@ -36,6 +36,8 @@ use phase_ast::{
 };
 use std::collections::{HashMap, HashSet};
 
+mod interrupts;
+
 /// How serious a diagnostic is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -378,6 +380,7 @@ pub fn analyze_full(program: &Program) -> Report {
     }
 
     let devices = check_devices(program, &mut errors);
+    interrupts::check(program, &devices.keys().copied().collect(), &mut errors);
 
     for item in &program.items {
         match item {
@@ -486,7 +489,7 @@ fn check_devices<'p>(
             Item::ExternFn(f) => other_names.insert(f.name.as_str()),
             Item::Entity(e) => other_names.insert(e.name.as_str()),
             Item::State(s) => other_names.insert(s.name.as_str()),
-            Item::Device(_) | Item::DeviceType(_) | Item::Import(_) => false,
+            Item::Device(_) | Item::DeviceType(_) | Item::Event(_) | Item::Import(_) => false,
         };
     }
     let mut types: HashMap<&str, &DeviceTypeDecl> = HashMap::new();
@@ -1710,6 +1713,19 @@ impl<'a> FnChecker<'a> {
             // own dedicated transitions (`move`/`sync`/`borrow`/`destroy`)
             // and reassigning through them would bypass those checks, so
             // it's a clear error rather than a silent domain reset.
+            // v2.2: events are checked with the other interrupt rules.
+            Stmt::Signal { .. } | Stmt::Wait { .. } => {}
+            // Runs straight through (a `return` inside is an error).
+            Stmt::Critical { body } => {
+                let base_locals = self.locals.clone();
+                let base_borrows = self.borrows.clone();
+                let (locals, borrows, diverged) = self.run_branch(Some(body), errors);
+                if diverged {
+                    self.diverged = true;
+                } else {
+                    self.adopt_branch(&base_locals, &base_borrows, locals, borrows, errors);
+                }
+            }
             Stmt::Assign { name, value } => {
                 let Some(var) = self.locals.get(name) else {
                     errors.push(err(format!("cannot assign to unknown local '{name}'")));

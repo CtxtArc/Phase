@@ -102,6 +102,9 @@ fn radio_pipeline_main_body_statement_sequence() {
             Stmt::Rotate { .. } => "Rotate",
             Stmt::Split { .. } => "Split",
             Stmt::Join { .. } => "Join",
+            Stmt::Signal { .. } => "Signal",
+            Stmt::Wait { .. } => "Wait",
+            Stmt::Critical { .. } => "Critical",
         })
         .collect();
 

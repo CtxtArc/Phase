@@ -34,3 +34,16 @@ device type CmsdkTimer {
 
 device Timer0: CmsdkTimer @ 0x40000000;
 device Timer1: CmsdkTimer @ 0x40001000;
+
+// Cortex-M3 NVIC: interrupt enables. Writing 1 to a bit of ISER enables
+// that IRQ, of ICER disables it (other bits are left alone, so whole-
+// register writes are the way to use them).
+//
+// IRQ numbers, each checked on QEMU's model by taking the interrupt:
+//   1  Uart0 transmit      8  Timer0      9  Timer1
+device type CortexM3Nvic {
+    ISER: read write u32 @ 0x000 { UART0_TX: bit 1, TIMER0: bit 8, TIMER1: bit 9 }
+    ICER: read write u32 @ 0x080 { UART0_TX: bit 1, TIMER0: bit 8, TIMER1: bit 9 }
+}
+
+device Nvic: CortexM3Nvic @ 0xE000E100;

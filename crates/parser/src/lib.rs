@@ -151,10 +151,30 @@ impl Parser {
             TokenKind::KwEntity => self.parse_entity_decl().map(Item::Entity),
             TokenKind::KwState => self.parse_state_decl().map(Item::State),
             TokenKind::KwExtern => self.parse_extern_fn_decl().map(Item::ExternFn),
-            TokenKind::KwFn => self.parse_fn_decl().map(Item::Fn),
+            TokenKind::KwFn => {
+                let f = self.parse_fn_decl()?;
+                if let Some((_, span)) = f.irq {
+                    return Err(ParseError {
+                        message: format!(
+                            "only an interrupt handler has an IRQ: `interrupt fn {}() @ irq N`",
+                            f.name
+                        ),
+                        span,
+                    });
+                }
+                Ok(Item::Fn(f))
+            }
             // `device` is a keyword only here, at the start of an item, so
             // existing programs may keep using it as a name.
             TokenKind::Ident(w) if w == "device" => self.parse_device_item(),
+            TokenKind::Ident(w) if w == "interrupt" => self.parse_interrupt_fn().map(Item::Fn),
+            TokenKind::Ident(w) if w == "event" => {
+                self.bump();
+                let span = self.peek_span();
+                let name = self.expect_ident()?;
+                self.expect(TokenKind::Semi)?;
+                Ok(Item::Event(EventDecl { name, span }))
+            }
             TokenKind::Ident(w) if w == "import" => {
                 let start = self.peek_span();
                 self.bump();
@@ -180,7 +200,7 @@ impl Parser {
             }
             other => Err(ParseError {
                 message: format!(
-                    "expected item (entity/state/fn/extern fn/device/import), found {:?}",
+                    "expected item (entity/state/fn/extern fn/interrupt fn/event/device/import), found {:?}",
                     other
                 ),
                 span: self.peek_span(),
@@ -471,6 +491,16 @@ impl Parser {
         let name = self.expect_ident()?;
         let params = self.parse_params()?;
         let return_type = self.parse_return_type()?;
+        let irq = if self.at(&TokenKind::At) {
+            // `interrupt fn h() @ irq N`; the caller checked `interrupt`.
+            self.bump();
+            self.expect_word("irq")?;
+            let span = self.peek_span();
+            let n = self.expect_uint("an IRQ number")?;
+            Some((n.min(u32::MAX as u64) as u32, span))
+        } else {
+            None
+        };
         let body = self.parse_block()?;
         Ok(FnDecl {
             name,
@@ -478,7 +508,30 @@ impl Parser {
             params,
             return_type,
             body,
+            irq,
         })
+    }
+
+    /// `interrupt fn NAME() @ irq N { .. }` (v2.2).
+    fn parse_interrupt_fn(&mut self) -> Result<FnDecl, ParseError> {
+        self.expect_word("interrupt")?;
+        if !self.at(&TokenKind::KwFn) {
+            return Err(ParseError {
+                message: format!("expected `fn` after `interrupt`, found {:?}", self.peek()),
+                span: self.peek_span(),
+            });
+        }
+        let f = self.parse_fn_decl()?;
+        if f.irq.is_none() {
+            return Err(ParseError {
+                message: format!(
+                    "interrupt handler '{}' needs the IRQ it handles: `interrupt fn {}() @ irq N`",
+                    f.name, f.name
+                ),
+                span: f.name_span,
+            });
+        }
+        Ok(f)
     }
 
     fn parse_extern_fn_decl(&mut self) -> Result<ExternFnDecl, ParseError> {
@@ -569,6 +622,31 @@ impl Parser {
             TokenKind::KwReturn => self.parse_return_stmt(),
             TokenKind::KwIf => self.parse_if_stmt(),
             TokenKind::KwWhile => self.parse_while_stmt(),
+            // v2.2: `signal E;`, `wait E;` and `critical { .. }`, keywords
+            // only in this shape -- `wait(x);` is still a call.
+            TokenKind::Ident(w)
+                if (w == "signal" || w == "wait")
+                    && matches!(self.peek_at(1), TokenKind::Ident(_))
+                    && matches!(self.peek_at(2), TokenKind::Semi) =>
+            {
+                let is_signal = w == "signal";
+                self.bump();
+                let name = self.expect_ident()?;
+                self.expect(TokenKind::Semi)?;
+                Ok(if is_signal {
+                    Stmt::Signal { name }
+                } else {
+                    Stmt::Wait { name }
+                })
+            }
+            TokenKind::Ident(w)
+                if w == "critical" && matches!(self.peek_at(1), TokenKind::LBrace) =>
+            {
+                self.bump();
+                Ok(Stmt::Critical {
+                    body: self.parse_block()?,
+                })
+            }
             // `name = expr;` (M9) -- look ahead one token so a bare call
             // statement (`tick();`) or other expression statement isn't
             // mistaken for an assignment.
@@ -1595,5 +1673,36 @@ mod tests {
             panic!()
         };
         assert_eq!(odd.name, "type");
+    }
+
+    #[test]
+    fn interrupts_events_and_critical_sections_are_parsed() {
+        let p = parse(
+            "event tick;
+             interrupt fn on_timer() @ irq 8 { signal tick; }
+             fn wait(x: u32) { }
+             fn main() { wait tick; critical { wait(1); } }",
+        )
+        .unwrap();
+        let Item::Event(e) = &p.items[0] else {
+            panic!()
+        };
+        assert_eq!(e.name, "tick");
+        let Item::Fn(h) = &p.items[1] else { panic!() };
+        assert_eq!(h.irq.map(|(n, _)| n), Some(8));
+        assert!(matches!(&h.body.stmts[0].node, Stmt::Signal { name } if name == "tick"));
+        let Item::Fn(m) = &p.items[3] else { panic!() };
+        assert!(matches!(&m.body.stmts[0].node, Stmt::Wait { name } if name == "tick"));
+        let Stmt::Critical { body } = &m.body.stmts[1].node else {
+            panic!()
+        };
+        // `wait(1)` is still a call.
+        assert!(
+            matches!(&body.stmts[0].node, Stmt::Expr(Expr::Call { callee, .. }) if callee == "wait")
+        );
+        assert!(parse("interrupt fn h() { }")
+            .unwrap_err()
+            .message
+            .contains("@ irq N"));
     }
 }

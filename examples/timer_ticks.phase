@@ -1,0 +1,48 @@
+// v2.2 example: an interrupt handler, an event, and `wait`.
+//
+// Timer0 counts down and raises IRQ 8 each time it reaches zero. The
+// handler acknowledges the interrupt and signals `tick`; `main` sleeps in
+// `wait tick` until then, and prints a dot per tick.
+//
+//   phase build --target=mps2-an385 --run examples/timer_ticks.phase
+//
+// runs it on QEMU's model of the board, where each dot is a real timer
+// interrupt. A host build has no timer, so each `wait` runs the handler
+// once, as if its interrupt had just arrived.
+
+import "devices/mps2_an385.phase";
+
+event tick;
+
+interrupt fn on_timer0() @ irq 8 {
+    volatile_write(Timer0.INT.PENDING, 1);   // acknowledge (write 1 to clear)
+    signal tick;
+}
+
+fn send_byte(c: u32) {
+    while volatile_read(Uart0.STATE.TXFULL) == 1 {
+    }
+    volatile_write(Uart0.DATA, c);
+}
+
+fn main() {
+    volatile_write(Uart0.BAUDDIV.DIV, 16);
+    volatile_write(Uart0.CTRL.TX_EN, 1);
+
+    volatile_write(Timer0.RELOAD, 250000);
+    volatile_write(Timer0.VALUE, 250000);
+    volatile_write(Nvic.ISER, 0x100);        // enable IRQ 8 (Nvic.ISER.TIMER0)
+    volatile_write(Timer0.CTRL, 0x9);        // ENABLE and IRQ_ENABLE
+
+    let n: u32 = 0;
+    while n < 5 {
+        wait tick;
+        send_byte(46);   // .
+        n = n + 1;
+    }
+
+    // The handler writes Timer0.INT, never Timer0.CTRL, so stopping the
+    // timer field by field can't lose one of its writes.
+    volatile_write(Timer0.CTRL.ENABLE, 0);
+    send_byte(10);
+}
