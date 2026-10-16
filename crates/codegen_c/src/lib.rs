@@ -373,13 +373,85 @@ fn format_device(d: &PirDevice) -> String {
     s
 }
 
-/// `Dev->REG`, or for a field, its value shifted down and masked.
-fn format_reg_read(r: &RegRef) -> String {
+/// `Dev->REG`, or for a field, its value shifted down and masked. A
+/// checked build first verifies the register is readable.
+fn format_reg_read(r: &RegRef, checked: bool) -> String {
     let reg = format!("{}->{}", r.device, r.reg);
-    match &r.field {
+    let read = match &r.field {
         None => reg,
         Some((_, lo, hi)) => format!("(({reg} >> {lo}u) & {:#x}u)", field_mask(*lo, *hi)),
+    };
+    if checked {
+        format!(
+            "(phase_chk_reg_read(\"{}\", {}), {read})",
+            reg_display(r),
+            reg_access(r)
+        )
+    } else {
+        read
     }
+}
+
+/// `Dev.REG` or `Dev.REG.FIELD`, as written in PHASE.
+fn reg_display(r: &RegRef) -> String {
+    match &r.field {
+        None => format!("{}.{}", r.device, r.reg),
+        Some((f, _, _)) => format!("{}.{}.{f}", r.device, r.reg),
+    }
+}
+
+/// The register's declared access, for the checker.
+fn reg_access(r: &RegRef) -> &'static str {
+    match (r.readable, r.writable) {
+        (true, true) => "PHASE_REG_R | PHASE_REG_W",
+        (true, false) => "PHASE_REG_R",
+        (false, true) => "PHASE_REG_W",
+        (false, false) => "0",
+    }
+}
+
+/// A checked build's register write: the access, the value and -- for a
+/// field write outside `critical` and outside a handler -- whether an
+/// interrupt handler landing between the read and the write would write
+/// the same register (the handlers are run right there to find out).
+fn format_checked_reg_write(r: &RegRef, value: &str, has_handlers: bool, pad: &str) -> String {
+    let reg = format!("{}->{}", r.device, r.reg);
+    let ty = reg_c_type(r.bits);
+    let name = reg_display(r);
+    let access = reg_access(r);
+    let width_mask: u64 = if r.bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << r.bits) - 1
+    };
+    let mut s = format!(
+        "{pad}{{
+{pad}    unsigned long long phase_v = (unsigned long long)({value});
+"
+    );
+    match &r.field {
+        None => {
+            s.push_str(&format!(
+                "{pad}    phase_chk_reg_write(&{reg}, \"{name}\", {access}, 0, phase_v, {width_mask:#x}ull);\n{pad}    {reg} = ({ty})phase_v;\n"
+            ));
+        }
+        Some((f, lo, hi)) => {
+            let mask = field_mask(*lo, *hi);
+            s.push_str(&format!(
+                "{pad}    phase_chk_reg_write(&{reg}, \"{name}\", {access}, 1, phase_v, {mask:#x}ull);\n{pad}    {ty} phase_old = {reg};\n"
+            ));
+            if has_handlers {
+                s.push_str(&format!(
+                    "{pad}    if (phase_chk_rmw_begin(&{reg}, \"{name}\")) {{\n{pad}        phase_run_handlers(); /* an interrupt between the read and the write */\n{pad}    }}\n{pad}    phase_chk_rmw_end();\n"
+                ));
+            }
+            s.push_str(&format!(
+                "{pad}    {reg} = ({ty})((phase_old & ~({mask:#x}u << {lo}u)) | ((({ty})phase_v & {mask:#x}u) << {lo}u)); /* field {f} */\n"
+            ));
+        }
+    }
+    s.push_str(&format!("{pad}}}\n"));
+    s
 }
 
 /// A register write; a field write keeps the register's other bits.
@@ -506,12 +578,13 @@ fn generate_source(program: &PirProgram, stem: &str, checked: bool) -> String {
     }
     let externs: HashSet<&str> = program.extern_fns.iter().map(|f| f.name.as_str()).collect();
 
+    let has_handlers = program.fns.iter().any(|f| f.irq.is_some());
     if uses_interrupts(program) {
-        out.push_str(&format_interrupt_support(program));
+        out.push_str(&format_interrupt_support(program, checked));
     }
 
     for f in &program.fns {
-        out.push_str(&format_fn(f, &sigs, &externs, checked));
+        out.push_str(&format_fn(f, &sigs, &externs, checked, has_handlers));
         out.push('\n');
     }
 
@@ -553,7 +626,7 @@ fn uses_interrupts(program: &PirProgram) -> bool {
 /// so sleeping runs every handler once, in IRQ order -- as if each one's
 /// interrupt had just arrived -- and a `wait` nothing signals stops the
 /// program instead of hanging it.
-fn format_interrupt_support(program: &PirProgram) -> String {
+fn format_interrupt_support(program: &PirProgram, checked: bool) -> String {
     let mut handlers: Vec<&PirFn> = program.fns.iter().filter(|f| f.irq.is_some()).collect();
     handlers.sort_by_key(|f| f.irq);
     let mut s = String::from("/* --- interrupts --- */\n");
@@ -578,17 +651,33 @@ fn format_interrupt_support(program: &PirProgram) -> String {
     ));
     s.push_str("/* Host build: nothing raises interrupts, so sleeping runs every handler\n * once, in IRQ order, as if each one's interrupt had just arrived. First,\n * phase_sim_hardware() -- if the program's C side defines it -- plays the\n * hardware: it can set the status bits the handlers test. */\n");
     s.push_str("#if defined(__GNUC__)\nextern void phase_sim_hardware(void) __attribute__((weak));\n#endif\n");
-    s.push_str(&format!("{unused}static void phase_sleep(void) {{\n"));
-    s.push_str("#if defined(__GNUC__)\n    if (phase_sim_hardware) {\n        phase_sim_hardware();\n    }\n#endif\n");
+    s.push_str(&format!(
+        "{unused}static void phase_run_handlers(void) {{\n"
+    ));
     for h in &handlers {
-        s.push_str(&format!("    {}();\n", h.sig.name));
+        if checked {
+            s.push_str(&format!(
+                "    phase_chk_handler_enter();\n    {}();\n    phase_chk_handler_leave();\n",
+                h.sig.name
+            ));
+        } else {
+            s.push_str(&format!("    {}();\n", h.sig.name));
+        }
     }
+    s.push_str("}\n");
+    s.push_str(&format!("{unused}static void phase_sleep(void) {{\n"));
+    s.push_str("#if defined(__GNUC__)\n    if (phase_sim_hardware) {\n        phase_sim_hardware();\n    }\n#endif\n    phase_run_handlers();\n");
     s.push_str("}\n#endif\n");
     s.push_str("/* `wait E`: sleep until a handler signals E, then clear it. The check and\n * the clear happen with interrupts off, so no signal is lost in between. */\n");
     s.push_str(&format!(
         "{unused}static void phase_wait(volatile bool *event, const char *name) {{\n"
     ));
-    s.push_str("    uint32_t m = phase_irq_save();\n#ifndef PHASE_TARGET_HW\n    int rounds = 0;\n#endif\n    (void)name;\n    while (!*event) {\n#ifndef PHASE_TARGET_HW\n        if (rounds++ == 1000) {\n            fprintf(stderr, \"PHASE: `wait %s` never returns: no interrupt handler signals it (this host build ran every handler 1000 times)\\n\", name);\n            exit(1);\n        }\n#endif\n        phase_sleep();\n        phase_irq_restore(m); /* let the pending handler run */\n        m = phase_irq_save();\n    }\n    *event = false;\n    phase_irq_restore(m);\n}\n\n");
+    let stuck = if checked {
+        "            phase_chk_wait_stuck(name);\n"
+    } else {
+        "            fprintf(stderr, \"PHASE: `wait %s` never returns: no interrupt handler signals it (this host build ran every handler 1000 times)\\n\", name);\n            exit(1);\n"
+    };
+    s.push_str(&format!("    uint32_t m = phase_irq_save();\n#ifndef PHASE_TARGET_HW\n    int rounds = 0;\n#endif\n    (void)name;\n    while (!*event) {{\n#ifndef PHASE_TARGET_HW\n        if (rounds++ == 1000) {{\n{stuck}        }}\n#endif\n        phase_sleep();\n        phase_irq_restore(m); /* let the pending handler run */\n        m = phase_irq_save();\n    }}\n    *event = false;\n    phase_irq_restore(m);\n}}\n\n"));
     s
 }
 
@@ -611,6 +700,9 @@ struct FnCx<'a> {
     locals: HashMap<String, PirType>,
     swapped: HashSet<String>,
     checked: bool,
+    /// The program has interrupt handlers (a checked build runs them in
+    /// the middle of a field write).
+    has_handlers: bool,
     /// Buffer borrow handles in scope, with their mode.
     handles: HashMap<String, BorrowMode>,
     /// Borrow handles of non-buffer entities (C pointers to the value).
@@ -699,6 +791,8 @@ impl FnCx<'_> {
         }
         if self.sig.name != "main" {
             s.push_str(&format!("{pad}phase_chk_leave();\n"));
+        } else {
+            s.push_str(&format!("{pad}phase_chk_main_exit();\n"));
         }
         s
     }
@@ -800,6 +894,7 @@ fn format_fn(
     sigs: &HashMap<&str, &PirFnSig>,
     externs: &HashSet<&str>,
     checked: bool,
+    has_handlers: bool,
 ) -> String {
     let is_main = f.sig.name == "main";
     let (ret, name, params) = if is_main {
@@ -825,6 +920,7 @@ fn format_fn(
         locals: f.sig.params.iter().cloned().collect(),
         swapped: swapped_buffers(&f.body),
         checked,
+        has_handlers,
         handles: HashMap::new(),
         struct_handles: HashSet::new(),
         scopes: vec![Vec::new()],
@@ -908,11 +1004,23 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
     match inst {
         PirInst::Signal { event } => format!("{pad}phase_event_{event} = true;\n"),
         PirInst::Wait { event, buf } => {
-            let mut s = format!("{pad}phase_wait(&phase_event_{event}, \"{event}\");\n");
+            let mut s = String::new();
+            if cx.checked {
+                s.push_str(&format!("{pad}phase_chk_wait(\"{event}\");\n"));
+            }
+            s.push_str(&format!(
+                "{pad}phase_wait(&phase_event_{event}, \"{event}\");\n"
+            ));
             if let Some(b) = buf {
                 s.push_str(&format!(
                     "{pad}/* the interrupt that signalled {event} hands {b} back to the CPU */\n"
                 ));
+                if cx.checked {
+                    s.push_str(&format!(
+                        "{pad}phase_chk_wait_for(\"{}\", \"{event}\", \"{b}\");\n",
+                        cx.sig.name
+                    ));
+                }
                 if cx.checked && cx.is_buffer(b) {
                     s.push_str(&format!("{pad}phase_chk_sync({b}, \"{b}\");\n"));
                 }
@@ -921,8 +1029,16 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
         }
         PirInst::Critical { body } => {
             let inner = format_block(body, cx, indent + 1);
+            let (on, off) = if cx.checked {
+                (
+                    format!("{pad}    phase_chk_critical_enter();\n"),
+                    format!("{pad}    phase_chk_critical_leave();\n"),
+                )
+            } else {
+                Default::default()
+            };
             format!(
-                "{pad}{{ /* critical: interrupts off */\n{pad}    uint32_t phase_irq_state = phase_irq_save();\n{inner}{pad}    phase_irq_restore(phase_irq_state);\n{pad}}}\n"
+                "{pad}{{ /* critical: interrupts off */\n{pad}    uint32_t phase_irq_state = phase_irq_save();\n{on}{inner}{off}{pad}    phase_irq_restore(phase_irq_state);\n{pad}}}\n"
             )
         }
         PirInst::EntityCreate { name, ty, domain } => {
@@ -1108,7 +1224,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
                 // reordered or eliminated" claim (bug-gallery #7).
                 let reg = match args.first() {
                     Some(CallArg::MmioRegister(r)) => r.clone(),
-                    Some(CallArg::DeviceRegister(r)) => format_reg_read(r),
+                    Some(CallArg::DeviceRegister(r)) => format_reg_read(r, cx.checked),
                     _ => {
                         "/* internal error: volatile_read missing MMIO register arg */".to_string()
                     }
@@ -1116,7 +1232,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
                 return format!("{pad}{} = {reg};\n", declare(name, ty));
             }
             let call_sig = cx.sigs.get(callee.as_str()).copied();
-            let arg_text = format_args(args, call_sig, &cx.locals, &cx.struct_handles);
+            let arg_text = format_args(args, call_sig, &cx.locals, &cx.struct_handles, cx.checked);
             let (before, mut after) = if cx.checked {
                 cx.call_checks(callee, args, &pad)
             } else {
@@ -1251,16 +1367,19 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
                     Some(CallArg::Entity(n)) => n.clone(),
                     Some(CallArg::Literal(lit)) => format_literal(lit),
                     Some(CallArg::MmioRegister(r)) => r.clone(),
-                    Some(CallArg::DeviceRegister(r)) => format_reg_read(r),
+                    Some(CallArg::DeviceRegister(r)) => format_reg_read(r, cx.checked),
                     None => "/* internal error: volatile_write missing value arg */".to_string(),
                 };
                 if let Some(CallArg::DeviceRegister(r)) = args.first() {
+                    if cx.checked {
+                        return format_checked_reg_write(r, &value, cx.has_handlers, &pad);
+                    }
                     return format!("{pad}{}\n", format_reg_write(r, &value));
                 }
                 return format!("{pad}{reg} = {value};\n");
             }
             let call_sig = cx.sigs.get(callee.as_str()).copied();
-            let arg_text = format_args(args, call_sig, &cx.locals, &cx.struct_handles);
+            let arg_text = format_args(args, call_sig, &cx.locals, &cx.struct_handles, cx.checked);
             let (before, after) = if cx.checked {
                 cx.call_checks(callee, args, &pad)
             } else {
@@ -1298,7 +1417,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
             then_body,
             else_body,
         } => {
-            let mut s = format!("{pad}if ({}) {{\n", format_pir_expr(cond));
+            let mut s = format!("{pad}if ({}) {{\n", format_pir_expr(cond, cx.checked));
             s.push_str(&format_block(then_body, cx, indent + 1));
             if else_body.is_empty() {
                 s.push_str(&format!("{pad}}}\n"));
@@ -1311,7 +1430,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
         }
 
         PirInst::While { cond, body } => {
-            let mut s = format!("{pad}while ({}) {{\n", format_pir_expr(cond));
+            let mut s = format!("{pad}while ({}) {{\n", format_pir_expr(cond, cx.checked));
             s.push_str(&format_block(body, cx, indent + 1));
             s.push_str(&format!("{pad}}}\n"));
             s
@@ -1319,7 +1438,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
 
         // ---- M9: assignment ------------------------------------------------
         PirInst::Assign { name, value } => {
-            format!("{pad}{name} = {};\n", format_pir_expr(value))
+            format!("{pad}{name} = {};\n", format_pir_expr(value, cx.checked))
         }
     }
 }
@@ -1328,7 +1447,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
 /// Every `Binary` node is fully parenthesized -- simplest way to guarantee
 /// correct precedence without implementing a precedence table, at the
 /// (acceptable, for generated code) cost of some redundant parens.
-fn format_pir_expr(e: &PirExpr) -> String {
+fn format_pir_expr(e: &PirExpr, checked: bool) -> String {
     match e {
         PirExpr::Ident(n) => n.clone(),
         PirExpr::IntLit(n) => n.to_string(),
@@ -1336,9 +1455,9 @@ fn format_pir_expr(e: &PirExpr) -> String {
         PirExpr::BoolLit(b) => b.to_string(),
         PirExpr::Binary { op, lhs, rhs } => format!(
             "({} {} {})",
-            format_pir_expr(lhs),
+            format_pir_expr(lhs, checked),
             format_binop(*op),
-            format_pir_expr(rhs)
+            format_pir_expr(rhs, checked)
         ),
         // M11: not a function call -- a direct read of the `volatile`
         // global, same reasoning as CallAssign's volatile_read special
@@ -1346,7 +1465,7 @@ fn format_pir_expr(e: &PirExpr) -> String {
         // read the same register on every loop iteration: the C standard
         // itself forbids hoisting a `volatile` read out of a loop.
         PirExpr::VolatileRead { register } => register.clone(),
-        PirExpr::DeviceRead(r) => format_reg_read(r),
+        PirExpr::DeviceRead(r) => format_reg_read(r, checked),
     }
 }
 
@@ -1370,6 +1489,7 @@ fn format_args(
     sig: Option<&PirFnSig>,
     locals: &HashMap<String, PirType>,
     struct_handles: &HashSet<String>,
+    checked: bool,
 ) -> String {
     let mut parts = Vec::new();
     for (i, a) in args.iter().enumerate() {
@@ -1399,7 +1519,7 @@ fn format_args(
             }
             CallArg::Literal(lit) => parts.push(format_literal(lit)),
             CallArg::MmioRegister(name) => parts.push(name.clone()),
-            CallArg::DeviceRegister(r) => parts.push(format_reg_read(r)),
+            CallArg::DeviceRegister(r) => parts.push(format_reg_read(r, checked)),
         }
     }
     parts.join(", ")
@@ -2059,7 +2179,8 @@ mod tests {
             "__asm__ volatile(\"mrs %0, primask\\n\\tcpsid i\"",
             "__asm__ volatile(\"wfi\" : : : \"memory\");",
             // Host: sleeping runs the handlers.
-            "#endif\n    on_timer();\n}",
+            "static void phase_run_handlers(void) {\n    on_timer();\n}",
+            "#endif\n    phase_run_handlers();\n}",
             "extern void phase_sim_hardware(void) __attribute__((weak));",
             "phase_event_tick = true;",
             "phase_wait(&phase_event_tick, \"tick\");",

@@ -65,8 +65,29 @@ static TsVal tsvals[MAX_TSVALS];
  * hand down access it holds (a read borrow only to a `read` parameter). */
 static int depth = 0;
 
-void phase_chk_enter(void) { depth++; }
-void phase_chk_leave(void) { depth--; }
+/* Interrupt context (v2.3): how many handlers are running (the host build
+ * runs them from `wait` and in the middle of field writes), and how deep
+ * in `critical` blocks the program is. */
+static int handler_depth = 0;
+static int critical_depth = 0;
+#define MAX_DEPTH 4096
+/* critical_depth when each frame was entered */
+static int frame_critical[MAX_DEPTH];
+
+static void fail(const char *fmt, ...);
+
+void phase_chk_enter(void) {
+    if (depth < MAX_DEPTH) {
+        frame_critical[depth] = critical_depth;
+    }
+    depth++;
+}
+void phase_chk_leave(void) {
+    depth--;
+    if (depth >= 0 && depth < MAX_DEPTH && critical_depth != frame_critical[depth]) {
+        fail("a function returned from inside `critical`: interrupts stay off for good");
+    }
+}
 
 static const char *dom_name(int d) {
     switch (d) {
@@ -476,4 +497,103 @@ void phase_chk_ts_end(const void *v, const char *name) {
         fail("typestate value '%s' ends its scope but was never created", name);
     }
     t->in_use = 0;
+}
+
+/* --- interrupts and registers (v2.3) --- */
+
+void phase_chk_main_exit(void) {
+    if (critical_depth != 0) {
+        fail("main returned from inside `critical`: interrupts stay off for good");
+    }
+}
+
+void phase_chk_handler_enter(void) { handler_depth++; }
+void phase_chk_handler_leave(void) { handler_depth--; }
+void phase_chk_critical_enter(void) { critical_depth++; }
+void phase_chk_critical_leave(void) { critical_depth--; }
+
+void phase_chk_wait(const char *event) {
+    if (handler_depth > 0) {
+        fail("`wait %s` in an interrupt handler: nothing can interrupt the handler to signal it, "
+             "so it never returns",
+             event);
+    }
+    if (critical_depth > 0) {
+        fail("`wait %s` inside `critical`: interrupts are off, so nothing can signal it", event);
+    }
+}
+
+void phase_chk_wait_stuck(const char *event) {
+    fail("`wait %s` never returned: no interrupt handler signalled it in 1000 rounds of "
+         "interrupts",
+         event);
+}
+
+#define MAX_HANDOVERS 256
+static struct {
+    const char *fn, *event, *buf;
+} handovers[MAX_HANDOVERS];
+static int n_handovers = 0;
+
+void phase_chk_wait_for(const char *fn, const char *event, const char *buf) {
+    for (int i = 0; i < n_handovers; i++) {
+        if (strcmp(handovers[i].fn, fn) == 0 && strcmp(handovers[i].event, event) == 0) {
+            if (strcmp(handovers[i].buf, buf) != 0) {
+                fail("`wait %s for %s` in '%s', but `%s` handed over '%s' there before: an event "
+                     "gives back one buffer",
+                     event, buf, fn, event, handovers[i].buf);
+            }
+            return;
+        }
+    }
+    if (n_handovers < MAX_HANDOVERS) {
+        handovers[n_handovers].fn = fn;
+        handovers[n_handovers].event = event;
+        handovers[n_handovers].buf = buf;
+        n_handovers++;
+    }
+}
+
+void phase_chk_reg_read(const char *reg, int access) {
+    if (!(access & PHASE_REG_R)) {
+        fail("read of write-only register %s", reg);
+    }
+}
+
+static int rmw_active = 0;
+static Key rmw_key;
+static const char *rmw_name;
+
+void phase_chk_reg_write(const volatile void *reg, const char *name, int access, int field,
+                         unsigned long long value, unsigned long long limit) {
+    if (!(access & PHASE_REG_W)) {
+        fail("write to read-only register %s", name);
+    }
+    if (field && !(access & PHASE_REG_R)) {
+        fail("writing field %s reads its register, which is write-only", name);
+    }
+    if (value > limit) {
+        fail("%llu does not fit %s (at most %llu)", value, name, limit);
+    }
+    if (rmw_active && handler_depth > 0 && KEY(reg) == rmw_key) {
+        fail("lost write: an interrupt handler wrote %s between the read and the write of "
+             "`volatile_write(%s, ..)`, which then overwrites it",
+             name, rmw_name);
+    }
+}
+
+int phase_chk_rmw_begin(const volatile void *reg, const char *name) {
+    if (handler_depth > 0 || critical_depth > 0 || rmw_active) {
+        return 0;
+    }
+    rmw_active = 1;
+    rmw_key = KEY(reg);
+    rmw_name = name;
+    return 1;
+}
+
+void phase_chk_rmw_end(void) {
+    if (handler_depth == 0) {
+        rmw_active = 0;
+    }
 }

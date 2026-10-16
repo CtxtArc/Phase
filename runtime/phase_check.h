@@ -93,4 +93,31 @@ void phase_chk_ts_use(const void *v, const char *state, int consume, const char 
                       const char *name);
 PHASE_ADDR_ONLY(1) void phase_chk_ts_end(const void *v, const char *name);
 
+/* interrupts and registers (v2.3) */
+enum { PHASE_REG_R = 1, PHASE_REG_W = 2 };
+/* main returning: interrupts must not be left off */
+void phase_chk_main_exit(void);
+void phase_chk_handler_enter(void);
+void phase_chk_handler_leave(void);
+void phase_chk_critical_enter(void);
+void phase_chk_critical_leave(void);
+/* `wait E`: not in a handler, not inside `critical` */
+void phase_chk_wait(const char *event);
+/* a `wait` no handler satisfied */
+void phase_chk_wait_stuck(const char *event);
+/* `wait E for b` in fn `fn`: E gives back one buffer per function */
+void phase_chk_wait_for(const char *fn, const char *event, const char *buf);
+/* register accesses, against the register's declared access (`access`:
+ * PHASE_REG_R | PHASE_REG_W); a write's value must be at most `limit`
+ * (the field's or the register's largest value) */
+void phase_chk_reg_read(const char *reg, int access);
+void phase_chk_reg_write(const volatile void *reg, const char *name, int access, int field,
+                         unsigned long long value, unsigned long long limit);
+/* A field write's read-modify-write, outside `critical` and handlers:
+ * returns 1 if an interrupt could land between the read and the write
+ * (the generated code then runs the handlers there); any handler write to
+ * the same register before phase_chk_rmw_end() is a lost write. */
+int phase_chk_rmw_begin(const volatile void *reg, const char *name);
+void phase_chk_rmw_end(void);
+
 #endif /* PHASE_CHECK_H */

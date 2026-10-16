@@ -575,3 +575,115 @@ fn nested_splits_and_a_callee_reusing_the_split_buffers_name_run_clean() {
     );
     assert_eq!(code, 0, "{stderr}");
 }
+
+// ---- v2.3: registers and interrupts --------------------------------------
+
+const DEV: &str = r#"
+    device Timer @ 0x40000000 {
+        CTRL: read write u32 @ 0x00 = 0 { ENABLE: bit 0, MODE: bits 1..=2, IRQ_EN: bit 3 }
+        STATUS: read u8 @ 0x04;
+        LOAD: write u8 @ 0x08;
+    }
+    event tick;
+    event ht;
+"#;
+
+fn dev(body: &str) -> String {
+    format!("{SIGS}\n{DEV}\n{body}")
+}
+
+#[test]
+fn register_access_against_the_map_is_caught() {
+    caught(
+        "rt_read_write_only",
+        &dev("fn main() { let x: u32 = volatile_read(Timer.LOAD); }"),
+        "read of write-only register Timer.LOAD",
+    );
+    caught(
+        "rt_write_read_only",
+        &dev("fn main() { volatile_write(Timer.STATUS, 1); }"),
+        "write to read-only register Timer.STATUS",
+    );
+    caught(
+        "rt_field_too_wide",
+        &dev("fn main() { volatile_write(Timer.CTRL.MODE, 4); }"),
+        "4 does not fit Timer.CTRL.MODE (at most 3)",
+    );
+    // A value computed at run time, which only the checked build can see.
+    caught(
+        "rt_reg_too_wide",
+        &dev("fn main() { let n: u32 = 200; n = n + n; volatile_write(Timer.LOAD, n); }"),
+        "400 does not fit Timer.LOAD (at most 255)",
+    );
+}
+
+#[test]
+fn a_handler_write_landing_in_a_field_write_is_caught() {
+    caught(
+        "rt_lost_write",
+        &dev("interrupt fn on_timer() @ irq 8 { volatile_write(Timer.CTRL.IRQ_EN, 0); signal tick; }
+              fn main() { volatile_write(Timer.CTRL.ENABLE, 1); wait tick; }"),
+        "lost write: an interrupt handler wrote Timer.CTRL.IRQ_EN between the read and the write of `volatile_write(Timer.CTRL.ENABLE, ..)`",
+    );
+}
+
+#[test]
+fn waiting_where_nothing_can_signal_is_caught() {
+    caught(
+        "rt_wait_in_handler",
+        &dev("interrupt fn on_timer() @ irq 8 { wait tick; } fn main() { wait tick; }"),
+        "`wait tick` in an interrupt handler",
+    );
+    caught(
+        "rt_wait_in_critical",
+        &dev("interrupt fn on_timer() @ irq 8 { signal tick; } fn main() { critical { wait tick; } }"),
+        "`wait tick` inside `critical`",
+    );
+    caught(
+        "rt_wait_unsignalled",
+        &dev("interrupt fn on_timer() @ irq 8 { signal ht; } fn main() { wait tick; }"),
+        "`wait tick` never returned",
+    );
+    caught(
+        "rt_return_in_critical",
+        &dev("fn f() { critical { return; } } fn main() { f(); }"),
+        "a function returned from inside `critical`",
+    );
+}
+
+#[test]
+fn an_event_handing_back_the_wrong_buffer_is_caught() {
+    caught(
+        "rt_wrong_handover",
+        &dev("interrupt fn on_timer() @ irq 8 { signal ht; }
+              fn main() {
+                  buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM;
+                  start(a); wait ht for a; start(b); wait ht for b;
+              }"),
+        "`wait ht for b` in 'main', but `ht` handed over 'a' there before",
+    );
+    caught(
+        "rt_handover_not_in_flight",
+        &dev("interrupt fn on_timer() @ irq 8 { signal ht; }
+              fn main() { buffer<u8, 8> a @RAM; wait ht for a; }"),
+        "'a'",
+    );
+}
+
+#[test]
+fn correct_interrupt_and_register_use_runs_clean() {
+    let (code, stderr) = run_unanalyzed(
+        "rt_irq_clean",
+        &dev("interrupt fn on_timer() @ irq 8 { volatile_write(Timer.CTRL.IRQ_EN, 0); signal tick; signal ht; }
+              fn main() {
+                  buffer<u8, 8> a @RAM;
+                  critical { volatile_write(Timer.CTRL.ENABLE, 1); volatile_write(Timer.CTRL.MODE, 3); }
+                  volatile_write(Timer.LOAD, 255);
+                  let s: u32 = volatile_read(Timer.STATUS);
+                  wait tick;
+                  start(a); wait ht for a; look(a);
+              }"),
+        1,
+    );
+    assert_eq!(code, 0, "{stderr}");
+}

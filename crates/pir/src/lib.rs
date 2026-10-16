@@ -135,6 +135,10 @@ pub struct RegRef {
     pub bits: u32,
     /// `(name, lowest bit, highest bit)` for a field access.
     pub field: Option<(String, u32, u32)>,
+    /// The register's declared access (v2.3: a checked build verifies
+    /// every access against it at run time).
+    pub readable: bool,
+    pub writable: bool,
 }
 
 /// A `device` (v2.0), for codegen to lay out: its registers are its own,
@@ -1092,6 +1096,8 @@ impl<'a> Lowerer<'a> {
             reg: r.name.clone(),
             bits: r.bits().unwrap_or(32),
             field,
+            readable: r.readable,
+            writable: r.writable,
         })
     }
 
