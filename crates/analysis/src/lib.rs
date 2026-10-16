@@ -55,6 +55,26 @@ pub struct Report {
     pub warnings: Vec<AnalysisError>,
 }
 
+/// One statement as the analyzer saw it (v2.3, for the language server's
+/// hover): what every local in the function was just before it, and just
+/// after. A statement inside a loop or a branch can appear more than once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceStep {
+    pub fn_name: String,
+    pub span: Span,
+    /// An `if`, `while` or `critical`: its own statements have steps too.
+    pub compound: bool,
+    pub before: Vec<(String, String)>,
+    pub after: Vec<(String, String)>,
+}
+
+/// Analyze `program`, recording every statement's [`TraceStep`].
+pub fn trace(program: &Program) -> (Report, Vec<TraceStep>) {
+    let mut steps = Vec::new();
+    let report = analyze_impl(program, Some(&mut steps));
+    (report, steps)
+}
+
 /// One safety violation (or, with [`Severity::Warning`], a concern).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalysisError {
@@ -198,6 +218,10 @@ pub fn analyze(program: &Program) -> Result<(), Vec<AnalysisError>> {
 /// Like [`analyze`], but also returns warnings (which never reject a
 /// program).
 pub fn analyze_full(program: &Program) -> Report {
+    analyze_impl(program, None)
+}
+
+fn analyze_impl(program: &Program, mut steps: Option<&mut Vec<TraceStep>>) -> Report {
     let mut errors = Vec::new();
 
     let entity_domains: HashMap<&str, Option<Domain>> = program
@@ -431,7 +455,13 @@ pub fn analyze_full(program: &Program) -> Report {
                 &state_machines,
                 &initial_states,
             );
+            if steps.is_some() {
+                checker.trace = Some(Vec::new());
+            }
             checker.check_fn(f, &mut errors);
+            if let (Some(all), Some(mine)) = (steps.as_deref_mut(), checker.trace.take()) {
+                all.extend(mine);
+            }
         }
     }
 
@@ -874,6 +904,8 @@ struct FnChecker<'a> {
     /// `return`. Code after that point is unreachable, and the state at that
     /// point must not be merged into the fall-through state of a branch.
     diverged: bool,
+    /// Recording each statement's before/after state (for hover).
+    trace: Option<Vec<TraceStep>>,
 }
 
 /// `move` is only legal along these (from, to) pairs (spec §2.4).
@@ -983,6 +1015,78 @@ impl<'a> FnChecker<'a> {
             cur_span: Span::default(),
             block_depth: 0,
             diverged: false,
+            trace: None,
+        }
+    }
+
+    /// Every local, described for a reader: its type, domain and anything
+    /// else that limits what can be done with it now.
+    fn describe_locals(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .locals
+            .iter()
+            .map(|(name, v)| (name.clone(), self.describe(name, v)))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn describe(&self, name: &str, v: &VarState) -> String {
+        if let Some((target, mode)) = &v.borrow_of {
+            let mode = match mode {
+                BorrowMode::Read => "read",
+                BorrowMode::Write => "write",
+            };
+            return if v.released {
+                format!("{mode} borrow of '{target}', released")
+            } else {
+                format!("{mode} borrow of '{target}'")
+            };
+        }
+        let mut parts: Vec<String> = Vec::new();
+        match (&v.typestate, &v.ty) {
+            (Some(ts), _) => parts.push(format!("`{}`", fmt_state(ts))),
+            (None, Some(t)) => parts.push(format!("`{}`", fmt_type(t))),
+            _ => {}
+        }
+        if v.destroyed {
+            parts.push("destroyed".into());
+        } else if let Some(how) = &v.consumed {
+            parts.push(format!("consumed ({how})"));
+        } else {
+            if let Some(d) = v.domain {
+                let who = match d {
+                    Domain::Dma => " (the DMA engine has it)",
+                    Domain::Device => " (the device has it)",
+                    _ => "",
+                };
+                parts.push(format!("in @{}{who}", d.name()));
+            }
+            if let Some((ps, _)) = &v.split_into {
+                parts.push(format!("split into {}", ps.join(", ")));
+            }
+            if let Some((parent, i)) = &v.part_of {
+                parts.push(format!("part {i} of '{parent}'"));
+            }
+            if let Some(b) = self.borrows.get(name) {
+                if let Some(w) = &b.writer {
+                    parts.push(format!("write-borrowed by '{w}'"));
+                }
+                if !b.readers.is_empty() {
+                    let mut r: Vec<&String> = b.readers.iter().collect();
+                    r.sort();
+                    let r: Vec<String> = r.iter().map(|x| format!("'{x}'")).collect();
+                    parts.push(format!("read-borrowed by {}", r.join(", ")));
+                }
+            }
+            if v.read_only {
+                parts.push("`read` parameter".into());
+            }
+        }
+        if parts.is_empty() {
+            "a local".into()
+        } else {
+            parts.join(", ")
         }
     }
 
@@ -1791,7 +1895,23 @@ impl<'a> FnChecker<'a> {
             }
             let before = errors.len();
             self.cur_span = stmt.span;
+            let snapshot = self.trace.as_ref().map(|_| self.describe_locals());
             self.check_stmt(stmt, errors);
+            if let Some(before_state) = snapshot {
+                let step = TraceStep {
+                    fn_name: self.fn_name.clone(),
+                    span: stmt.span,
+                    compound: matches!(
+                        stmt.node,
+                        Stmt::If { .. } | Stmt::While { .. } | Stmt::Critical { .. }
+                    ),
+                    before: before_state,
+                    after: self.describe_locals(),
+                };
+                if let Some(t) = self.trace.as_mut() {
+                    t.push(step);
+                }
+            }
             // Errors raised while checking this statement (and not already
             // pinned to a nested statement) point at it.
             for e in &mut errors[before..] {

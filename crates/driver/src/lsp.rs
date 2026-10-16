@@ -3,13 +3,16 @@
 //! It checks each open document on every change and publishes the same
 //! diagnostics `phase check` prints -- with the same underlines and each
 //! note as related information -- and lists a document's functions and
-//! devices (with their registers) as symbols. Nothing is cached between
-//! checks: analysis of a source file is fast enough to redo per keystroke.
+//! devices (with their registers) as symbols. Hovering a buffer or other
+//! local shows who owns it at that line and how it got there; hovering a
+//! function, device, register or event shows its declaration, and
+//! go-to-definition jumps to it, across imports. Nothing is cached between
+//! requests: analysis of a source file is fast enough to redo each time.
 
 use crate::diagnostics::{underline_range, Diagnostic};
 use crate::json::{self, obj, Json};
-use phase_ast::{Item, Span};
-use phase_parser::SourceFile;
+use phase_ast::{device_regs, Item, Program, Span};
+use phase_parser::{Loaded, SourceFile};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -126,6 +129,8 @@ impl Server {
                                 obj(&[("openClose", true.into()), ("change", 1u32.into())]),
                             ),
                             ("documentSymbolProvider", true.into()),
+                            ("hoverProvider", true.into()),
+                            ("definitionProvider", true.into()),
                         ]),
                     ),
                     (
@@ -188,6 +193,26 @@ impl Server {
                     .unwrap_or_default();
                 vec![response(id, Json::Arr(symbols))]
             }
+            ("textDocument/hover", Some(id)) => {
+                let hover = match (uri, position(&params)) {
+                    (Some(uri), Some(pos)) => self.hover(&uri, pos),
+                    _ => None,
+                };
+                let result = hover.map_or(Json::Null, |md| {
+                    obj(&[(
+                        "contents",
+                        obj(&[("kind", "markdown".into()), ("value", md.into())]),
+                    )])
+                });
+                vec![response(id, result)]
+            }
+            ("textDocument/definition", Some(id)) => {
+                let def = match (uri, position(&params)) {
+                    (Some(uri), Some(pos)) => self.definition(&uri, pos),
+                    _ => None,
+                };
+                vec![response(id, def.unwrap_or(Json::Null))]
+            }
             (_, Some(id)) => vec![error_response(
                 id,
                 -32601,
@@ -206,10 +231,9 @@ impl Server {
         )
     }
 
-    /// Everything `phase check` would report for the document at `uri`,
-    /// and the files it was loaded from. Imports are read from open
-    /// documents first (unsaved edits count), then from disk.
-    fn check(&self, uri: &str) -> (Vec<Diagnostic>, Vec<SourceFile>) {
+    /// Load the document at `uri` and its imports. Imports are read from
+    /// open documents first (unsaved edits count), then from disk.
+    fn load(&self, uri: &str) -> Result<Loaded, phase_parser::LoadError> {
         let root = uri_to_path(uri);
         let docs = &self.docs;
         let mut read = |p: &Path| -> io::Result<String> {
@@ -221,7 +245,13 @@ impl Server {
                 None => std::fs::read_to_string(p),
             }
         };
-        match phase_parser::load(&root, &mut read) {
+        phase_parser::load(&root, &mut read)
+    }
+
+    /// Everything `phase check` would report for the document at `uri`,
+    /// and the files it was loaded from.
+    fn check(&self, uri: &str) -> (Vec<Diagnostic>, Vec<SourceFile>) {
+        match self.load(uri) {
             Err(e) => (vec![Diagnostic::from(&e.error)], e.files),
             Ok(loaded) => {
                 let report = phase_analysis::analyze_full(&loaded.program);
@@ -235,6 +265,437 @@ impl Server {
             }
         }
     }
+}
+
+impl Server {
+    /// Markdown for what is under `pos` in the document at `uri`.
+    fn hover(&self, uri: &str, pos: (u32, u32)) -> Option<String> {
+        let loaded = self.load(uri).ok()?;
+        let text = &loaded.files[0].src;
+        let (chain, idx) = word_chain_at(text, pos)?;
+        let word = chain[idx].as_str();
+        let line = pos.0 + 1;
+        // A local of the function the cursor is in.
+        if idx == 0 {
+            if let Some(f) = enclosing_fn(&loaded.program, line) {
+                if let Some(md) = local_hover(&loaded.program, &f.name, word, line, text) {
+                    return Some(md);
+                }
+            }
+        }
+        let (span, kind) = find_decl(&loaded.program, &chain[..=idx])?;
+        let src = &loaded.files.get(span.file as usize)?.src;
+        let mut md = format!("```phase\n{}\n```", decl_text(src, span));
+        if let Some(extra) = kind_note(&loaded.program, &kind, word) {
+            md.push_str(&format!("\n\n{extra}"));
+        }
+        Some(md)
+    }
+
+    /// Where what is under `pos` is declared.
+    fn definition(&self, uri: &str, pos: (u32, u32)) -> Option<Json> {
+        let loaded = self.load(uri).ok()?;
+        let text = &loaded.files[0].src;
+        let (chain, idx) = word_chain_at(text, pos)?;
+        let word = chain[idx].as_str();
+        let line = pos.0 + 1;
+        let span = if idx == 0 {
+            enclosing_fn(&loaded.program, line)
+                .and_then(|f| local_decl(&loaded.program, f, word, text))
+        } else {
+            None
+        };
+        let span = match span {
+            Some(s) => s,
+            None => find_decl(&loaded.program, &chain[..=idx])?.0,
+        };
+        let file = loaded.files.get(span.file as usize)?;
+        let target_uri = if span.file == 0 {
+            uri.to_string()
+        } else {
+            path_to_uri(&file.path)
+        };
+        Some(obj(&[
+            ("uri", target_uri.into()),
+            ("range", word_range(span, &file.src, word)),
+        ]))
+    }
+}
+
+/// The range of `word` on `span`'s line, at or after its start (a
+/// declaration's span can start before its name), else `span`'s own.
+fn word_range(span: Span, src: &str, word: &str) -> Json {
+    let line_no = span.line.max(1) - 1;
+    let line = src.lines().nth(line_no as usize).unwrap_or("");
+    let chars: Vec<char> = line.chars().collect();
+    let w: Vec<char> = word.chars().collect();
+    let from = (span.col.max(1) - 1) as usize;
+    for i in from..chars.len().saturating_sub(w.len() - 1) {
+        let whole = chars[i..i + w.len()] == w[..]
+            && (i == 0 || !is_word(chars[i - 1]))
+            && chars.get(i + w.len()).is_none_or(|c| !is_word(*c));
+        if whole {
+            let pos = |c: usize| {
+                obj(&[
+                    ("line", line_no.into()),
+                    ("character", utf16_col(line, c).into()),
+                ])
+            };
+            return obj(&[("start", pos(i)), ("end", pos(i + w.len()))]);
+        }
+    }
+    range(span, src, None)
+}
+
+/// `textDocument/*` request position: (line, character), both 0-based.
+fn position(params: &Json) -> Option<(u32, u32)> {
+    let num = |k: &str| match params.at(&["position", k]) {
+        Some(Json::Num(n)) => Some(*n as u32),
+        _ => None,
+    };
+    Some((num("line")?, num("character")?))
+}
+
+fn is_word(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// The dotted name under `pos` (`Fz.CTRL.EN` -> [Fz, CTRL, EN]) and which
+/// part of it the cursor is on.
+fn word_chain_at(text: &str, pos: (u32, u32)) -> Option<(Vec<String>, usize)> {
+    let line: Vec<char> = text.lines().nth(pos.0 as usize)?.chars().collect();
+    // The UTF-16 column -> a char index.
+    let mut units = 0u32;
+    let mut at = line.len();
+    for (i, c) in line.iter().enumerate() {
+        if units >= pos.1 {
+            at = i;
+            break;
+        }
+        units += c.len_utf16() as u32;
+    }
+    if at == line.len() || !is_word(line[at]) {
+        // Just past the end of a word counts too.
+        if at > 0 && is_word(line[at - 1]) {
+            at -= 1;
+        } else {
+            return None;
+        }
+    }
+    let mut start = at;
+    while start > 0 && (is_word(line[start - 1]) || line[start - 1] == '.') {
+        start -= 1;
+    }
+    let mut end = at;
+    while end < line.len() && is_word(line[end]) {
+        end += 1;
+    }
+    let before: String = line[start..at].iter().collect();
+    let chain_text: String = line[start..end].iter().collect();
+    let chain: Vec<String> = chain_text
+        .split('.')
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect();
+    let idx = before
+        .matches('.')
+        .count()
+        .min(chain.len().saturating_sub(1));
+    if chain.is_empty() || chain[idx].starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((chain, idx))
+}
+
+/// The function of file 0 whose text contains `line` (1-based).
+fn enclosing_fn(program: &Program, line: u32) -> Option<&phase_ast::FnDecl> {
+    program.items.iter().find_map(|i| match i {
+        Item::Fn(f)
+            if f.name_span.file == 0 && f.name_span.line <= line && line <= f.body.close.line =>
+        {
+            Some(f)
+        }
+        _ => None,
+    })
+}
+
+/// What a declaration is, for the extra line in its hover.
+enum DeclKind {
+    Fn,
+    Device,
+    Register,
+    Field,
+    Event,
+    Other,
+}
+
+/// The declaration a (dotted) name refers to.
+fn find_decl(program: &Program, chain: &[String]) -> Option<(Span, DeclKind)> {
+    let first = chain.first()?.as_str();
+    for item in &program.items {
+        match item {
+            Item::Fn(f) if chain.len() == 1 && f.name == first => {
+                return Some((f.name_span, DeclKind::Fn))
+            }
+            Item::ExternFn(f) if chain.len() == 1 && f.name == first => {
+                return Some((f.name_span, DeclKind::Fn))
+            }
+            Item::Event(e) if chain.len() == 1 && e.name == first => {
+                return Some((e.span, DeclKind::Event))
+            }
+            Item::DeviceType(t) if chain.len() == 1 && t.name == first => {
+                return Some((t.span, DeclKind::Other))
+            }
+            Item::Device(d) if d.name == first => {
+                if chain.len() == 1 {
+                    return Some((d.span, DeclKind::Device));
+                }
+                let reg = device_regs(program, d)?
+                    .iter()
+                    .find(|r| r.name == chain[1])?;
+                if chain.len() == 2 {
+                    return Some((reg.span, DeclKind::Register));
+                }
+                let field = reg.fields.iter().find(|f| f.name == chain[2])?;
+                return Some((field.span, DeclKind::Field));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The source of a declaration: its first line, continued while brackets
+/// are open (a multi-line `extern fn`), without a body.
+fn decl_text(src: &str, span: Span) -> String {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    for l in lines.iter().skip(span.line.max(1) as usize - 1).take(8) {
+        let mut t = l.trim().to_string();
+        if let Some(i) = t.find('{') {
+            if depth == 0 && !t.contains('}') {
+                t = t[..i].trim_end().to_string();
+                out.push(t);
+                break;
+            }
+        }
+        depth += t.matches('(').count() as i32 - t.matches(')').count() as i32;
+        out.push(t);
+        if depth <= 0 {
+            break;
+        }
+    }
+    out.join("\n    ")
+}
+
+/// One more line for some declarations: who signals and waits for an
+/// event, what a device's registers are.
+fn kind_note(program: &Program, kind: &DeclKind, name: &str) -> Option<String> {
+    match kind {
+        DeclKind::Event => {
+            let mut signal = Vec::new();
+            let mut wait = Vec::new();
+            for item in &program.items {
+                if let Item::Fn(f) = item {
+                    let (s, w) = event_uses(&f.body, name);
+                    if s {
+                        signal.push(format!("`{}`", f.name));
+                    }
+                    if w {
+                        wait.push(format!("`{}`", f.name));
+                    }
+                }
+            }
+            let list = |v: &[String]| {
+                if v.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    v.join(", ")
+                }
+            };
+            Some(format!(
+                "Signalled in {}; waited for in {}.",
+                list(&signal),
+                list(&wait)
+            ))
+        }
+        DeclKind::Device => {
+            let d = program.items.iter().find_map(|i| match i {
+                Item::Device(d) if d.name == name => Some(d),
+                _ => None,
+            })?;
+            let regs = device_regs(program, d)?;
+            let names: Vec<String> = regs.iter().map(|r| format!("`{}`", r.name)).collect();
+            Some(format!("Registers: {}.", names.join(", ")))
+        }
+        DeclKind::Fn | DeclKind::Register | DeclKind::Field | DeclKind::Other => None,
+    }
+}
+
+/// Whether `block` signals / waits for `event`.
+fn event_uses(block: &phase_ast::Block, event: &str) -> (bool, bool) {
+    use phase_ast::Stmt;
+    let (mut s, mut w) = (false, false);
+    for st in &block.stmts {
+        let (a, b) = match &st.node {
+            Stmt::Signal { name } => (name == event, false),
+            Stmt::Wait { name, .. } => (false, name == event),
+            Stmt::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                let (a1, b1) = event_uses(then_block, event);
+                let (a2, b2) = else_block
+                    .as_ref()
+                    .map_or((false, false), |e| event_uses(e, event));
+                (a1 || a2, b1 || b2)
+            }
+            Stmt::While { body, .. } | Stmt::Critical { body } => event_uses(body, event),
+            _ => (false, false),
+        };
+        s |= a;
+        w |= b;
+    }
+    (s, w)
+}
+
+fn span_contains(s: Span, line: u32) -> bool {
+    s.line <= line && line <= s.end_line.max(s.line)
+}
+
+/// A local's hover: what it is at `line`, and the statements so far in
+/// this function that changed it.
+fn local_hover(
+    program: &Program,
+    fn_name: &str,
+    name: &str,
+    line: u32,
+    text: &str,
+) -> Option<String> {
+    let (_, steps) = phase_analysis::trace(program);
+    let steps: Vec<&phase_analysis::TraceStep> = steps
+        .iter()
+        .filter(|s| s.fn_name == fn_name && s.span.file == 0)
+        .collect();
+    let state = |v: &[(String, String)]| v.iter().find(|(n, _)| n == name).map(|(_, d)| d.clone());
+    // The innermost statement on this line: the state as it starts (or,
+    // for the line declaring the name, as it ends).
+    let here: Vec<&&phase_analysis::TraceStep> = steps
+        .iter()
+        .filter(|s| span_contains(s.span, line))
+        .collect();
+    let innermost = here
+        .iter()
+        .filter(|s| !s.compound)
+        .map(|s| s.span)
+        .min_by_key(|s| (s.end_line - s.line, std::cmp::Reverse(s.col)))
+        .or_else(|| here.iter().map(|s| s.span).max_by_key(|s| (s.line, s.col)));
+    let mut now: Vec<String> = Vec::new();
+    match innermost {
+        Some(sp) => {
+            for s in steps.iter().filter(|s| s.span == sp) {
+                if let Some(d) = state(&s.before).or_else(|| state(&s.after)) {
+                    if !now.contains(&d) {
+                        now.push(d);
+                    }
+                }
+            }
+        }
+        None => {
+            // Not on a statement (a parameter in the header, say): the
+            // state as the function starts, or as it ends.
+            let first = steps.iter().min_by_key(|s| (s.span.line, s.span.col));
+            let last = steps
+                .iter()
+                .filter(|s| s.span.line <= line)
+                .max_by_key(|s| (s.span.line, s.span.col));
+            let pick = if steps.iter().all(|s| s.span.line > line) {
+                first.and_then(|s| state(&s.before))
+            } else {
+                last.and_then(|s| state(&s.after))
+            };
+            now.extend(pick);
+        }
+    }
+    if now.is_empty() {
+        return None;
+    }
+    // Statements up to here that changed it, in source order.
+    let mut changes: Vec<(Span, String)> = Vec::new();
+    let mut seen: Vec<Span> = Vec::new();
+    let mut ordered: Vec<&&phase_analysis::TraceStep> = steps
+        .iter()
+        .filter(|s| !s.compound && s.span.line < line)
+        .collect();
+    ordered.sort_by_key(|s| (s.span.line, s.span.col));
+    for s in ordered {
+        let (b, a) = (state(&s.before), state(&s.after));
+        if let Some(after) = a.filter(|a| b.as_ref() != Some(a)) {
+            if !seen.contains(&s.span) {
+                seen.push(s.span);
+                changes.push((s.span, after));
+            }
+        }
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut md = format!("**{name}**: {}", now.join(" *or* "));
+    if !changes.is_empty() {
+        md.push_str("\n\n");
+        let skip = changes.len().saturating_sub(8);
+        if skip > 0 {
+            md.push_str(&format!("({skip} earlier changes)\n\n"));
+        }
+        for (sp, desc) in &changes[skip..] {
+            let src = lines.get(sp.line as usize - 1).map_or("", |l| l.trim());
+            md.push_str(&format!("- line {}: `{src}` → {desc}\n", sp.line));
+        }
+    }
+    Some(md)
+}
+
+/// Where a local of `f` is declared: a parameter in the header, or the
+/// statement that first introduces it.
+fn local_decl(program: &Program, f: &phase_ast::FnDecl, name: &str, text: &str) -> Option<Span> {
+    if f.params.iter().any(|p| p.name == name) {
+        // Parameters carry no span: find `name:` in the header.
+        let lines: Vec<&str> = text.lines().collect();
+        for ln in f.name_span.line..=f.body.close.line {
+            let l = lines.get(ln as usize - 1)?;
+            let mut from = 0;
+            while let Some(i) = l[from..].find(name) {
+                let at = from + i;
+                let before_ok = at == 0 || !is_word(l[..at].chars().next_back().unwrap());
+                let rest = l[at + name.len()..].trim_start();
+                if before_ok && rest.starts_with(':') {
+                    let col = l[..at].chars().count() as u32 + 1;
+                    return Some(Span {
+                        line: ln,
+                        col,
+                        end_line: ln,
+                        end_col: col + name.chars().count() as u32,
+                        file: 0,
+                    });
+                }
+                from = at + name.len();
+            }
+            if l.contains('{') {
+                break;
+            }
+        }
+        return None;
+    }
+    let (_, steps) = phase_analysis::trace(program);
+    steps
+        .iter()
+        .filter(|s| s.fn_name == f.name && s.span.file == 0)
+        .filter(|s| {
+            !s.before.iter().any(|(n, _)| n == name) && s.after.iter().any(|(n, _)| n == name)
+        })
+        .filter(|s| !s.compound)
+        .map(|s| s.span)
+        .min_by_key(|s| (s.line, s.col))
 }
 
 /// `file:///a/b%20c.phase` -> `/a/b c.phase`.
@@ -486,5 +947,121 @@ mod tests {
             rel[0].at(&["location", "range", "start", "line"]),
             Some(&Json::Num(2.0))
         );
+    }
+
+    const HOVER_SRC: &str = "device Fz @ 0x40000000 {
+    CTRL: read write u32 @ 0x00 { EN: bit 0 }
+}
+event done;
+extern fn start(x: write buffer<u8, 8> @RAM -> @DMA);
+extern fn look(x: read buffer<u8, 8> @RAM);
+interrupt fn on_dma() @ irq 3 {
+    signal done;
+}
+fn main() {
+    buffer<u8, 8> b @RAM;
+    start(b);
+    volatile_write(Fz.CTRL.EN, 1);
+    wait done for b;
+    look(b);
+}
+";
+
+    fn hover_at(line: u32, character: u32) -> Option<String> {
+        let mut server = Server::default();
+        server
+            .docs
+            .insert("file:///h.phase".into(), HOVER_SRC.into());
+        server.hover("file:///h.phase", (line, character))
+    }
+
+    #[test]
+    fn hovering_a_buffer_shows_its_owner_there_and_how_it_got_there() {
+        // `start(b);` (line 12): b is still the CPU's as it starts.
+        let md = hover_at(11, 10).unwrap();
+        assert!(md.starts_with("**b**: `buffer<u8, 8>`, in @RAM"), "{md}");
+        // `look(b);` (line 15): handed back by the interrupt.
+        let md = hover_at(14, 9).unwrap();
+        assert!(md.starts_with("**b**: `buffer<u8, 8>`, in @RAM"), "{md}");
+        assert!(
+            md.contains(
+                "- line 12: `start(b);` → `buffer<u8, 8>`, in @DMA (the DMA engine has it)"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains("- line 14: `wait done for b;` → `buffer<u8, 8>`, in @RAM"),
+            "{md}"
+        );
+        // Between the two, on `wait done for b;`: the engine has it.
+        let md = hover_at(13, 18).unwrap();
+        assert!(md.contains("in @DMA"), "{md}");
+    }
+
+    #[test]
+    fn hovering_declarations_shows_them() {
+        // `start` in `start(b);`
+        let md = hover_at(11, 6).unwrap();
+        assert!(
+            md.contains("extern fn start(x: write buffer<u8, 8> @RAM -> @DMA);"),
+            "{md}"
+        );
+        // `EN` in `Fz.CTRL.EN`, and `CTRL`.
+        let md = hover_at(12, 27).unwrap();
+        assert!(
+            md.contains("CTRL: read write u32 @ 0x00 { EN: bit 0 }"),
+            "{md}"
+        );
+        let md = hover_at(12, 23).unwrap();
+        assert!(md.contains("CTRL: read write u32"), "{md}");
+        // The event: who signals it, who waits.
+        let md = hover_at(13, 10).unwrap();
+        assert!(
+            md.contains("Signalled in `on_dma`; waited for in `main`."),
+            "{md}"
+        );
+        assert_eq!(hover_at(9, 0), None); // `fn`
+    }
+
+    #[test]
+    fn go_to_definition_finds_locals_registers_and_imports() {
+        let mut server = Server::default();
+        server
+            .docs
+            .insert("file:///h.phase".into(), HOVER_SRC.into());
+        let def = |line, ch| server.definition("file:///h.phase", (line, ch)).unwrap();
+        // `b` in `look(b)` -> its declaration on line 11 (0-based 10).
+        let d = def(14, 9);
+        assert_eq!(d.at(&["range", "start", "line"]), Some(&Json::Num(10.0)));
+        assert_eq!(
+            d.at(&["range", "start", "character"]),
+            Some(&Json::Num(18.0))
+        );
+        // `EN` -> the field.
+        let d = def(12, 27);
+        assert_eq!(d.at(&["range", "start", "line"]), Some(&Json::Num(1.0)));
+        assert_eq!(
+            d.at(&["range", "start", "character"]),
+            Some(&Json::Num(34.0))
+        );
+
+        // A device from an imported file.
+        let dir = std::env::temp_dir().join("phase_lsp_def_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("board.phase"),
+            "// board\ndevice Uart0 @ 0x40004000 {\n    DATA: read write u32 @ 0x00;\n}\n",
+        )
+        .unwrap();
+        let root = dir.join("app.phase");
+        let uri = path_to_uri(&root);
+        server.docs.insert(
+            uri.clone(),
+            "import \"board.phase\";\nfn main() {\n    volatile_write(Uart0.DATA, 65);\n}\n".into(),
+        );
+        let d = server.definition(&uri, (2, 26)).unwrap();
+        let target = d.get("uri").and_then(Json::as_str).unwrap();
+        assert!(target.ends_with("/board.phase"), "{target}");
+        assert_eq!(d.at(&["range", "start", "line"]), Some(&Json::Num(2.0)));
     }
 }

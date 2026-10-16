@@ -33,7 +33,7 @@ fn escape(s: &str) -> String {
 }
 
 #[test]
-fn a_session_publishes_diagnostics_lists_symbols_and_shuts_down() {
+fn a_session_publishes_diagnostics_lists_symbols_hovers_and_shuts_down() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_phase"))
         .arg("lsp")
         .stdin(Stdio::piped())
@@ -48,6 +48,8 @@ fn a_session_publishes_diagnostics_lists_symbols_and_shuts_down() {
     let init = read_message(&mut stdout);
     assert!(init.contains(r#""id":1"#), "{init}");
     assert!(init.contains(r#""documentSymbolProvider":true"#), "{init}");
+    assert!(init.contains(r#""hoverProvider":true"#), "{init}");
+    assert!(init.contains(r#""definitionProvider":true"#), "{init}");
     assert!(init.contains(r#""change":1"#), "{init}");
     send(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
 
@@ -89,7 +91,26 @@ fn a_session_publishes_diagnostics_lists_symbols_and_shuts_down() {
     assert!(symbols.contains(r#""name":"look""#), "{symbols}");
     assert!(symbols.contains(r#""name":"main""#), "{symbols}");
 
-    send(r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{}}"#);
+    // Hover over `b` in `look(b)` (line 5, now after the sync).
+    send(
+        r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///t.phase"},"position":{"line":5,"character":9}}}"#,
+    );
+    let hover = read_message(&mut stdout);
+    assert!(hover.contains(r#""kind":"markdown""#), "{hover}");
+    assert!(hover.contains("**b**: `buffer<u8, 4>`, in @RAM"), "{hover}");
+    assert!(hover.contains("- line 4: `move b -> @DMA;`"), "{hover}");
+    // ...and jump to where it is declared (line 3).
+    send(
+        r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///t.phase"},"position":{"line":5,"character":9}}}"#,
+    );
+    let def = read_message(&mut stdout);
+    assert!(def.contains(r#""uri":"file:///t.phase""#), "{def}");
+    assert!(
+        def.contains(r#""start":{"character":18,"line":2}"#),
+        "{def}"
+    );
+
+    send(r#"{"jsonrpc":"2.0","id":6,"method":"textDocument/rename","params":{}}"#);
     let unsupported = read_message(&mut stdout);
     assert!(unsupported.contains("-32601"), "{unsupported}");
 
