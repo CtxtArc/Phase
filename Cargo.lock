@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "phase_analysis"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "phase_ast",
  "phase_parser",
@@ -12,11 +12,11 @@ dependencies = [
 
 [[package]]
 name = "phase_ast"
-version = "2.1.0"
+version = "2.2.0"
 
 [[package]]
 name = "phase_codegen_c"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "phase_analysis",
  "phase_ast",
@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "phase_driver"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "phase_analysis",
  "phase_ast",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "phase_fuzz"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "phase_analysis",
  "phase_codegen_c",
@@ -48,14 +48,14 @@ dependencies = [
 
 [[package]]
 name = "phase_lexer"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "phase_ast",
 ]
 
 [[package]]
 name = "phase_parser"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "phase_ast",
  "phase_lexer",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "phase_pir"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "phase_analysis",
  "phase_ast",

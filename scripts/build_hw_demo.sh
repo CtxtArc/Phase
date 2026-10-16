@@ -8,6 +8,7 @@
 #     declared register map (spec §3.7)
 #   - examples/hw_uart_echo.phase: a buffer handed to the UART device and
 #     synced, with the send loop in C (runtime/hw_uart_echo_extern.c)
+#   - examples/timer_ticks.phase: five timer interrupts, each waking `wait`
 #
 # Requires the GNU Arm Embedded toolchain (arm-none-eabi-gcc) and
 # qemu-system-arm on PATH, e.g.
@@ -28,7 +29,7 @@ for tool in arm-none-eabi-gcc qemu-system-arm; do
 done
 
 cargo build -q --bin phase
-for example in uart_hello hw_uart_echo; do
+for example in uart_hello hw_uart_echo timer_ticks; do
     echo "== $example =="
     timeout 30 target/debug/phase build --target=mps2-an385 --run "examples/$example.phase"
     echo

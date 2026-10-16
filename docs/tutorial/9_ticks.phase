@@ -1,0 +1,23 @@
+import "../../examples/devices/mps2_an385.phase";
+
+extern fn report(n: u32);
+
+event tick;
+
+interrupt fn on_timer0() @ irq 8 {
+    volatile_write(Timer0.INT.PENDING, 1);   // acknowledge
+    signal tick;
+}
+
+fn main() {
+    volatile_write(Timer0.RELOAD, 48000);
+    volatile_write(Nvic.ISER, 0x100);        // enable IRQ 8
+    volatile_write(Timer0.CTRL, 0x9);        // ENABLE and IRQ_ENABLE
+    let n: u32 = 0;
+    while n < 3 {
+        wait tick;                           // sleep until the handler signals
+        report(n);
+        n = n + 1;
+    }
+    volatile_write(Timer0.CTRL.ENABLE, 0);       // stop the timer
+}

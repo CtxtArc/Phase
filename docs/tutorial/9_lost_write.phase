@@ -1,0 +1,15 @@
+import "../../examples/devices/mps2_an385.phase";
+
+event tick;
+
+interrupt fn on_timer0() @ irq 8 {
+    volatile_write(Timer0.INT.PENDING, 1);
+    volatile_write(Timer0.CTRL.IRQ_ENABLE, 0);   // one tick only
+    signal tick;
+}
+
+fn main() {
+    volatile_write(Timer0.CTRL, 0x8);
+    volatile_write(Timer0.CTRL.ENABLE, 1);       // read, modify, write
+    wait tick;
+}

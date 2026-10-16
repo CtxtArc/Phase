@@ -4,6 +4,51 @@ All notable changes to PHASE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] — 2026-10-16
+
+Interrupts. A handler is an `interrupt fn` bound to its IRQ; it tells the
+rest of the program something happened with an `event`, which `main`
+waits for; `critical { }` keeps interrupts out of a block. The analyzer
+follows the call graph from every handler, so a register write a handler
+could lose and a `wait` that could never return are compile errors.
+
+Every program 2.1 accepted is still accepted: the new words are keywords
+only where they start an item or a statement.
+
+After the changes, 4,000 freshly fuzzed programs (1,816 accepted and run
+in checked mode) produced no soundness violations. The fuzzer does not
+generate interrupts; they are covered by the analyzer, codegen and
+end-to-end tests, including real timer interrupts on QEMU.
+
+### Added
+
+- **`interrupt fn NAME() @ irq N`, `event E;`, `signal E;`, `wait E;`,
+  `critical { .. }`** (spec §3.16). Handlers take nothing, return
+  nothing, are never called directly, and each IRQ (0-239) has one.
+- **Checks** (whole program, through calls): a field write in thread
+  code to a register an interrupt handler writes must be inside
+  `critical` (bug gallery #41); `wait` in handler code (#42) or inside
+  `critical` is an error, and so is `return` inside `critical`.
+- **Code generation**: events are `volatile` flags; `critical` saves
+  PRIMASK and disables interrupts; `wait` tests and clears its event with
+  interrupts off and sleeps with `wfi`, so no signal is lost; handlers
+  become the vector table's `IRQn_Handler`. A host build runs every
+  handler once per `wait`, and stops a `wait` nothing signals with a
+  message.
+- `runtime/hw/startup.c`: the vector table covers the board's 32 IRQs as
+  weak aliases.
+- Board file: the NVIC, and the IRQ numbers of Uart0 transmit (1),
+  Timer0 (8) and Timer1 (9), each checked on QEMU's model by taking it.
+- `examples/timer_ticks.phase`: five real timer interrupts on QEMU's board
+  model, part of the hardware test.
+- Tutorial step 9, interrupts; grammar and Vim syntax for the new words.
+
+### Changed
+
+- Internal crate APIs: `FnDecl::irq`, `Item::Event`, `Stmt::Signal`,
+  `Stmt::Wait`, `Stmt::Critical`; `PirInst::Signal`/`Wait`/`Critical`,
+  `PirFn::irq`, `PirProgram::events`.
+
 ## [2.1.0] — 2026-10-13
 
 Programs can span several files, and a chip's identical peripherals share

@@ -2,7 +2,7 @@
 
 **A physical-domain safety language for signal, RF, and embedded pipelines**
 
-Version 2.1
+Version 2.2
 
 ---
 
@@ -575,6 +575,71 @@ file is reported in that file, and a note can point into any of them
 (§6.5). An `extern fn` declared in an imported file is implemented like
 any other: in `runtime/<stem>_extern.c` of the program being built.
 
+### 3.16 Interrupts
+
+```phase
+event tick;
+
+interrupt fn on_timer0() @ irq 8 {
+    volatile_write(Timer0.INT.PENDING, 1);   // acknowledge
+    signal tick;
+}
+
+fn main() {
+    ...
+    wait tick;
+    critical {
+        volatile_write(Timer0.CTRL.ENABLE, 0);
+    }
+}
+```
+
+(v2.2.) `interrupt fn NAME() @ irq N { .. }` is the handler for external
+interrupt `N` (0–239 on a Cortex-M): the hardware calls it, between any
+two instructions of the code it interrupts. It takes no parameters and
+returns nothing, it is never called directly, and each IRQ has at most
+one handler. `event NAME;` declares an event: `signal E;` raises it, and
+`wait E;` sleeps until it is raised, then clears it. An event is a flag,
+not a counter — two signals before a `wait` are seen as one.
+`critical { .. }` runs its block with interrupts disabled, restoring the
+previous state at its end. `interrupt`, `event`, `signal`, `wait` and
+`critical` are keywords only where they start an item or a statement, so
+`fn wait(..)` and `wait(x);` are unaffected.
+
+*Thread code* is `main` and every function it calls; *handler code* is
+every handler and every function a handler calls (one function can be
+both). The analyzer follows the call graph to check:
+
+- **No lost register writes.** A field write is read-modify-write. In
+  thread code outside `critical`, a field write to a register that handler
+  code also writes is an error (#41): the handler may run between the read
+  and the write, and its write would be lost. A whole-register write, a
+  field write inside `critical`, and a field write in handler code (which
+  isn't interrupted by other handlers here) are fine.
+- **No waiting where nothing can signal.** `wait` in handler code never
+  returns (#42): the interrupt that would signal it can't run until the
+  handler returns. Neither does `wait` inside `critical`.
+- **No early exit from `critical`.** A `return` inside it would leave
+  interrupts disabled.
+
+The model assumes one core and handlers that don't preempt each other
+(one priority level). Handlers have no access to `main`'s buffers — they
+have no parameters and PHASE has no globals — so ownership hand-offs
+between a handler and `main` (a DMA half-transfer handler giving `main`
+the half it just finished) are not expressible yet; events carry the
+"it happened", and registers the data.
+
+In C, an event is a `volatile bool`; `critical` saves PRIMASK and executes
+`cpsid i`, restoring PRIMASK at the end; `wait` tests and clears its event
+with interrupts disabled and sleeps with `wfi` in between (which wakes on
+a pending interrupt even while they are disabled), so a signal can't slip
+in between the test and the sleep. Each handler becomes `IRQn_Handler`,
+replacing a weak entry of the vector table (`runtime/hw/startup.c`). A
+host build has no interrupt sources: there, sleeping runs every handler
+once, in IRQ order — as if each one's interrupt had just arrived — and a
+`wait` that 1,000 such rounds don't satisfy stops the program with a
+message rather than hanging it.
+
 ---
 
 <a name="part-4-type-system--static-analysis"></a>
@@ -674,6 +739,10 @@ For every program `phase check` accepts, within a function body:
   field write only on a register that can also be read, and a literal
   only if it fits (§3.7); the register map itself is laid out exactly as
   declared, which the C compiler checks.
+- **Interrupts.** No field write in thread code can lose a write made by
+  an interrupt handler (it is inside `critical`, or no handler writes that
+  register); no `wait` is reachable from a handler or inside `critical`;
+  interrupts are re-enabled at the end of every `critical` block (§3.16).
 
 **Trust boundary.** `extern fn` bodies are not analyzed (§3.9): PHASE
 trusts that a kernel does only what its signature says — touches only the
@@ -732,7 +801,10 @@ if it exists, else `runtime/<stem>_extern.c`; they must be freestanding.
 with semihosting on, so the program exits cleanly when `main` returns.
 `--checked` and `--stub-externs` are host-only: the checker and the stubs
 print and exit through libc. `examples/uart_hello.phase`, a UART driver
-written in PHASE, prints "Hello from PHASE" this way.
+written in PHASE, prints "Hello from PHASE" this way, and
+`examples/timer_ticks.phase` takes five real timer interrupts (§3.16).
+`examples/devices/mps2_an385.phase` lists the board's devices and the IRQ
+numbers checked on QEMU's model: Uart0 transmit 1, Timer0 8, Timer1 9.
 
 ---
 
@@ -983,8 +1055,8 @@ a second reason. For the release, 6,000 freshly generated programs from the 1.4
 generator (2,619 accepted and run with several stub seeds each, including
 1,500 at `--chaos 0.3`) produced no violations. After the 2.0
 changes, another 4,000 (1,710 accepted and run, including 1,000 at
-`--chaos 0.3`) produced none either, and after 2.1's, another 4,000
-(1,740 accepted and run).
+`--chaos 0.3`) produced none either; after 2.1's, another 4,000
+(1,740 accepted and run), and after 2.2's, another 4,000 (1,816).
 
 **Scope of the evidence.** Struct entities other than typestate values
 are not tracked at run time; the generator covers one typestate machine,
@@ -1093,6 +1165,8 @@ for the analyzer and as the security narrative for the portfolio write-up.
 | 38 | Two registers at one offset | A copy-pasted register map | "register `Timer.VALUE` (bytes 0x4..0x8) overlaps `Timer.CTRL`" |
 | 39 | Read-only data passed to a parameter with no access mode | A legacy API that may write what it is given | "`checksum` doesn't declare whether it writes its parameter `x`, but `view` is read-only" |
 | 40 | Two devices at one address | A copy-pasted base address in a board file | "devices `DebugUart` (0x40005000..0x40005014) and `ModemUart` (0x40005000..0x40005014) overlap" |
+| 41 | A field write an interrupt handler can split | A lost register update: a one-shot timer that keeps firing | "writing field `Timer0.CTRL.ENABLE` reads `Timer0.CTRL` … interrupt handler `on_timer0` (IRQ 8) also writes `Timer0.CTRL`" |
+| 42 | Waiting inside an interrupt handler | A handler that sleeps forever, blocking its priority level | "`wait tx_done` in interrupt handler code would never return" |
 
 Every file in `examples/bug_gallery/` carries its expected error in an
 `// Expected: "..."` header, and a test asserts the analyzer produces it.
@@ -1300,6 +1374,14 @@ devices may no longer overlap or be misaligned. Output:
 with each address checked on QEMU's board model, imported by
 `examples/uart_hello.phase`; bug-gallery #40; and "PHASE in 15 minutes"
 (`docs/tutorial/`), generated by running its programs.
+
+**v2.2 — Interrupts**
+`interrupt fn` handlers bound to IRQs, `event`s they signal and `main`
+waits for, and `critical` sections (§3.16). The analyzer follows the call
+graph from every handler to catch a field write a handler can split and a
+`wait` that can never return. Output: `examples/timer_ticks.phase` takes
+five real timer interrupts on QEMU's MPS2 AN385 model; bug-gallery
+#41–#42; a tutorial step.
 
 **M12 — LLVM backend** *(not yet started)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead

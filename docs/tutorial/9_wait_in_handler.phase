@@ -1,0 +1,18 @@
+import "../../examples/devices/mps2_an385.phase";
+
+event tick;
+event sent;
+
+interrupt fn on_timer0() @ irq 8 {
+    volatile_write(Timer0.INT.PENDING, 1);
+    volatile_write(Uart0.DATA, 46);
+    wait sent;                                   // for the UART to finish
+}
+
+interrupt fn on_uart0_tx() @ irq 1 {
+    volatile_write(Uart0.INTSTATUS.TX, 1);
+    signal sent;
+}
+
+fn main() {
+}

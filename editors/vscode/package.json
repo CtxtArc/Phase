@@ -2,7 +2,7 @@
   "name": "phase-language",
   "displayName": "PHASE",
   "description": "PHASE language support: syntax highlighting, and the compiler's own diagnostics inline through `phase lsp`.",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "publisher": "phase-lang",
   "license": "Apache-2.0",
   "engines": {

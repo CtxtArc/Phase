@@ -685,6 +685,46 @@ must also keep its registers aligned.
 
 ---
 
+## v2.2 additions
+
+v2.2 added interrupt handlers, events and critical sections (spec §3.16).
+These two are the classic ways interrupt code goes wrong.
+
+## #41 — A read-modify-write an interrupt can split
+
+**`examples/bug_gallery/interrupted_field_write.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html) —
+Concurrent Execution using Shared Resource with Improper Synchronization.
+
+**Real-world precedent:** `REG |= BIT;` in thread code on a register an
+interrupt handler also changes — one of the most common embedded race
+conditions, and the reason CMSIS and every RTOS provide critical-section
+macros. The handler runs between the load and the store, and the store
+writes its change away.
+
+**What PHASE does:** follows the call graph from `main` and from every
+handler; a field write in thread code to a register handler code writes
+must be inside `critical { }`.
+
+---
+
+## #42 — Waiting inside an interrupt handler
+
+**`examples/bug_gallery/wait_in_handler.phase`**
+
+**Category:** [CWE-833](https://cwe.mitre.org/data/definitions/833.html) —
+Deadlock.
+
+**Real-world precedent:** a handler (or a helper it calls) that blocks on
+something only another interrupt — or the code it interrupted — can
+deliver: the system hangs with that priority level masked.
+
+**What PHASE does:** a `wait` reachable from any handler, or inside
+`critical`, is an error, with the call chain from the handler.
+
+---
+
 ## Summary table
 
 | # | Bug-gallery file | CWE | Named real-world precedent |
@@ -729,3 +769,5 @@ must also keep its registers aligned.
 | 38 | `overlapping_registers.phase` | CWE-684 | a copy-pasted register map |
 | 39 | `read_only_to_unannotated_param.phase` | CWE-362 | a legacy API that may write what it is given |
 | 40 | `overlapping_devices.phase` | CWE-684 | a copy-pasted base address in a board file |
+| 41 | `interrupted_field_write.phase` | CWE-362 | `REG \|= BIT` racing an interrupt handler |
+| 42 | `wait_in_handler.phase` | CWE-833 | a handler blocking on an interrupt that can't run |
