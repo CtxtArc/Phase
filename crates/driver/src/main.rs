@@ -48,13 +48,14 @@ options:
                                program's extern fns instead of requiring
                                runtime/<stem>_extern.c; scalar results come
                                from a PRNG seeded by PHASE_STUB_SEED
-  --target=host|mps2-an385     (build) host (default): compile with `cc` and
-                               simulate devices; mps2-an385: cross-compile
-                               for the ARM MPS2 AN385 board (Cortex-M3) with
-                               arm-none-eabi-gcc into <stem>.elf, devices at
-                               their real addresses
+  --target=TARGET              (build) host (default): compile with `cc` and
+                               simulate devices; mps2-an385 / mps2-an505:
+                               cross-compile for the ARM MPS2 AN385 board
+                               (Cortex-M3) or AN505 board (Cortex-M33, with
+                               PL081 DMA controllers) with arm-none-eabi-gcc
+                               into <stem>.elf, devices at their real addresses
   --run                        (build) run the result: the host binary, or the
-                               .elf under qemu-system-arm -M mps2-an385
+                               .elf under qemu-system-arm -M <board>
 
 `build` writes <project>/build/<stem>.gen.{{c,h}} and <project>/build/<stem>,
 where <project> is the nearest directory at or above <file> that contains a
@@ -205,8 +206,10 @@ fn main() -> ExitCode {
                 Some(v) => v.to_string(),
                 None => args.next().unwrap_or_default(),
             };
-            if !matches!(v.as_str(), "host" | "mps2-an385") {
-                eprintln!("error: unknown --target '{v}' (expected host or mps2-an385)");
+            if v != "host" && Board::named(&v).is_none() {
+                eprintln!(
+                    "error: unknown --target '{v}' (expected host, mps2-an385 or mps2-an505)"
+                );
                 return ExitCode::FAILURE;
             }
             target = v;
@@ -401,7 +404,7 @@ fn main() -> ExitCode {
             //     actually declares any `extern fn`, and only if a
             //     matching file exists.
             let needs_extern_runtime = !pir.extern_fns.is_empty();
-            if target == "mps2-an385" {
+            if let Some(board) = Board::named(&target) {
                 if checked || stub_externs {
                     eprintln!(
                         "error: --checked and --stub-externs need a host build (the checker and \
@@ -410,6 +413,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 return build_mps2(&BuildMps2 {
+                    board,
                     stem: &stem,
                     runtime_dir: &runtime_dir,
                     build_dir: &build_dir,
@@ -523,7 +527,40 @@ fn run_and_report(mut cmd: Command, what: &str) -> ExitCode {
     }
 }
 
+/// A bare-metal target board: how to compile for it and run it on QEMU.
+#[derive(Clone, Copy)]
+struct Board {
+    /// `--target=` name, which is also QEMU's `-M` machine name.
+    name: &'static str,
+    cpu: &'static str,
+    linker_script: &'static str,
+    /// Defined for the C (the runtime picks the board's addresses by it).
+    define: &'static str,
+}
+
+impl Board {
+    const ALL: [Board; 2] = [
+        Board {
+            name: "mps2-an385",
+            cpu: "cortex-m3",
+            linker_script: "mps2an385.ld",
+            define: "PHASE_BOARD_MPS2_AN385",
+        },
+        Board {
+            name: "mps2-an505",
+            cpu: "cortex-m33",
+            linker_script: "mps2an505.ld",
+            define: "PHASE_BOARD_MPS2_AN505",
+        },
+    ];
+
+    fn named(name: &str) -> Option<Board> {
+        Self::ALL.into_iter().find(|b| b.name == name)
+    }
+}
+
 struct BuildMps2<'a> {
+    board: Board,
     stem: &'a str,
     runtime_dir: &'a Path,
     build_dir: &'a Path,
@@ -533,22 +570,24 @@ struct BuildMps2<'a> {
     run: bool,
 }
 
-/// `--target=mps2-an385`: cross-compile the generated C with the
-/// bare-metal runtime in runtime/hw/ (vector table and startup, linker
-/// script, real-hardware `sync` waits) for the ARM MPS2 AN385 board, and
+/// `--target=mps2-an385` / `mps2-an505`: cross-compile the generated C with
+/// the bare-metal runtime in runtime/hw/ (vector table and startup, linker
+/// script, real-hardware `sync` waits) for an ARM MPS2 board, and
 /// optionally run it on QEMU's model of that board. `PHASE_TARGET_HW` puts
 /// every `device` at its declared address.
 fn build_mps2(b: &BuildMps2) -> ExitCode {
+    let board = b.board;
     let hw = b.runtime_dir.join("hw");
     let needed = [
         "startup.c",
         "phase_runtime_hw.c",
         "libc_min.c",
-        "mps2an385.ld",
+        board.linker_script,
     ];
     if let Some(missing) = needed.iter().find(|f| !hw.join(f).is_file()) {
         eprintln!(
-            "error: --target=mps2-an385 needs '{}', which was not found",
+            "error: --target={} needs '{}', which was not found",
+            board.name,
             hw.join(missing).display()
         );
         return ExitCode::FAILURE;
@@ -573,8 +612,9 @@ fn build_mps2(b: &BuildMps2) -> ExitCode {
     let cc = env::var("PHASE_ARM_CC").unwrap_or_else(|_| "arm-none-eabi-gcc".to_string());
     let elf = b.build_dir.join(format!("{}.elf", b.stem));
     let mut cmd = Command::new(&cc);
+    cmd.arg(format!("-mcpu={}", board.cpu));
+    cmd.arg(format!("-D{}=1", board.define));
     cmd.args([
-        "-mcpu=cortex-m3",
         "-mthumb",
         "-ffreestanding",
         "-nostdlib",
@@ -585,7 +625,7 @@ fn build_mps2(b: &BuildMps2) -> ExitCode {
         "-DPHASE_TARGET_HW=1",
     ])
     .arg("-T")
-    .arg(hw.join("mps2an385.ld"))
+    .arg(hw.join(board.linker_script))
     .arg("-I")
     .arg(b.build_dir)
     .arg("-I")
@@ -615,8 +655,9 @@ fn build_mps2(b: &BuildMps2) -> ExitCode {
         }
         Err(e) => {
             eprintln!(
-                "error: could not invoke '{cc}' ({e}); --target=mps2-an385 needs the GNU Arm \
-                 Embedded toolchain on PATH (or PHASE_ARM_CC set to it)"
+                "error: could not invoke '{cc}' ({e}); --target={} needs the GNU Arm \
+                 Embedded toolchain on PATH (or PHASE_ARM_CC set to it)",
+                board.name
             );
             return ExitCode::FAILURE;
         }
@@ -624,7 +665,7 @@ fn build_mps2(b: &BuildMps2) -> ExitCode {
     let elf_s = elf.display().to_string();
     let qemu_args = [
         "-M",
-        "mps2-an385",
+        board.name,
         "-nographic",
         "-monitor",
         "none",
@@ -633,14 +674,17 @@ fn build_mps2(b: &BuildMps2) -> ExitCode {
         "-kernel",
     ];
     if !b.run {
-        println!("OK: built {elf_s} for mps2-an385");
+        println!("OK: built {elf_s} for {}", board.name);
         println!(
             "    run it: qemu-system-arm {} {elf_s}",
             qemu_args.join(" ")
         );
         return ExitCode::SUCCESS;
     }
-    println!("OK: built {elf_s} for mps2-an385; running it on qemu-system-arm");
+    println!(
+        "OK: built {elf_s} for {}; running it on qemu-system-arm",
+        board.name
+    );
     let qemu = env::var("PHASE_QEMU").unwrap_or_else(|_| "qemu-system-arm".to_string());
     let mut cmd = Command::new(&qemu);
     cmd.args(qemu_args).arg(&elf);

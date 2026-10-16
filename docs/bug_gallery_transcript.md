@@ -28,6 +28,12 @@ OK: examples/circular_dma.phase parsed and passed domain/ownership analysis (1 e
 OK: examples/counting_loop.phase parsed and passed domain/ownership analysis (0 entities, 1 fn)
 ```
 
+### `examples/dma_stream.phase`
+
+```
+OK: examples/dma_stream.phase parsed and passed domain/ownership analysis (0 entities, 4 fns, 2 files)
+```
+
 ### `examples/hw_uart_echo.phase`
 
 ```

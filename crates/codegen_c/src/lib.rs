@@ -442,7 +442,7 @@ fn format_checked_reg_write(r: &RegRef, value: &str, has_handlers: bool, pad: &s
             ));
             if has_handlers {
                 s.push_str(&format!(
-                    "{pad}    if (phase_chk_rmw_begin(&{reg}, \"{name}\")) {{\n{pad}        phase_run_handlers(); /* an interrupt between the read and the write */\n{pad}    }}\n{pad}    phase_chk_rmw_end();\n"
+                    "{pad}    if (phase_chk_rmw_begin(&{reg}, \"{name}\")) {{\n{pad}        phase_interrupt_now(); /* an interrupt between the read and the write */\n{pad}    }}\n{pad}    phase_chk_rmw_end();\n"
                 ));
             }
             s.push_str(&format!(
@@ -649,7 +649,7 @@ fn format_interrupt_support(program: &PirProgram, checked: bool) -> String {
     s.push_str(&format!(
         "{unused}static void phase_irq_restore(uint32_t m) {{\n    (void)m;\n}}\n"
     ));
-    s.push_str("/* Host build: nothing raises interrupts, so sleeping runs every handler\n * once, in IRQ order, as if each one's interrupt had just arrived. First,\n * phase_sim_hardware() -- if the program's C side defines it -- plays the\n * hardware: it can set the status bits the handlers test. */\n");
+    s.push_str("/* Host build: nothing raises interrupts, so sleeping runs every handler\n * once, in IRQ order, as if each one's interrupt had just arrived. First,\n * phase_sim_hardware() -- if the program's C side defines it -- plays the\n * hardware: it can set the status bits the handlers test. A checked build\n * also does this in the middle of every field write (see phase_check.h). */\n");
     s.push_str("#if defined(__GNUC__)\nextern void phase_sim_hardware(void) __attribute__((weak));\n#endif\n");
     s.push_str(&format!(
         "{unused}static void phase_run_handlers(void) {{\n"
@@ -665,9 +665,15 @@ fn format_interrupt_support(program: &PirProgram, checked: bool) -> String {
         }
     }
     s.push_str("}\n");
-    s.push_str(&format!("{unused}static void phase_sleep(void) {{\n"));
+    s.push_str("/* The hardware moves on, then every handler runs: an interrupt, now. */\n");
+    s.push_str(&format!(
+        "{unused}static void phase_interrupt_now(void) {{\n"
+    ));
     s.push_str("#if defined(__GNUC__)\n    if (phase_sim_hardware) {\n        phase_sim_hardware();\n    }\n#endif\n    phase_run_handlers();\n");
-    s.push_str("}\n#endif\n");
+    s.push_str("}\n");
+    s.push_str(&format!(
+        "{unused}static void phase_sleep(void) {{\n    phase_interrupt_now();\n}}\n#endif\n"
+    ));
     s.push_str("/* `wait E`: sleep until a handler signals E, then clear it. The check and\n * the clear happen with interrupts off, so no signal is lost in between. */\n");
     s.push_str(&format!(
         "{unused}static void phase_wait(volatile bool *event, const char *name) {{\n"
@@ -2181,6 +2187,7 @@ mod tests {
             // Host: sleeping runs the handlers.
             "static void phase_run_handlers(void) {\n    on_timer();\n}",
             "#endif\n    phase_run_handlers();\n}",
+            "static void phase_sleep(void) {\n    phase_interrupt_now();\n}",
             "extern void phase_sim_hardware(void) __attribute__((weak));",
             "phase_event_tick = true;",
             "phase_wait(&phase_event_tick, \"tick\");",

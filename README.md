@@ -207,7 +207,10 @@ devices at one address are an error.
 `phase build --target=mps2-an385 --run examples/uart_hello.phase` compiles
 a UART driver written entirely in PHASE for an ARM Cortex-M3 board and
 runs it on QEMU's model of it — `Hello from PHASE` comes out of the real
-UART0 data register.
+UART0 data register. `--target=mps2-an505` builds for a Cortex-M33 board
+with real DMA controllers: `examples/dma_stream.phase` streams ten blocks
+through its PL081, each half of the buffer handed to `main` by the
+controller's interrupt.
 
 Interrupts are part of the language too — a handler bound to its IRQ,
 an event it signals, and `main` sleeping until it does:
@@ -319,7 +322,7 @@ runtime/
   phase_runtime.h/.c   generic sim_dma_wait/sim_device_wait, always linked
   phase_check.h/.c     runtime ownership checker, linked by `phase build --checked`
   *_extern.c           one per demo program, implementing that program's extern fns
-  hw/                  real ARM Cortex-M3 backend for --target=mps2-an385 (startup,
+  hw/                  bare-metal ARM backend for --target=mps2-an385 / mps2-an505 (startup,
                        linker script, real sim_dma_wait/sim_device_wait, memset/memcpy)
 
 editors/
@@ -343,7 +346,7 @@ docs/
 scripts/
   capture_bug_gallery.sh      regenerates the transcript from real compiler output
   render_tutorial.py          regenerates docs/tutorial/README.md by running its programs
-  build_hw_demo.sh            runs the hardware examples with --target=mps2-an385 --run
+  build_hw_demo.sh            runs the hardware examples on QEMU (--target=<board> --run)
 ```
 
 ## Building and testing
@@ -353,7 +356,7 @@ scripts/
 `qemu-system-arm` (`sudo apt-get install --no-install-recommends
 gcc-arm-none-eabi qemu-system-arm`) — everything else works without them,
 and the one test that needs them
-(`hardware_examples_run_on_the_mps2_an385_board_under_qemu`) skips itself
+(`hardware_examples_run_on_the_mps2_boards_under_qemu`) skips itself
 with a clear message if they're missing. (CI sets
 `PHASE_REQUIRE_HW_TOOLS=1`, which turns that skip into a failure.)
 
@@ -477,6 +480,13 @@ each interrupt and signals an event, and a `main` that sleeps in
 `wait tick` and prints a dot per tick — five real interrupts on QEMU's
 board model.
 
+`examples/dma_stream.phase`: real DMA. Built with `--target=mps2-an505
+--run`, the AN505's PL081 controller fills each half of a buffer in turn,
+its transfer-complete interrupt hands the half to `main`
+(`wait lo_done for lo`), and `main` checks all of it before handing it
+back: ten blocks, each a real (emulated) transfer. A host build runs the
+same program against a simulated PL081.
+
 `examples/hw_uart_echo.phase`: a buffer handed to the UART as a device,
 built for the same board — its `sync()` is a real register poll on real
 (emulated) hardware, not the host's simulated address space.
@@ -526,9 +536,10 @@ has to discover the hard way:
   but not at run time, and the fuzzer uses three buffer types, one
   typestate machine and one device. Their silence is strong evidence for
   the rules they exercise, not a proof of everything.
-- **One hardware target.** `--target=mps2-an385` (ARM Cortex-M3, validated
-  on QEMU's model of the board). Another board needs its own startup code,
-  linker script and wait functions under `runtime/`. There are no arrays
+- **Two hardware targets, both emulated.** `--target=mps2-an385` (ARM
+  Cortex-M3) and `--target=mps2-an505` (Cortex-M33 with PL081 DMA),
+  validated on QEMU's models of the boards, not yet on silicon. Another
+  board needs its own startup code, linker script and wait functions under `runtime/`. There are no arrays
   of registers yet (a FIFO of 16 identical registers is 16 declarations).
 - **Interrupts are modeled simply.** One core, one priority level
   (handlers don't preempt each other), and events are flags, not
@@ -577,9 +588,8 @@ Likely next:
 - **The VS Code extension**, packaged and tested.
 - **M12 — An LLVM backend**, removing the dependency on an external `cc`
   ([`phase_specification.md`](phase_specification.md) §9).
-- **A real DMA controller** — the ping-pong pipeline on a board with one
-  (e.g. an STM32 Nucleo), instead of QEMU's MPS2 model, which has none —
-  with its registers declared as a `device`.
+- **Real boards** — an STM32 Nucleo, with its own DMA controller and
+  interrupts, run on silicon instead of QEMU.
 - **More from the language server** — completion of names and register
   fields, rename.
 

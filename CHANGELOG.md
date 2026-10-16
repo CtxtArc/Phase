@@ -4,6 +4,31 @@ All notable changes to PHASE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`--target=mps2-an505`**: the MPS2 AN505 board (Cortex-M33 with
+  TrustZone, run in the Secure state), on `qemu-system-arm -M mps2-an505`.
+  `examples/devices/mps2_an505.phase` declares its UARTs, NVIC and four
+  PL081 DMA controllers.
+- `examples/dma_stream.phase`: ten blocks through a real (emulated) PL081
+  DMA controller, each half of a split buffer handed to `main` by the
+  controller's transfer-complete interrupt; part of the QEMU hardware
+  test. The same program runs on the host against a simulated PL081.
+- The vector table covers 128 IRQs.
+
+### Changed
+
+- A checked build lets the hardware move on too (`phase_sim_hardware()`)
+  when it runs the interrupt handlers in the middle of a field write, as
+  it does when `wait` sleeps.
+
+### Fixed
+
+- The CLI tests of checked builds ran the unchecked binary; they now run
+  the checked one.
+
 ## [2.3.0] — 2026-10-16
 
 Interrupts hand over buffers: `wait half_done for lo;` lets the interrupt

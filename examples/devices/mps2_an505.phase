@@ -1,0 +1,88 @@
+// Board support for the ARM MPS2 AN505 (Cortex-M33 with TrustZone): its
+// CMSDK UARTs, its four PL081 DMA controllers and the NVIC. Import it and
+// use the devices:
+//
+//     import "devices/mps2_an505.phase";
+//
+// A program built with `--target=mps2-an505` runs in the Secure state, so
+// every peripheral is at its Secure alias (the Non-secure address with bit
+// 28 set: UART0 is at 0x40200000 for Non-secure code, 0x50200000 here).
+// Addresses and IRQ numbers as QEMU's model of the board (`-M mps2-an505`,
+// qemu/hw/arm/mps2-tz.c) places them; each device here was checked there.
+
+// CMSDK APB UART (the same peripheral as on the AN385).
+device type CmsdkUart {
+    DATA:      read write u32 @ 0x00 { BYTE: bits 0..=7 }
+    STATE:     read write u32 @ 0x04 { TXFULL: bit 0, RXFULL: bit 1, TXOVR: bit 2, RXOVR: bit 3 }
+    CTRL:      read write u32 @ 0x08 = 0 { TX_EN: bit 0, RX_EN: bit 1, TX_IRQ_EN: bit 2, RX_IRQ_EN: bit 3 }
+    INTSTATUS: read write u32 @ 0x0C { TX: bit 0, RX: bit 1 }
+    BAUDDIV:   read write u32 @ 0x10 { DIV: bits 0..=19 }
+}
+
+device Uart0: CmsdkUart @ 0x50200000;
+device Uart1: CmsdkUart @ 0x50201000;
+device Uart2: CmsdkUart @ 0x50202000;
+device Uart3: CmsdkUart @ 0x50203000;
+device Uart4: CmsdkUart @ 0x50204000;
+
+// ARM PrimeCell PL081 DMA controller: two channels. Each channel copies
+// TransferSize elements from SRC to DEST, and with CONTROL.TC_IRQ set,
+// raises its bit of INTTCSTATUS when done. (The PL081 TRM, ARM DDI 0218.)
+//
+// Channel registers: SRC and DEST are addresses, which is the C side's
+// job (PHASE has no buffer addresses); the rest can be written here.
+device type Pl081 {
+    INTSTATUS:      read u32 @ 0x000 { CH0: bit 0, CH1: bit 1 }
+    // Terminal count (transfer done), per channel; write 1 to INTTCCLEAR
+    // to clear a bit.
+    INTTCSTATUS:    read u32 @ 0x004 { CH0: bit 0, CH1: bit 1 }
+    INTTCCLEAR:     write u32 @ 0x008;
+    INTERRSTATUS:   read u32 @ 0x00C { CH0: bit 0, CH1: bit 1 }
+    INTERRCLEAR:    write u32 @ 0x010;
+    RAWINTTCSTATUS: read u32 @ 0x014 { CH0: bit 0, CH1: bit 1 }
+    ENABLEDCHANNELS: read u32 @ 0x01C { CH0: bit 0, CH1: bit 1 }
+    CONFIG:         read write u32 @ 0x030 = 0 { ENABLE: bit 0 }
+
+    C0SRC:     read write u32 @ 0x100;
+    C0DEST:    read write u32 @ 0x104;
+    C0LLI:     read write u32 @ 0x108;
+    C0CONTROL: read write u32 @ 0x10C {
+        SIZE: bits 0..=11, SWIDTH: bits 18..=20, DWIDTH: bits 21..=23,
+        SRC_INC: bit 26, DEST_INC: bit 27, TC_IRQ: bit 31
+    }
+    C0CONFIG:  read write u32 @ 0x110 {
+        ENABLE: bit 0, FLOW: bits 11..=13, ERR_IRQ: bit 14, TC_IRQ: bit 15, HALT: bit 18
+    }
+
+    C1SRC:     read write u32 @ 0x120;
+    C1DEST:    read write u32 @ 0x124;
+    C1LLI:     read write u32 @ 0x128;
+    C1CONTROL: read write u32 @ 0x12C {
+        SIZE: bits 0..=11, SWIDTH: bits 18..=20, DWIDTH: bits 21..=23,
+        SRC_INC: bit 26, DEST_INC: bit 27, TC_IRQ: bit 31
+    }
+    C1CONFIG:  read write u32 @ 0x130 {
+        ENABLE: bit 0, FLOW: bits 11..=13, ERR_IRQ: bit 14, TC_IRQ: bit 15, HALT: bit 18
+    }
+}
+
+device Dma0: Pl081 @ 0x50110000;
+device Dma1: Pl081 @ 0x50111000;
+device Dma2: Pl081 @ 0x50112000;
+device Dma3: Pl081 @ 0x50113000;
+
+// Cortex-M33 NVIC: interrupt enables, 32 IRQs per register. Writing 1 to
+// a bit of ISERn enables that IRQ, of ICERn disables it.
+//
+// IRQ numbers: 33 Uart0 transmit; the PL081s' transfer-complete
+// interrupts are 57 (Dma0), 60 (Dma1), 63 (Dma2) and 66 (Dma3).
+device type CortexM33Nvic {
+    ISER0: read write u32 @ 0x000;
+    ISER1: read write u32 @ 0x004 { UART0_TX: bit 1, DMA0_TC: bit 25, DMA1_TC: bit 28, DMA2_TC: bit 31 }
+    ISER2: read write u32 @ 0x008 { DMA3_TC: bit 2 }
+    ICER0: read write u32 @ 0x080;
+    ICER1: read write u32 @ 0x084 { UART0_TX: bit 1, DMA0_TC: bit 25, DMA1_TC: bit 28, DMA2_TC: bit 31 }
+    ICER2: read write u32 @ 0x088 { DMA3_TC: bit 2 }
+}
+
+device Nvic: CortexM33Nvic @ 0xE000E100;

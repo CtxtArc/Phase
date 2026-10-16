@@ -19,7 +19,11 @@
  * completion register the same way -- same pattern, different register.
  */
 
+#if defined(PHASE_BOARD_MPS2_AN505)
+#include "mps2an505.h"
+#else
 #include "mps2an385.h"
+#endif
 #include "phase_runtime.h"
 
 static void wait_for_uart_tx_drain(void) {

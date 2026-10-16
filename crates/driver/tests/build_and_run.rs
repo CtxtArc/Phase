@@ -302,7 +302,7 @@ fn counting_loop_builds_and_runs_exactly_five_iterations() {
 /// CI sets `PHASE_REQUIRE_HW_TOOLS=1`, which turns that skip into a hard
 /// failure so a broken toolchain install can't make the job silently green.
 #[test]
-fn hardware_examples_run_on_the_mps2_an385_board_under_qemu() {
+fn hardware_examples_run_on_the_mps2_boards_under_qemu() {
     let have = |tool: &str| {
         Command::new(tool)
             .arg("--version")
@@ -316,23 +316,30 @@ fn hardware_examples_run_on_the_mps2_an385_board_under_qemu() {
              qemu-system-arm is not installed"
         );
         eprintln!(
-            "skipping hardware_examples_run_on_the_mps2_an385_board_under_qemu: \
+            "skipping hardware_examples_run_on_the_mps2_boards_under_qemu: \
              arm-none-eabi-gcc and/or qemu-system-arm not installed \
              (see scripts/build_hw_demo.sh for what this test needs)"
         );
         return;
     }
     let root = workspace_root();
-    for (example, expected) in [
-        ("uart_hello", "Hello from PHASE\n"),
-        ("hw_uart_echo", "PHASE"),
+    const STREAM: &str =
+        "block 0 in lo: ok\nblock 1 in hi: ok\nblock 2 in lo: ok\nblock 3 in hi: ok\n\
+         block 4 in lo: ok\nblock 5 in hi: ok\nblock 6 in lo: ok\nblock 7 in hi: ok\n\
+         ring: blocks 8 and 9\n";
+    for (board, example, expected) in [
+        ("mps2-an385", "uart_hello", "Hello from PHASE\n"),
+        ("mps2-an385", "hw_uart_echo", "PHASE"),
         // Five real timer interrupts, each waking `wait tick`.
-        ("timer_ticks", ".....\n"),
+        ("mps2-an385", "timer_ticks", ".....\n"),
+        // Ten real PL081 DMA transfers, each half handed to `main` by the
+        // controller's transfer-complete interrupt.
+        ("mps2-an505", "dma_stream", STREAM),
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_phase"))
             .current_dir(std::env::temp_dir())
             .env_remove("PHASE_RUNTIME_DIR")
-            .args(["build", "--target=mps2-an385", "--run"])
+            .args(["build", &format!("--target={board}"), "--run"])
             .arg(root.join(format!("examples/{example}.phase")))
             .output()
             .unwrap();
@@ -343,7 +350,7 @@ fn hardware_examples_run_on_the_mps2_an385_board_under_qemu() {
         assert!(stderr.is_empty(), "{example}: {stderr}");
         assert!(
             stdout.ends_with(expected),
-            "expected real UART0 output {expected:?} from the QEMU-emulated MPS2 AN385 \
+            "expected real UART0 output {expected:?} from the QEMU-emulated {board} \
              board, got: {stdout:?}"
         );
         assert!(root.join(format!("build/{example}.elf")).is_file());

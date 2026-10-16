@@ -1,0 +1,97 @@
+// v2.3 example: a DMA stream on a real (emulated) DMA controller.
+//
+// The AN505's PL081 DMA controller fills the two halves of a buffer, one
+// channel per half, and raises an interrupt as each finishes. The handler
+// hands the finished half to `main` (`wait lo_done for lo`), which checks
+// it and gives it back for the next block -- the CPU never touches a half
+// the engine is writing.
+//
+//   phase build --target=mps2-an505 --run examples/dma_stream.phase
+//
+// runs it on QEMU's model of the board, where each block is a real DMA
+// transfer and each hand-off a real interrupt. A host build runs the same
+// program against a simulated PL081 (runtime/dma_stream_extern.c).
+
+import "devices/mps2_an505.phase";
+
+event lo_done;
+event hi_done;
+
+// Dma0's transfer-complete interrupt: which channel finished?
+interrupt fn dma0_tc() @ irq 57 {
+    if volatile_read(Dma0.INTTCSTATUS.CH0) == 1 {
+        volatile_write(Dma0.INTTCCLEAR, 1);   // write 1 to clear
+        signal lo_done;
+    }
+    if volatile_read(Dma0.INTTCSTATUS.CH1) == 1 {
+        volatile_write(Dma0.INTTCCLEAR, 2);
+        signal hi_done;
+    }
+}
+
+// Point a channel at a half: SRC is the next block of samples, DEST the
+// half (addresses are the C side's job). From here on the engine owns it.
+extern fn aim_ch0(dest: write buffer<u32, 16> @RAM -> @DMA);
+extern fn aim_ch1(dest: write buffer<u32, 16> @RAM -> @DMA);
+
+extern fn check(h: read buffer<u32, 16> @RAM);
+extern fn summarize(x: read buffer<u32, 32> @RAM);
+
+// Start channel 0: 16 words, both addresses incrementing, an interrupt
+// when done.
+fn fill_lo(dest: write buffer<u32, 16> @RAM -> @DMA) {
+    aim_ch0(dest);
+    volatile_write(Dma0.C0CONTROL, 0);
+    volatile_write(Dma0.C0CONTROL.SIZE, 16);
+    volatile_write(Dma0.C0CONTROL.SWIDTH, 2);    // 32-bit reads
+    volatile_write(Dma0.C0CONTROL.DWIDTH, 2);    // 32-bit writes
+    volatile_write(Dma0.C0CONTROL.SRC_INC, 1);
+    volatile_write(Dma0.C0CONTROL.DEST_INC, 1);
+    volatile_write(Dma0.C0CONTROL.TC_IRQ, 1);
+    volatile_write(Dma0.C0CONFIG, 0x8001);       // TC_IRQ and ENABLE: go
+    // Harmless on the chip; QEMU's PL081 only updates its interrupt line
+    // on a write to a controller register.
+    volatile_write(Dma0.CONFIG.ENABLE, 1);
+}
+
+fn fill_hi(dest: write buffer<u32, 16> @RAM -> @DMA) {
+    aim_ch1(dest);
+    volatile_write(Dma0.C1CONTROL, 0);
+    volatile_write(Dma0.C1CONTROL.SIZE, 16);
+    volatile_write(Dma0.C1CONTROL.SWIDTH, 2);
+    volatile_write(Dma0.C1CONTROL.DWIDTH, 2);
+    volatile_write(Dma0.C1CONTROL.SRC_INC, 1);
+    volatile_write(Dma0.C1CONTROL.DEST_INC, 1);
+    volatile_write(Dma0.C1CONTROL.TC_IRQ, 1);
+    volatile_write(Dma0.C1CONFIG, 0x8001);
+    volatile_write(Dma0.CONFIG.ENABLE, 1);
+}
+
+fn main() {
+    volatile_write(Uart0.BAUDDIV.DIV, 16);
+    volatile_write(Uart0.CTRL.TX_EN, 1);
+    volatile_write(Dma0.CONFIG.ENABLE, 1);        // the controller
+    volatile_write(Nvic.ISER1, 0x2000000);        // IRQ 57 (DMA0_TC)
+
+    buffer<u32, 32> ring @RAM;
+    let n: u32 = 0;
+    split ring into lo, hi;
+    fill_lo(lo);
+    fill_hi(hi);
+
+    while n < 4 {
+        wait lo_done for lo;    // channel 0 is done with lo
+        check(lo);
+        fill_lo(lo);            // and gets it back for the next block
+        wait hi_done for hi;
+        check(hi);
+        fill_hi(hi);
+        n = n + 1;
+    }
+
+    // Let the last two transfers finish, then use the buffer whole.
+    wait lo_done for lo;
+    wait hi_done for hi;
+    join lo, hi into ring;
+    summarize(ring);
+}

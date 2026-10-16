@@ -850,6 +850,31 @@ written in PHASE, prints "Hello from PHASE" this way, and
 `examples/devices/mps2_an385.phase` lists the board's devices and the IRQ
 numbers checked on QEMU's model: Uart0 transmit 1, Timer0 8, Timer1 9.
 
+**A board with a DMA controller (v2.3).** `--target=mps2-an505` builds for
+the MPS2 AN505 (Cortex-M33 with TrustZone) and runs on `qemu-system-arm
+-M mps2-an505`. The CPU starts in the Secure state with its vector table
+at 0x10000000, so `runtime/hw/mps2an505.ld` links code at the Secure alias
+of SSRAM1 and data at that of SSRAM2 (0x38000000), and every peripheral is
+used at its Secure alias (Non-secure address + 0x10000000). The vector
+table in `runtime/hw/startup.c` has 128 IRQ entries, enough for the
+AN505's 124. `examples/devices/mps2_an505.phase` declares its UARTs, NVIC
+and four ARM PL081 DMA controllers, and `examples/dma_stream.phase` streams
+ten blocks through Dma0: each channel fills one half of a split buffer,
+the controller's transfer-complete interrupt (IRQ 57) hands the half to
+`main` with `wait lo_done for lo`, and `main` checks every word of it
+before giving it back. Each transfer is a real (emulated) DMA copy and
+each hand-off a real interrupt. Two things about QEMU's PL081 model are
+worth knowing: it performs a whole memory-to-memory transfer the moment a
+channel is enabled (a real controller takes time, which the program
+doesn't depend on), and it updates its interrupt line only on writes to
+the controller's own registers, not a channel's — so the example rewrites
+`CONFIG.ENABLE` after starting a channel, which is harmless on the chip.
+QEMU's PL081 can't loop (a circular linked list of transfers would never
+finish inside one register write) and has no peripheral request lines, so
+the stream is double-buffered, not circular, and memory to memory. The
+same program also builds for the host, where `runtime/dma_stream_extern.c`
+plays the PL081 in `phase_sim_hardware()`.
+
 ---
 
 <a name="part-6-compiler-architecture"></a>

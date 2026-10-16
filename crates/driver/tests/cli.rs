@@ -433,9 +433,13 @@ fn build_and_run(stem: &str, checked: bool) -> String {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let run = Command::new(root.join(format!("build/{stem}")))
-        .output()
-        .unwrap();
+    // A checked build's binary is `<stem>-checked`.
+    let binary = if checked {
+        format!("build/{stem}-checked")
+    } else {
+        format!("build/{stem}")
+    };
+    let run = Command::new(root.join(binary)).output().unwrap();
     assert!(
         run.status.success(),
         "{}",
@@ -494,10 +498,15 @@ fn circular_dma_gets_alternating_halves_from_its_interrupt_then_rejoins_the_buff
             8,
             "{stdout}"
         );
-        assert!(
-            stdout.contains("summarize: 128 samples, halves hold blocks 6 and 7"),
-            "{stdout}"
-        );
+        // The engine runs until it is switched off. A checked build lets it
+        // (and the handlers) run in the middle of every field write, the
+        // one that switches it off included, so it may fill one more half.
+        let last = if checked {
+            "summarize: 128 samples, halves hold blocks 8 and 7"
+        } else {
+            "summarize: 128 samples, halves hold blocks 6 and 7"
+        };
+        assert!(stdout.contains(last), "{stdout}");
     }
 }
 
