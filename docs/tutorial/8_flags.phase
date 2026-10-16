@@ -1,0 +1,12 @@
+device Timer @ 0x40000000 {
+    CTRL: read write u32 @ 0x00 = 0 { ENABLE: bit 0, PRESCALE: bits 4..=7 }
+    INT:  read write u32 @ 0x0C { DONE: bit 0 w1c, OVERFLOW: bit 1 w1c, IRQ_EN: bit 4 }
+}
+
+const DIV_16: u32 = 15;               // the field holds the divider minus one
+const ON: u32 = DIV_16 << 4 | 1 << 0;
+
+fn main() {
+    volatile_write(Timer.CTRL, ON);
+    volatile_write(Timer.INT.IRQ_EN, 1);
+}

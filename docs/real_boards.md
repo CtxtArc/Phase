@@ -9,6 +9,8 @@ or similar board: the plan for 3.0. Each item says what breaks today, and
 roughly what would fix it.
 
 Items marked **(v3 core)** are the ones a real driver can't do without.
+Items marked **Done in 2.4** have been built since this list was
+written.
 
 ## 1. Describing real hardware
 
@@ -23,7 +25,10 @@ Items marked **(v3 core)** are the ones a real driver can't do without.
   copy is declared separately: `examples/devices/mps2_an505.phase` spells
   out `C0CONTROL` and `C1CONTROL`. Needed: register arrays and clusters
   with a stride (`S[8] @ 0x10 + 0x18 * n { CR, NDTR, PAR, M0AR }`),
-  indexed by a constant (`Dma2.S[0].CR`).
+  indexed by a constant (`Dma2.S[0].CR`). **Done in 2.4**, as arrays of
+  single registers with a step (`CR[8]: .. @ 0x10 step 0x18`), indexed
+  by a constant. A whole cluster per index, and an index known only at
+  run time, are still to do.
 - **Bits with side effects (v3 core).** Real status registers have bits
   cleared by writing 1 (`w1c`), cleared by reading (`rc`), or cleared by
   writing 0 (`rc_w0`, the STM32 timers' `SR`). A read-modify-write on such
@@ -31,7 +36,9 @@ Items marked **(v3 core)** are the ones a real driver can't do without.
   lost-interrupt bug that PHASE can't see, because its maps only say
   read/write. Needed: these access kinds on fields, and an error for a
   field write that would clear the others. The same applies to registers
-  whose read has a side effect (a data register that pops a FIFO).
+  whose read has a side effect (a data register that pops a FIFO). **Done
+  in 2.4** for fields (`w1c`, `rc`, `rc_w0`); a whole register whose read
+  pops a FIFO can't be declared yet.
 - **Named field values.** `MODE: bits 0..=1` takes 0–3, but only some of
   those values mean something ("input", "output", "alternate", "analog").
   Needed: enumerated values on fields, and writes checked against them.
@@ -54,7 +61,9 @@ Items marked **(v3 core)** are the ones a real driver can't do without.
   register field declared as an address, and `volatile_write(Dma2.S[0].M0AR,
   address_of(lo))` as the hand-off itself. `lo` would go to the
   hardware right there, and passing a buffer the CPU doesn't own would be
-  an error.
+  an error. **Done in 2.4**: registers declared `address` take only
+  `address_of(buf)` — the hand-off, checked like `move` — or 0, and
+  `examples/dma_stream.phase` programs the PL081 without C for it.
 - **One domain per engine (v3 core).** Today `@DMA` is one domain: two
   transfers on two streams look the same, and `sync(b)` doesn't know which
   engine to wait for. On real hardware it does, because the runtime's
@@ -123,7 +132,8 @@ Items marked **(v3 core)** are the ones a real driver can't do without.
 - **Bit operations and constants (v3 core).** Expressions have `+ - * /`
   and comparisons, but no `& | ^ << >> ~`, no `const`, and no enums. So
   register values can't be computed, and magic numbers like
-  `volatile_write(Dma0.C0CONFIG, 0x8001)` end up in the code.
+  `volatile_write(Dma0.C0CONFIG, 0x8001)` end up in the code. **Done in
+  2.4** (bit operations and `const`; enums are still to do).
 - **Arrays and indexing.** Buffers can only be handed around whole; PHASE
   code can't read `b[i]`, so all data processing lives in C. Needed:
   indexed access to CPU-owned buffers, bounds-checked, and `for` loops.
@@ -159,17 +169,20 @@ Items marked **(v3 core)** are the ones a real driver can't do without.
 
 ## Order of work for 3.0
 
+2.4 did the parts of this that don't need a physical board: bit
+operations and constants, register arrays, `w1c`/`rc`/`rc_w0` fields, and
+buffer addresses in PHASE. What is left, in order:
+
 1. A target description and an STM32 Nucleo target that flashes and runs:
    nothing else can be validated without it.
-2. SVD import, register arrays, and `w1c`/`rc` field semantics.
-3. Bit operations and constants.
-4. Buffer addresses in PHASE, domains per engine, and `sync` tied to the
-   engine's real completion flag.
-5. Memory regions, static buffers and alignment, plus cache maintenance
+2. SVD import (register clusters and named field values with it).
+3. Domains per engine, and `sync` tied to the engine's real completion
+   flag.
+4. Memory regions, static buffers and alignment, plus cache maintenance
    if the board is a Cortex-M7.
-6. Interrupt priorities and counting events.
-7. Shared data with handlers, timeouts and error events.
+5. Interrupt priorities and counting events.
+6. Shared data with handlers, timeouts and error events.
 
-Items 1–4 are enough to write a real ADC-to-memory DMA driver on a
-Nucleo in PHASE without C externs for the hand-off. That is the
+Items 1–3, with what 2.4 added, are enough to write a real ADC-to-memory
+DMA driver on a Nucleo in PHASE without C for the hand-off. That is the
 "survives a real board" bar for 3.0.

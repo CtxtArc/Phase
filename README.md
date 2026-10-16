@@ -7,7 +7,7 @@
 **A compiler that statically checks memory safety for hardware pipelines — DMA, MMIO, and zero-copy devices — before the code ever runs.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.3.0-success" alt="Version 2.3.0">
+  <img src="https://img.shields.io/badge/version-2.4.0-success" alt="Version 2.4.0">
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
 </p>
@@ -68,9 +68,14 @@ compiler guarantees:
 6. **Register safety** — a peripheral's register map is declared once
    (`device Uart0 @ 0x40004000 { .. }`), and every access is checked
    against it: no misspelled register or field, no write to a read-only
-   register or read of a write-only one, no field value wider than its
-   field. Register accesses are `volatile`, so the C compiler never
-   reorders or eliminates them.
+   register or read of a write-only one, no value — literal or computed
+   constant — wider than its field, no index past the end of a register
+   array, and no field write that clears a write-1-to-clear flag it
+   didn't mean to. A DMA engine gets a buffer's address only through a
+   register declared `address`, and writing it *is* the hand-off:
+   `volatile_write(Dma0.CDEST[0], address_of(lo))` gives `lo` to the
+   engine, checked like `move`. Register accesses are `volatile`, so the
+   C compiler never reorders or eliminates them.
 7. **Interrupt safety** — an `interrupt fn` handler can't lose a register
    write to the code it interrupts: a field write (read-modify-write) to a
    register a handler also writes must be inside `critical { }`. Nothing a
@@ -90,7 +95,7 @@ itself at run time:
 ```
 $ phase build --checked --stub-externs program.phase   # instrumented build
 $ cargo run --release -p phase_fuzz -- --count 1000     # differential fuzzing
-1000 programs generated, 456 accepted by `phase check` (0 more only with warnings, not run), 0 soundness violations, 0 pipeline failures
+1000 programs generated, 437 accepted by `phase check` (0 more only with warnings, not run), 0 soundness violations, 0 pipeline failures
 ```
 
 - **`phase build --checked`** emits C that verifies every ownership rule
@@ -267,7 +272,7 @@ deliberately broken program per rule, each rejected at compile time:
 - **[CWE-362] Writing through read-only views** — [`write_through_read_borrow.phase`](examples/bug_gallery/write_through_read_borrow.phase), [`read_param_handed_to_writer.phase`](examples/bug_gallery/read_param_handed_to_writer.phase), [`read_only_to_unannotated_param.phase`](examples/bug_gallery/read_only_to_unannotated_param.phase): a read borrow or a `read` parameter handed to a kernel that writes, or to one that never said it only reads.
 - **[CWE-362/367] Broken double buffering** — [`refill_while_processing.phase`](examples/bug_gallery/refill_while_processing.phase), [`ping_pong_without_swap.phase`](examples/bug_gallery/ping_pong_without_swap.phase), [`swap_while_borrowed.phase`](examples/bug_gallery/swap_while_borrowed.phase): refilling the buffer the CPU is processing (a torn frame), forgetting to trade buffers, or swapping one out from under a live view.
 - **[CWE-362/367] Ring buffers and circular DMA** — [`process_half_in_flight.phase`](examples/bug_gallery/process_half_in_flight.phase), [`use_ring_while_split.phase`](examples/bug_gallery/use_ring_while_split.phase), [`join_with_half_in_flight.phase`](examples/bug_gallery/join_with_half_in_flight.phase), [`rotate_wrong_direction.phase`](examples/bug_gallery/rotate_wrong_direction.phase), [`wrong_half_event.phase`](examples/bug_gallery/wrong_half_event.phase): processing the half the engine is still filling (the classic off-by-one-half in circular ADC drivers), using the whole buffer while half of it is in flight, treating it as whole again with one half still streaming, rotating a triple-buffer ring the wrong way, or taking the wrong half on a half-transfer interrupt.
-- **[CWE-684/908/197] Hardware register misuse** — [`write_read_only_register.phase`](examples/bug_gallery/write_read_only_register.phase), [`read_write_only_register.phase`](examples/bug_gallery/read_write_only_register.phase), [`field_write_on_write_only_register.phase`](examples/bug_gallery/field_write_on_write_only_register.phase), [`field_value_too_wide.phase`](examples/bug_gallery/field_value_too_wide.phase), [`overlapping_registers.phase`](examples/bug_gallery/overlapping_registers.phase), [`overlapping_devices.phase`](examples/bug_gallery/overlapping_devices.phase): clearing a flag through a read-only status register, trusting what a write-only register reads back as, `CMD |= START` on a write-only register, a prescaler value spilling into the enable bit, and copy-pasted register maps with two registers — or two whole devices — at one address.
+- **[CWE-684/908/197] Hardware register misuse** — [`write_read_only_register.phase`](examples/bug_gallery/write_read_only_register.phase), [`read_write_only_register.phase`](examples/bug_gallery/read_write_only_register.phase), [`field_write_on_write_only_register.phase`](examples/bug_gallery/field_write_on_write_only_register.phase), [`field_value_too_wide.phase`](examples/bug_gallery/field_value_too_wide.phase), [`overlapping_registers.phase`](examples/bug_gallery/overlapping_registers.phase), [`overlapping_devices.phase`](examples/bug_gallery/overlapping_devices.phase), [`constant_too_wide.phase`](examples/bug_gallery/constant_too_wide.phase), [`field_write_clears_flag.phase`](examples/bug_gallery/field_write_clears_flag.phase), [`register_index_out_of_range.phase`](examples/bug_gallery/register_index_out_of_range.phase): clearing a flag through a read-only status register, trusting what a write-only register reads back as, `CMD |= START` on a write-only register, a prescaler value — literal or named — spilling into the enable bit, copy-pasted register maps with two registers or two whole devices at one address, `INTSTATUS |= TX` clearing a pending RX interrupt, and DMA stream 8 on an 8-stream controller.
 - **[CWE-362/833] Interrupt races and deadlocks** — [`interrupted_field_write.phase`](examples/bug_gallery/interrupted_field_write.phase), [`wait_in_handler.phase`](examples/bug_gallery/wait_in_handler.phase), [`wait_never_signalled.phase`](examples/bug_gallery/wait_never_signalled.phase): a one-shot timer that keeps firing because `main`'s read-modify-write of its control register overwrote the handler's, a handler that waits for an interrupt that can't run until it returns, and a `main` that waits for an event a refactor stopped signalling.
 - **[CWE-416/825] Found by the fuzzer** — [`dma_into_dead_block.phase`](examples/bug_gallery/dma_into_dead_block.phase), [`swap_across_blocks.phase`](examples/bug_gallery/swap_across_blocks.phase): a buffer abandoned to the DMA engine at the end of an `if` block, or swapped with one from an inner block and left dangling.
 - **[CWE-787/843] Wrong buffer type** — [`buffer_length_mismatch.phase`](examples/bug_gallery/buffer_length_mismatch.phase), [`buffer_element_mismatch.phase`](examples/bug_gallery/buffer_element_mismatch.phase), [`runtime_length_to_fixed.phase`](examples/bug_gallery/runtime_length_to_fixed.phase): a shorter buffer where a longer one is required (a real overflow), bytes where samples are expected, or a run-time length where an exact one is assumed.
@@ -480,12 +485,14 @@ each interrupt and signals an event, and a `main` that sleeps in
 `wait tick` and prints a dot per tick — five real interrupts on QEMU's
 board model.
 
-`examples/dma_stream.phase`: real DMA. Built with `--target=mps2-an505
---run`, the AN505's PL081 controller fills each half of a buffer in turn,
-its transfer-complete interrupt hands the half to `main`
-(`wait lo_done for lo`), and `main` checks all of it before handing it
-back: ten blocks, each a real (emulated) transfer. A host build runs the
-same program against a simulated PL081.
+`examples/dma_stream.phase`: real DMA, programmed entirely in PHASE. Built
+with `--target=mps2-an505 --run`, the AN505's PL081 controller copies a
+fresh block into each half of a buffer in turn — the program hands it
+both buffers by writing their addresses (`address_of`) — its
+transfer-complete interrupt hands them back
+(`wait lo_done for src_lo, lo`), and `main` checks every word before
+starting the next copy: ten blocks, each a real (emulated) transfer. A
+host build runs the same program against a simulated PL081.
 
 `examples/hw_uart_echo.phase`: a buffer handed to the UART as a device,
 built for the same board — its `sync()` is a real register poll on real
@@ -520,8 +527,10 @@ has to discover the hard way:
   `let` or shadowed.
 - **`if`/`while` conditions and assignment right-hand sides are a
   deliberately small subset of expressions** (identifiers, literals,
-  binary comparisons/arithmetic, and a direct `volatile_read` of a register)
-  — not the full `Expr` grammar. A condition using any other call is a
+  constants, comparisons, arithmetic and bit operations, and a direct
+  `volatile_read` of a register) — not the full `Expr` grammar. There are
+  no arrays to index other than registers, and a register array's index
+  must be a constant. A condition using any other call is a
   clear `UnsupportedExpr` error, not a silent guess: general `extern fn`
   calls inside a condition would be re-invoked every loop iteration with
   much less clear ordering/purity guarantees than a register read.
@@ -539,8 +548,13 @@ has to discover the hard way:
 - **Two hardware targets, both emulated.** `--target=mps2-an385` (ARM
   Cortex-M3) and `--target=mps2-an505` (Cortex-M33 with PL081 DMA),
   validated on QEMU's models of the boards, not yet on silicon. Another
-  board needs its own startup code, linker script and wait functions under `runtime/`. There are no arrays
-  of registers yet (a FIFO of 16 identical registers is 16 declarations).
+  board needs its own startup code, linker script and wait functions
+  under `runtime/`. `@DMA` is one domain: PHASE knows a buffer is the
+  hardware's, and (since 2.4) at which register it was handed over, but
+  not which engine must finish before `sync` may return — `sync` on a
+  board still waits on a stand-in, and `wait E for b` on the program's
+  word that `E` means `b` is done. What else real boards need is in
+  [`docs/real_boards.md`](docs/real_boards.md).
 - **Interrupts are modeled simply.** One core, one priority level
   (handlers don't preempt each other), and events are flags, not
   counters: two signals before a `wait` count as one. A handler hands
@@ -579,13 +593,17 @@ Full rationale for all of these is in
 
 ## What's next
 
-2.3 lets interrupts hand buffers to `main`, fuzzes register and
-interrupt code, and adds hover and go-to-definition, on top of 2.2's
-interrupts, 2.1's imports and device types and 2.0's register maps,
-Cortex-M3 target and language server (see [`CHANGELOG.md`](CHANGELOG.md)).
-Likely next:
+2.4 runs real (emulated) DMA on a second board, the Cortex-M33 MPS2
+AN505, and adds what programming it took: constants and bit operations,
+register arrays, flags with read and write side effects, and DMA
+addresses written from PHASE as checked hand-offs. 2.3 let interrupts
+hand buffers to `main`, fuzzed register and interrupt code, and added
+hover and go-to-definition; 2.2 brought interrupts, 2.1 imports and
+device types, 2.0 register maps, a Cortex-M3 target and the language
+server (see [`CHANGELOG.md`](CHANGELOG.md)). Next — 3.0 is the
+real-board release:
 
-- **The VS Code extension**, packaged and tested.
+- **The VS Code extension**, packaged as a `.vsix` and tried installed.
 - **M12 — An LLVM backend**, removing the dependency on an external `cc`
   ([`phase_specification.md`](phase_specification.md) §9).
 - **Real boards** — an STM32 Nucleo, with its own DMA controller and

@@ -2,7 +2,7 @@
 
 **A physical-domain safety language for signal, RF, and embedded pipelines**
 
-Version 2.3
+Version 2.4
 
 ---
 
@@ -286,7 +286,10 @@ they were. The analyzer checks:
   read-modify-write, and a write-only register reads back as something
   other than what was last written (#36).
 - **Values.** A literal written to a register or field must fit its width
-  (#37). A non-literal value is masked to the field's width.
+  (#37), and so must any constant expression (v2.4, #45): `1 << 3` or
+  `MODE_FAST << 1 | EN` is computed when the program is compiled. A value
+  only known at run time is masked to the field's width (a checked build
+  reports one that doesn't fit, §6.7).
 
 A register is a hardware location, not a value: `Uart0.STATE` on its own
 is an error, as is using `Uart0` as a value.
@@ -294,7 +297,7 @@ is an error, as is using `Uart0` as a value.
 Codegen lays each device out as a C struct of `volatile` members at the
 declared offsets (each one checked by `_Static_assert`), with
 `Dev_REG_FIELD_Pos`/`_Msk` macros so hand-written C can use the same
-fields. On a hardware target (`--target=mps2-an385`, §5.3) the device
+fields. On a hardware target (`--target=mps2-an385` or `mps2-an505`, §5.3) the device
 macro is the declared address; in a host build it is a simulated register
 block that starts from the declared reset values. A field write is a
 read-modify-write and is not atomic with respect to an interrupt handler
@@ -321,6 +324,74 @@ register. In C, a type is one struct (`phase_devtype_T_regs`, with
 `T_REG_FIELD_Pos`/`_Msk` macros), and each of its devices a pointer of
 that type. `examples/devices/mps2_an385.phase` declares the MPS2 AN385
 board's UARTs and timers this way, for programs to `import` (§3.15).
+
+**Register arrays (v2.4).** A peripheral with repeated registers — a DMA
+controller's streams, say — declares each as an array:
+
+```phase
+device Dma2 @ 0x40026400 {
+    CR[8]:   read write u32 @ 0x10 step 0x18 { EN: bit 0, TCIE: bit 4 }
+    NDTR[8]: read write u32 @ 0x14 step 0x18 { N: bits 0..=15 }
+}
+volatile_write(Dma2.CR[STREAM].EN, 1);
+```
+
+`NAME[count]: .. @ offset step stride` is `count` registers, the `n`th at
+`offset + n * stride` (`step` defaults to the register's size). Each
+element is placed and checked for alignment and overlap like a register
+of its own. An access names one element by an index that must be a
+constant — a literal, a `const`, or an expression of them — in range
+(#47); an array register without an index, or a single register with
+one, is an error. In C, element `n` is the struct member `NAME_n`.
+
+**Fields with side effects (v2.4).** A field may say what reading or
+writing it does: `w1c` (writing 1 clears it, writing 0 does nothing — a
+pending flag), `rc` (reading the register clears it), or `rc_w0` (writing
+0 clears it — an STM32 status flag):
+
+```phase
+INT: read write u32 @ 0x0C { PENDING: bit 0 w1c, OVERRUN: bit 1 w1c, ENABLE: bit 4 }
+```
+
+A field write reads the register and writes the other bits back, so:
+
+- in a register with another `w1c` field, it writes a 1 back to any of
+  those flags that are set — clearing a pending flag nobody handled (#46);
+- in a register with another `rc_w0` field, it writes back the flag's old
+  value, and a flag the hardware sets in between is cleared by the 0;
+- in a register with an `rc` field, its read clears that field.
+
+Each is an error; write the whole register instead
+(`volatile_write(INT, 1 << 0)` clears just `PENDING`). Reading one field
+of a register with another `rc` field is an error too: the read clears
+that field, so read the register once into a local and take the fields
+from it with bit operations.
+
+**Address registers (v2.4).** A register declared `address` holds the
+address of memory a device reads or writes — a DMA source, destination,
+or next descriptor:
+
+```phase
+CSRC[2]:  read write u32 @ 0x100 step 0x20 address;
+CDEST[2]: read write u32 @ 0x104 step 0x20 address;
+
+volatile_write(Dma0.CSRC[0], address_of(src));
+volatile_write(Dma0.CDEST[0], address_of(dest));
+```
+
+Writing `address_of(buf)` to one *is* the hand-off of `buf` to the
+hardware: `buf` must be an owned buffer the CPU has — in `@RAM`, not
+borrowed, not split, not a `read` parameter — and it is `@DMA` from that
+statement on (the note on a later error says where it was handed over).
+It comes back with `sync(buf)` or `wait E for buf` (§3.16). An address
+register takes nothing but `address_of(..)` or the constant 0 (no
+address — the end of a descriptor chain); `address_of` goes nowhere
+else, and only to a writable `u32` register with no fields. This puts
+the step that matters most — telling the hardware where to write — in
+checked code: before 2.4 it was a C extern's job. In C, the register gets
+the buffer's address; a host build, whose pointers are wider than 32
+bits, also records the pointer so simulated hardware can find the memory
+(`phase_addr_get(&Dev->REG)`, `runtime/phase_runtime.h`).
 
 The pre-2.0 form, a bare register name tagged `@MMIO`, is still accepted
 and becomes a simulated `uint32_t` register:
@@ -631,7 +702,9 @@ The model assumes one core and handlers that don't preempt each other
 (one priority level).
 
 **Interrupts that hand over buffers (v2.3).** `wait E for b;` waits for
-`E` like `wait E;` and then hands `b` back to the CPU, like `sync(b)`:
+`E` like `wait E;` and then hands `b` back to the CPU, like `sync(b)`
+(`wait E for a, b;`, v2.4, hands back each: a copy's source and
+destination are both done when it is):
 the event is the hardware saying it is done with `b` — a DMA engine's
 half-transfer interrupt saying the first half of a circular buffer is
 full:
@@ -655,8 +728,8 @@ while n < 4 {
 
 `b` must be owned by the hardware (`@DMA` or `@DEVICE`) at the `wait`,
 exactly as for `sync`; afterwards it is `@RAM`. Within one function, every
-`wait E for ..` names the same buffer: an event means one particular
-transfer finished. `wait half_done for hi` after `wait half_done for lo`
+`wait E for ..` names the same buffer (or the same set of buffers, in any
+order): an event means one particular transfer finished. `wait half_done for hi` after `wait half_done for lo`
 is an error (#43) — the classic wrong-half bug, which ownership alone
 can't see when both halves are with the engine. The rule is per function
 and by name: the first `wait E for b` in a function decides which buffer
@@ -680,6 +753,44 @@ defines it, to play the hardware: set the status bits the handlers test
 way) — and then runs every handler once, in IRQ order, as if each one's
 interrupt had just arrived. A `wait` that 1,000 such rounds don't satisfy
 stops the program with a message rather than hanging it.
+
+### 3.17 Constants and bit operations
+
+```phase
+const PL081_ENABLE: u32 = 1 << 0;
+const PL081_TC_IRQ: u32 = 1 << 15;
+const COPY: u32 = WORDS | WORD << 18 | WORD << 21 | 1 << 31;
+
+volatile_write(Dma0.CCONFIG[0], PL081_TC_IRQ | PL081_ENABLE);
+let mode: u32 = volatile_read(Dev.CTRL) >> 1 & 7;
+if status & READY == READY { .. }
+```
+
+(v2.4.) Expressions have the bit operations `&`, `|`, `^`, `<<`, `>>`
+and unary `~`, with Rust's precedence, loosest first: comparisons, `|`,
+`^`, `&`, shifts, `+ -`, `* /`, then `~` — so `x & MASK == 0` means
+`(x & MASK) == 0`, unlike C. They work on the value's unsigned 64-bit
+pattern: `~1` has 63 bits set (mask it to a register's width), and a
+shift by 64 or more gives 0 in the generated C, where C itself leaves it
+undefined. Their operands must be integers: a float, a bool or a
+comparison is an error, and so is a shift by a constant amount of 64 or
+more.
+
+`const NAME: TYPE = expr;` names a value computed when the program is
+compiled, from integer literals, other constants (declared in any order),
+and arithmetic and bit operations. `TYPE` is `u8`, `u16`, `u32` or
+`u64`, and the value must fit it. Computing a constant may not leave the
+unsigned 64-bit range: a negative literal, a subtraction below zero, an
+overflowing sum, product or shift, and a division by zero are errors, as
+is a constant defined in terms of itself. Constants share the namespace of
+functions, events, entities and devices, and no local may be named like
+one. `const` is a keyword only where it starts an item.
+
+Any expression whose value is constant — `PL081_TC_IRQ | PL081_ENABLE`,
+`1 << (IRQ_DMA0_TC - 32)` — is computed: a register write of it is
+checked to fit like a literal, an array index of it is checked against
+the array, and the generated C has the number. A `let` can now be
+initialized from any scalar expression (`let m: u32 = c >> 1 & 7;`).
 
 ---
 
@@ -777,9 +888,14 @@ For every program `phase check` accepts, within a function body:
   device register (or a simulated `@MMIO` one) and is lowered to a
   `volatile` access, so the C compiler cannot eliminate or reorder it. A
   device register is only read if readable and written if writable, a
-  field write only on a register that can also be read, and a literal
-  only if it fits (§3.7); the register map itself is laid out exactly as
-  declared, which the C compiler checks.
+  field write only on a register that can also be read, and a constant
+  value only if it fits (§3.7, §3.17); an element of a register array is
+  in range. No field write writes back and clears another `w1c` flag,
+  races an `rc_w0` flag, or reads a read-clear register, and no field read
+  clears another `rc` field. A buffer's address goes to the hardware only
+  through an `address` register, as the hand-off of a buffer the CPU owns.
+  The register map itself is laid out exactly as declared, which the C
+  compiler checks.
 - **Interrupts.** No field write in thread code can lose a write made by
   an interrupt handler (it is inside `critical`, or no handler writes that
   register); no `wait` is reachable from a handler or inside `critical`;
@@ -850,7 +966,7 @@ written in PHASE, prints "Hello from PHASE" this way, and
 `examples/devices/mps2_an385.phase` lists the board's devices and the IRQ
 numbers checked on QEMU's model: Uart0 transmit 1, Timer0 8, Timer1 9.
 
-**A board with a DMA controller (v2.3).** `--target=mps2-an505` builds for
+**A board with a DMA controller (v2.4).** `--target=mps2-an505` builds for
 the MPS2 AN505 (Cortex-M33 with TrustZone) and runs on `qemu-system-arm
 -M mps2-an505`. The CPU starts in the Secure state with its vector table
 at 0x10000000, so `runtime/hw/mps2an505.ld` links code at the Secure alias
@@ -859,11 +975,14 @@ used at its Secure alias (Non-secure address + 0x10000000). The vector
 table in `runtime/hw/startup.c` has 128 IRQ entries, enough for the
 AN505's 124. `examples/devices/mps2_an505.phase` declares its UARTs, NVIC
 and four ARM PL081 DMA controllers, and `examples/dma_stream.phase` streams
-ten blocks through Dma0: each channel fills one half of a split buffer,
-the controller's transfer-complete interrupt (IRQ 57) hands the half to
-`main` with `wait lo_done for lo`, and `main` checks every word of it
-before giving it back. Each transfer is a real (emulated) DMA copy and
-each hand-off a real interrupt. Two things about QEMU's PL081 model are
+ten blocks through Dma0, programmed entirely from PHASE: each channel
+copies a freshly produced block into one half of a split buffer — the
+program writes both buffers' addresses into the channel's `address`
+registers, which hands them to the controller (§3.7) — the controller's
+transfer-complete interrupt (IRQ 57) hands both back with `wait lo_done
+for src_lo, lo`, and `main` checks every word of the copy before starting
+the next. Each transfer is a real (emulated) DMA copy and each hand-off a
+real interrupt. Two things about QEMU's PL081 model are
 worth knowing: it performs a whole memory-to-memory transfer the moment a
 channel is enabled (a real controller takes time, which the program
 doesn't depend on), and it updates its interrupt line only on writes to
@@ -944,8 +1063,9 @@ options:
                                 writes <stem>.checked.gen.c and <stem>-checked
   --stub-externs               (build) generate placeholder extern bodies
                                 instead of requiring runtime/<stem>_extern.c
-  --target=host|mps2-an385     (build) host (default), or a Cortex-M3 .elf
-                                for the MPS2 AN385 board (§5.3)
+  --target=TARGET              (build) host (default), or an .elf for the
+                                MPS2 AN385 (mps2-an385, Cortex-M3) or AN505
+                                (mps2-an505, Cortex-M33) board (§5.3)
   --run                        (build) run the result: the host binary, or
                                 the .elf on qemu-system-arm
 ```
@@ -1020,9 +1140,9 @@ that line in the function that changed it (`- line 12: start(b); → in
 under the cursor starts in; on a line that declares the name, the one it
 ends in. A statement checked more than once (in a loop, or on paths that
 disagree in a rejected program) shows each state it was seen in.
-Hovering a function, extern, device, register, field or event shows its
-declaration; an event also lists the functions that signal and wait for
-it, a device its registers. `textDocument/definition` jumps to the
+Hovering a function, extern, device, register, field, event or constant
+shows its declaration; an event also lists the functions that signal and
+wait for it, a device its registers, a constant its value (v2.4). `textDocument/definition` jumps to the
 declaration of the same names — a local's `let`/`buffer`/`split`, a
 parameter in its function's header, a register field in another file of
 the program. Other requests get `MethodNotFound`.
@@ -1071,6 +1191,13 @@ by making them happen: a field write in thread code outside `critical`
 reads the register, runs every interrupt handler, and writes the result —
 and a handler writing that same register in between is reported as the
 lost write it would be.
+
+v2.4 adds: a field write that would write a 1 back to another set `w1c`
+flag, or a 0 to an `rc_w0` flag set while the handlers ran in the middle
+of it (the program's `phase_sim_hardware` can set one), or that reads a
+register with an `rc` field, fails; so does a field read of a register
+with another `rc` field. Writing `address_of(buf)` to an `address`
+register is checked as the `move` to `@DMA` it is.
 
 Typestate values are tracked by the address of the variable holding
 them: their state comes from the callee's *declared* return state (or,
@@ -1197,6 +1324,37 @@ generated programs from the 2.3 generator (1,925 accepted and run with
 several stub seeds each, including 1,000 at `--chaos 0.3`) produced no
 violations.
 
+**v2.4.** The generator's device gains a register with `w1c` flags (a
+field write to it is a deviation), an array of four registers (an index
+past the end is a deviation), and two `address` registers that buffers
+are handed to with `address_of` (a buffer the CPU doesn't own outright
+is a deviation); register values are written as constant expressions;
+`wait E for a, b` hands back pairs; and `main` ends by calling every
+helper once with fresh buffers, so helper bodies always run. Every
+interrupt and register check above was mutated again with this
+generator, together with the new ones, against 1,500 programs each:
+
+| Check removed from the analyzer | Found |
+|---|---|
+| field write in thread code to a register a handler writes | 6 violations |
+| `wait` in handler code / inside `critical` | 8 / 5 |
+| `return` inside `critical` | 1 |
+| `wait` on an event nothing signals | 23 |
+| an event hands back the same buffers per function | 3 |
+| `wait E for b`: `b` must be the hardware's | 12 |
+| reading a write-only / writing a read-only register | 2 / 1 |
+| a constant value fits its register or field | 24 |
+| a field write must not write back another `w1c` flag | 2 |
+| `address_of(b)`: `b` must be in `@RAM` | 3 |
+| a register array index is in range | 11 pipeline failures (the C compiler rejects the element that doesn't exist) |
+
+`rc` and `rc_w0` fields are checked by the static tests and the runtime
+checker's own tests, not fuzzed: the generator has no hardware that sets
+flags behind the program's back. With the real analyzer, 5,000 freshly
+generated programs from the 2.4 generator (1,928 accepted and run with
+several stub seeds each, including 1,000 at `--chaos 0.3`) produced no
+violations.
+
 **Scope of the evidence.** Struct entities other than typestate values
 are not tracked at run time; the generator covers one typestate machine,
 three buffer types and one device, with handlers that call nothing. Those
@@ -1309,6 +1467,10 @@ for the analyzer and as the security narrative for the portfolio write-up.
 | 42 | Waiting inside an interrupt handler | A handler that sleeps forever, blocking its priority level | "`wait tx_done` in interrupt handler code would never return" |
 | 43 | An event handing back the wrong half | Processing the half of a circular buffer the DMA engine is still writing | "`wait half_done for hi`, but `half_done` hands over 'lo' earlier in this function" |
 | 44 | Waiting for an event nothing signals | A board that hangs because a refactor dropped a handler's `signal` | "`wait rx_ready` never returns: nothing signals 'rx_ready'" |
+| 45 | A named value too wide for its field | A prescaler constant that spills into the next field (`CTRL \|= DIV << 4`) | "16 (0x10) does not fit in 'Timer.CTRL.PRESCALE' (4 bits, at most 15)" |
+| 46 | A field write that clears another pending flag | Acknowledging one interrupt by read-modify-write, losing another | "writing field 'Uart0.INTSTATUS.TX' writes back a 1 to every set bit of `w1c` field 'RX'" |
+| 47 | One past the last element of a register array | DMA stream 8 on an 8-stream controller | "Dma2.CR[8] is out of range: 'Dma2.CR' has 8 registers (0 to 7)" |
+| 48 | Refilling a DMA source while it is read | A copy of two blocks mixed together | "entity 'src' is in domain @DMA but 'produce' expects @RAM" (it was handed over by writing its address) |
 
 Every file in `examples/bug_gallery/` carries its expected error in an
 `// Expected: "..."` header, and a test asserts the analyzer produces it.
@@ -1537,6 +1699,17 @@ history on hover and jumps to declarations (§6.8). Output:
 `examples/circular_dma.phase` streams eight blocks from its interrupt
 handler, against a simulated DMA controller in a host build; bug-gallery
 #43–#44.
+
+**v2.4 — Real DMA, and the language for it**
+`--target=mps2-an505` builds for the MPS2 AN505 (Cortex-M33) on QEMU,
+whose PL081 DMA controllers move real (emulated) data (§5.3). Constants
+and bit operations (§3.17); register arrays, fields with read and write
+side effects, and `address` registers, through which writing a buffer's
+address hands it to the hardware (§3.7); `wait E for a, b` (§3.16).
+Output: `examples/dma_stream.phase` streams ten blocks through the PL081,
+programmed entirely from PHASE, each copy checked word by word;
+`docs/real_boards.md`, what PHASE needs for real boards; bug-gallery
+#45–#48.
 
 **M12 — LLVM backend** *(not yet started)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead

@@ -767,6 +767,80 @@ run.)
 
 ---
 
+## #45 — A named value too wide for its field
+
+**`examples/bug_gallery/constant_too_wide.phase`**
+
+**Category:** [CWE-197](https://cwe.mitre.org/data/definitions/197.html) —
+Numeric truncation error.
+
+**Real-world precedent:** a prescaler or divider constant that holds the
+divider where the field wants the divider minus one, or a mask computed
+one bit too wide. `CTRL |= DIV << 4` then sets a bit of the next field
+(here, the timer's interrupt enable), and nothing complains.
+
+**What PHASE does:** computes every constant expression when it compiles
+the program and checks the value against the register or field it is
+written to, as it does a literal.
+
+---
+
+## #46 — A field write that clears another pending flag
+
+**`examples/bug_gallery/field_write_clears_flag.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html) —
+Concurrent execution using a shared resource with improper
+synchronization.
+
+**Real-world precedent:** `UART->INTSTATUS |= TX` on a write-1-to-clear
+status register. The read returns RX set as well; writing it back clears
+RX, and the receive interrupt is gone before anyone handled it. The same
+bug with write-0-to-clear flags (`TIMx->SR &= ~UIF` on an STM32) clears
+a flag set between the read and the write, which is why ST's reference
+manuals say never to read-modify-write those registers.
+
+**What PHASE does:** fields can be declared `w1c`, `rc` or `rc_w0`; a
+field write that would clear another flag, race one, or read a
+read-clear register is an error, and the fix — a whole-register write —
+is what the message asks for.
+
+---
+
+## #47 — One past the last element of a register array
+
+**`examples/bug_gallery/register_index_out_of_range.phase`**
+
+**Category:** [CWE-787](https://cwe.mitre.org/data/definitions/787.html) —
+Out-of-bounds write.
+
+**Real-world precedent:** `DMA2->S[8].CR` on a controller with streams 0
+to 7 — an off-by-one in a stream or channel number, from a table or a
+define. In C it compiles and writes past the controller's registers.
+
+**What PHASE does:** register arrays are declared with their count, and
+an index — which must be a constant — is checked against it.
+
+---
+
+## #48 — Refilling a DMA source while it is read
+
+**`examples/bug_gallery/dma_source_rewritten.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html),
+[CWE-367](https://cwe.mitre.org/data/definitions/367.html).
+
+**Real-world precedent:** a memory-to-peripheral or memory-to-memory DMA
+started on a buffer the code then refills for the next transfer before
+the current one completes; the device receives a mix of two blocks.
+
+**What PHASE does:** writing a buffer's address into an `address`
+register hands the buffer to the hardware, so writing it afterwards is
+the same error as any other use of a buffer the DMA engine owns, with a
+note at the register write.
+
+---
+
 ## Summary table
 
 | # | Bug-gallery file | CWE | Named real-world precedent |
@@ -815,3 +889,7 @@ run.)
 | 42 | `wait_in_handler.phase` | CWE-833 | a handler blocking on an interrupt that can't run |
 | 43 | `wrong_half_event.phase` | CWE-362, CWE-367 | half-transfer and transfer-complete callbacks swapped |
 | 44 | `wait_never_signalled.phase` | CWE-835 | a "data ready" flag no handler sets any more |
+| 45 | `constant_too_wide.phase` | CWE-197 | a divider constant that spills into the next field |
+| 46 | `field_write_clears_flag.phase` | CWE-362 | `INTSTATUS \|= TX` on write-1-to-clear flags |
+| 47 | `register_index_out_of_range.phase` | CWE-787 | `DMA2->S[8]` on an 8-stream controller |
+| 48 | `dma_source_rewritten.phase` | CWE-362, CWE-367 | a DMA source refilled mid-transfer |

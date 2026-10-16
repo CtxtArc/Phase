@@ -4,25 +4,77 @@ All notable changes to PHASE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.4.0] — 2026-10-16
+
+Real DMA, and the language it takes. `--target=mps2-an505` runs on a
+board whose DMA controllers move real (emulated) data, and
+`examples/dma_stream.phase` programs one entirely from PHASE: constants
+and bit operations compute the register values, register arrays address
+its channels, and writing a buffer's address into a register declared
+`address` *is* the hand-off of that buffer, checked like `move`. Status
+flags can say what reading and writing them does (`w1c`, `rc`, `rc_w0`),
+so a field write that clears a pending interrupt is caught. Plus
+`docs/real_boards.md`: what PHASE needs before it runs on real boards,
+the plan for 3.0.
+
+Every program 2.3 accepted is still accepted, except one that names
+something `address_of`, or a local like a constant it now declares.
+
+Each new check, and every interrupt and register check from 2.3, was
+caught by the fuzzer with that check removed from the analyzer (spec
+§6.7); with the real analyzer, 5,000 freshly fuzzed programs (1,928
+accepted and run in checked mode, including 1,000 at `--chaos 0.3`)
+produced no soundness violations.
 
 ### Added
 
 - **`--target=mps2-an505`**: the MPS2 AN505 board (Cortex-M33 with
-  TrustZone, run in the Secure state), on `qemu-system-arm -M mps2-an505`.
-  `examples/devices/mps2_an505.phase` declares its UARTs, NVIC and four
-  PL081 DMA controllers.
-- `examples/dma_stream.phase`: ten blocks through a real (emulated) PL081
-  DMA controller, each half of a split buffer handed to `main` by the
-  controller's transfer-complete interrupt; part of the QEMU hardware
-  test. The same program runs on the host against a simulated PL081.
-- The vector table covers 128 IRQs.
+  TrustZone, run in the Secure state), on `qemu-system-arm -M mps2-an505`
+  (spec §5.3). `examples/devices/mps2_an505.phase` declares its UARTs,
+  NVIC and four PL081 DMA controllers, with constants for their settings
+  and IRQs. The vector table covers 128 IRQs.
+- `examples/dma_stream.phase`: ten blocks copied through a real
+  (emulated) PL081, source and destination handed to the controller by
+  writing their addresses and handed back by its transfer-complete
+  interrupt, every word checked; part of the QEMU hardware test. The same
+  program runs on the host against a simulated PL081.
+- **Bit operations and constants** (spec §3.17): `& | ^ << >> ~` with
+  Rust's precedence, on the unsigned 64-bit pattern (shifts by 64 or more
+  are 0, not undefined); `const NAME: u32 = expr;`, computed at compile
+  time, with negative, overflowing, divide-by-zero and too-wide values as
+  errors. Constant expressions written to registers are checked like
+  literals (bug gallery #45). A `let` can be initialized from any scalar
+  expression.
+- **Register arrays** (spec §3.7): `CR[8]: .. @ 0x10 step 0x18`, indexed
+  by a constant and checked against the count (#47).
+- **Fields with side effects**: `w1c`, `rc`, `rc_w0`. A field write that
+  would clear another pending flag (#46), race a write-0-to-clear flag, or
+  read a read-clear register is an error, and so is reading one field of
+  a register with another `rc` field. The board files mark the CMSDK UART
+  and timer flags `w1c`.
+- **Address registers**: a register declared `address` takes
+  `address_of(buf)` — the hand-off of `buf` to the hardware, checked like
+  `move` (#48) — or 0. Host builds keep the real pointers for simulated
+  hardware (`phase_addr_get`, `runtime/phase_runtime.h`).
+- **`wait E for a, b;`**: an event can hand back several buffers (a
+  copy's source and destination).
+- Checked builds verify field side effects and address hand-offs at run
+  time; the fuzzer generates constant expressions, a `w1c` register, a
+  register array, address hand-offs and paired waits.
+- Hover shows a constant's value, and sees through register array
+  indexes.
+- `docs/real_boards.md`. Grammar and Vim syntax for the new words.
 
 ### Changed
 
 - A checked build lets the hardware move on too (`phase_sim_hardware()`)
   when it runs the interrupt handlers in the middle of a field write, as
   it does when `wait` sleeps.
+- The PL081's channel registers are arrays (`CCONTROL[0]`, …): a
+  program's C side refers to `CCONTROL_0`.
+- Internal crate APIs: `Item::Const`, `Expr::BitNot`, `Expr::Index`,
+  `RegDecl::array`/`address`, `RegField::kind`, `Stmt::Wait::bufs`;
+  `PirExpr::UInt`/`BitNot`, `CallArg::Value`/`Address`.
 
 ### Fixed
 

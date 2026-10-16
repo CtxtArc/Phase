@@ -248,6 +248,22 @@ the other:
 
 {{run phase check 8_copied_address.phase}}
 
+Real register maps need a little more. Named values and bit operations
+(`&`, `|`, `^`, `<<`, `>>`, `~`) compute what to write — and a computed
+value is checked against its field like a literal. Some status bits are
+cleared by writing 1 to them (`w1c`): writing one *field* of such a
+register reads it and writes the rest back, a 1 for every flag that was
+set — clearing interrupts nobody handled:
+
+{{file 8_flags.phase}}
+
+{{run phase check 8_flags.phase}}
+
+Write the whole register instead: `volatile_write(Timer.INT, 1 << 4)`.
+Repeated registers — a DMA controller's channels — are declared as
+arrays (`CR[8]: read write u32 @ 0x10 step 0x18`) and indexed by a
+constant, checked against the count.
+
 A host build runs against a simulated register block. For real hardware,
 `examples/uart_hello.phase` is a UART driver written this way, and
 PHASE builds it for an ARM Cortex-M3 board and runs it on QEMU (this
@@ -330,6 +346,18 @@ A host build of the example plays the DMA controller in C
 real handler hands the halves over:
 
 {{run phase build --run ../../examples/circular_dma.phase}}
+
+On a board with a real DMA controller, the program also tells the
+controller where the buffers are. A register declared `address` takes a
+buffer's address, and writing it is the hand-off:
+`volatile_write(Dma0.CDEST[0], address_of(lo))` gives `lo` to the
+controller exactly like `move lo -> @DMA`, and touching `lo` before the
+interrupt hands it back is an error. `examples/dma_stream.phase` programs
+the PL081 controller of QEMU's MPS2 AN505 board this way — every word
+of every copy checked — and runs on QEMU or, against a simulated
+controller, on the host:
+
+{{run phase build --run ../../examples/dma_stream.phase}}
 
 ## 10. Trust, and checking the checker
 

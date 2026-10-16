@@ -19,10 +19,10 @@ Two pieces, usable separately:
 
 ## VS Code
 
-> **Untested so far.** The grammar is checked against every example, and
-> `phase lsp` by a full session in the test suite, but the extension
-> itself hasn't been run in VS Code yet. Neovim (below) is the tested
-> setup.
+> **Tested from source.** Run from its folder
+> (`code --extensionDevelopmentPath=editors/vscode`), the extension has
+> been checked in VS Code: highlighting, diagnostics with their notes, and
+> hover. The packaged `.vsix` hasn't been installed and tried yet.
 
 The extension in [`vscode/`](vscode/) highlights `.phase` files and starts
 `phase lsp`. With `phase` on your `PATH` (or `phase.serverPath` set to it):
@@ -30,8 +30,8 @@ The extension in [`vscode/`](vscode/) highlights `.phase` files and starts
 ```sh
 cd editors/vscode
 npm install                      # vscode-languageclient
-npx @vscode/vsce package         # -> phase-language-2.3.0.vsix
-code --install-extension phase-language-2.3.0.vsix
+npx @vscode/vsce package         # -> phase-language-2.4.0.vsix
+code --install-extension phase-language-2.4.0.vsix
 ```
 
 Setting `phase.serverPath` to an empty string keeps highlighting only.

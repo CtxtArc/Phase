@@ -28,7 +28,7 @@ $ cd docs/tutorial
 
 ```console
 $ phase --version
-phase 2.3.0
+phase 2.4.0
 ```
 
 Work inside the clone (here, `docs/tutorial/`): `phase build` finds the
@@ -752,6 +752,49 @@ note: 'ModemUart' is declared here
 8_copied_address.phase: 1 error found
 ```
 
+Real register maps need a little more. Named values and bit operations
+(`&`, `|`, `^`, `<<`, `>>`, `~`) compute what to write — and a computed
+value is checked against its field like a literal. Some status bits are
+cleared by writing 1 to them (`w1c`): writing one *field* of such a
+register reads it and writes the rest back, a 1 for every flag that was
+set — clearing interrupts nobody handled:
+
+```phase
+device Timer @ 0x40000000 {
+    CTRL: read write u32 @ 0x00 = 0 { ENABLE: bit 0, PRESCALE: bits 4..=7 }
+    INT:  read write u32 @ 0x0C { DONE: bit 0 w1c, OVERFLOW: bit 1 w1c, IRQ_EN: bit 4 }
+}
+
+const DIV_16: u32 = 15;               // the field holds the divider minus one
+const ON: u32 = DIV_16 << 4 | 1 << 0;
+
+fn main() {
+    volatile_write(Timer.CTRL, ON);
+    volatile_write(Timer.INT.IRQ_EN, 1);
+}
+```
+
+```console
+$ phase check 8_flags.phase
+error: writing field 'Timer.INT.IRQ_EN' writes back a 1 to every set bit of `w1c` field 'DONE' of 'Timer.INT', clearing a pending flag nobody handled; write the whole register
+  --> 8_flags.phase:11:5
+   |
+11 |     volatile_write(Timer.INT.IRQ_EN, 1);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: 'DONE' is `w1c`, declared here
+  --> 8_flags.phase:3:35
+   |
+ 3 |     INT:  read write u32 @ 0x0C { DONE: bit 0 w1c, OVERFLOW: bit 1 w1c, IRQ_EN: bit 4 }
+   |                                   ----
+
+8_flags.phase: 1 error found
+```
+
+Write the whole register instead: `volatile_write(Timer.INT, 1 << 4)`.
+Repeated registers — a DMA controller's channels — are declared as
+arrays (`CR[8]: read write u32 @ 0x10 step 0x18`) and indexed by a
+constant, checked against the count.
+
 A host build runs against a simulated register block. For real hardware,
 `examples/uart_hello.phase` is a UART driver written this way, and
 PHASE builds it for an ARM Cortex-M3 board and runs it on QEMU (this
@@ -992,6 +1035,30 @@ OK: built /path/to/phase/build/circular_dma
 [sim] sim_dma_wait("hi"): waiting for DMA transfer to complete (256 bytes)...
 [sim] sim_dma_wait("hi"): DMA transfer complete
 [sim] summarize: 128 samples, halves hold blocks 6 and 7
+```
+
+On a board with a real DMA controller, the program also tells the
+controller where the buffers are. A register declared `address` takes a
+buffer's address, and writing it is the hand-off:
+`volatile_write(Dma0.CDEST[0], address_of(lo))` gives `lo` to the
+controller exactly like `move lo -> @DMA`, and touching `lo` before the
+interrupt hands it back is an error. `examples/dma_stream.phase` programs
+the PL081 controller of QEMU's MPS2 AN505 board this way — every word
+of every copy checked — and runs on QEMU or, against a simulated
+controller, on the host:
+
+```console
+$ phase build --run ../../examples/dma_stream.phase
+OK: built /path/to/phase/build/dma_stream
+block 0 in lo: ok
+block 1 in hi: ok
+block 2 in lo: ok
+block 3 in hi: ok
+block 4 in lo: ok
+block 5 in hi: ok
+block 6 in lo: ok
+block 7 in hi: ok
+ring: blocks 8 and 9
 ```
 
 ## 10. Trust, and checking the checker
