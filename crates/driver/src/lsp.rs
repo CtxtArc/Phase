@@ -635,7 +635,14 @@ fn local_hover(
         if let Some(after) = a.filter(|a| b.as_ref() != Some(a)) {
             if !seen.contains(&s.span) {
                 seen.push(s.span);
-                changes.push((s.span, after));
+                // Where it was introduced: its state then is in the line
+                // itself (and on the first line of the hover, if unchanged).
+                let what = if b.is_none() {
+                    "declared".to_string()
+                } else {
+                    after
+                };
+                changes.push((s.span, what));
             }
         }
     }
@@ -649,7 +656,11 @@ fn local_hover(
         }
         for (sp, desc) in &changes[skip..] {
             let src = lines.get(sp.line as usize - 1).map_or("", |l| l.trim());
-            md.push_str(&format!("- line {}: `{src}` → {desc}\n", sp.line));
+            if desc == "declared" {
+                md.push_str(&format!("- line {}: `{src}` — declared\n", sp.line));
+            } else {
+                md.push_str(&format!("- line {}: `{src}` → {desc}\n", sp.line));
+            }
         }
     }
     Some(md)
@@ -991,6 +1002,10 @@ fn main() {
         );
         assert!(
             md.contains("- line 14: `wait done for b;` → `buffer<u8, 8>`, in @RAM"),
+            "{md}"
+        );
+        assert!(
+            md.contains("- line 11: `buffer<u8, 8> b @RAM;` — declared"),
             "{md}"
         );
         // Between the two, on `wait done for b;`: the engine has it.
