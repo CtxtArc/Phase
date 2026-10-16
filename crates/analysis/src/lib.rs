@@ -1471,6 +1471,47 @@ impl<'a> FnChecker<'a> {
         None
     }
 
+    /// `sync(name)`, or `wait event for name`: the hardware gives `name`
+    /// back to the CPU.
+    fn hand_back(&mut self, name: &str, event: Option<&str>, errors: &mut Vec<AnalysisError>) {
+        let what = match event {
+            None => "sync".to_string(),
+            Some(e) => format!("wait {e} for"),
+        };
+        let Some(var) = self.owned_target(name, &what, errors) else {
+            return;
+        };
+        let Some(from) = var.domain else { return };
+        if !legal_sync_source(from) {
+            let msg = match event {
+                None => format!(
+                    "cannot sync entity '{name}': no legal sync transition from @{}",
+                    from.name()
+                ),
+                Some(e) => format!(
+                    "`wait {e} for {name}`, but '{name}' is in @{}: the hardware doesn't have it, so there is nothing for `{e}` to give back",
+                    from.name()
+                ),
+            };
+            let mut e = err(msg).about(name);
+            if event.is_some() {
+                e = e.note_opt(var.domain_since.as_ref());
+            }
+            errors.push(e);
+            return;
+        }
+        let span = self.cur_span;
+        let v = self.locals.get_mut(name).unwrap();
+        v.domain = Some(Domain::Ram);
+        v.domain_since = Some((
+            span,
+            match event {
+                None => format!("'{name}' is synced back to @RAM here"),
+                Some(e) => format!("'{name}' is handed back to @RAM by `wait {e}` here"),
+            },
+        ));
+    }
+
     fn owned_target(
         &self,
         name: &str,
@@ -1568,26 +1609,14 @@ impl<'a> FnChecker<'a> {
                 v.domain_since = Some((span, format!("'{name}' is moved to @{} here", to.name())));
             }
 
-            Stmt::Sync { name } => {
-                let Some(var) = self.owned_target(name, "sync", errors) else {
-                    return;
-                };
-                let Some(from) = var.domain else { return };
-                if !legal_sync_source(from) {
-                    errors.push(
-                        err(format!(
-                            "cannot sync entity '{name}': no legal sync transition from @{}",
-                            from.name()
-                        ))
-                        .about(name),
-                    );
-                    return;
-                }
-                let span = self.cur_span;
-                let v = self.locals.get_mut(name).unwrap();
-                v.domain = Some(Domain::Ram);
-                v.domain_since = Some((span, format!("'{name}' is synced back to @RAM here")));
-            }
+            Stmt::Sync { name } => self.hand_back(name, None, errors),
+            // v2.3: `wait E for b` -- the interrupt that signals E says the
+            // hardware is done with `b`: a hand-back, like `sync`. (The
+            // event rules are checked with the other interrupt rules.)
+            Stmt::Wait {
+                name: event,
+                buf: Some(name),
+            } => self.hand_back(name, Some(event), errors),
 
             Stmt::Release { name } => {
                 let Some(var) = self.locals.get(name) else {
@@ -1714,7 +1743,7 @@ impl<'a> FnChecker<'a> {
             // and reassigning through them would bypass those checks, so
             // it's a clear error rather than a silent domain reset.
             // v2.2: events are checked with the other interrupt rules.
-            Stmt::Signal { .. } | Stmt::Wait { .. } => {}
+            Stmt::Signal { .. } | Stmt::Wait { buf: None, .. } => {}
             // Runs straight through (a `return` inside is an error).
             Stmt::Critical { body } => {
                 let base_locals = self.locals.clone();

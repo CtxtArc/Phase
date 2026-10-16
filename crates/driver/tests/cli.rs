@@ -471,7 +471,7 @@ fn triple_buffer_processes_every_frame_in_order_across_three_rotating_buffers() 
 }
 
 #[test]
-fn circular_dma_processes_alternating_halves_then_rejoins_the_whole_buffer() {
+fn circular_dma_gets_alternating_halves_from_its_interrupt_then_rejoins_the_buffer() {
     for checked in [false, true] {
         let stdout = build_and_run("circular_dma", checked);
         let processed: Vec<&str> = stdout
@@ -487,8 +487,15 @@ fn circular_dma_processes_alternating_halves_then_rejoins_the_whole_buffer() {
                 "{stdout}"
             );
         }
+        // Each half reached `main` through the interrupt handler: the
+        // simulated engine raised it, the handler signalled the event.
+        assert_eq!(
+            stdout.matches("interrupt\n[sim] process: block").count(),
+            8,
+            "{stdout}"
+        );
         assert!(
-            stdout.contains("summarize: 128 samples, halves hold blocks 8 and 9"),
+            stdout.contains("summarize: 128 samples, halves hold blocks 6 and 7"),
             "{stdout}"
         );
     }
@@ -655,10 +662,11 @@ fn a_host_build_runs_handlers_when_main_waits_and_stops_a_wait_nothing_signals()
         std::fs::copy(root.join("runtime").join(f), dir.join("runtime").join(f)).unwrap();
     }
     let file = dir.join("stuck.phase");
-    // The handler never signals `done`.
+    // The handler could signal `done` (or the compiler would reject the
+    // `wait`), but at run time it never does.
     std::fs::write(
         &file,
-        "event done;\nevent other;\ninterrupt fn h() @ irq 3 {\n    signal other;\n}\nfn main() {\n    wait done;\n}\n",
+        "event done;\ninterrupt fn h() @ irq 3 {\n    let n: u32 = 0;\n    if n == 1 {\n        signal done;\n    }\n}\nfn main() {\n    wait done;\n}\n",
     )
     .unwrap();
     let stuck = phase()

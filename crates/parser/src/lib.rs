@@ -636,7 +636,23 @@ impl Parser {
                 Ok(if is_signal {
                     Stmt::Signal { name }
                 } else {
-                    Stmt::Wait { name }
+                    Stmt::Wait { name, buf: None }
+                })
+            }
+            // v2.3: `wait E for b;` -- the event hands `b` back to the CPU.
+            TokenKind::Ident(w)
+                if w == "wait"
+                    && matches!(self.peek_at(1), TokenKind::Ident(_))
+                    && matches!(self.peek_at(2), TokenKind::Ident(f) if f == "for") =>
+            {
+                self.bump();
+                let name = self.expect_ident()?;
+                self.bump(); // `for`
+                let buf = self.expect_ident()?;
+                self.expect(TokenKind::Semi)?;
+                Ok(Stmt::Wait {
+                    name,
+                    buf: Some(buf),
                 })
             }
             TokenKind::Ident(w)
@@ -1676,6 +1692,18 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_a_buffer_is_parsed() {
+        let p = parse("event ht; fn main() { wait ht for lo; wait ht; }").unwrap();
+        let Item::Fn(m) = &p.items[1] else { panic!() };
+        assert!(matches!(&m.body.stmts[0].node,
+            Stmt::Wait { name, buf: Some(b) } if name == "ht" && b == "lo"));
+        assert!(matches!(
+            &m.body.stmts[1].node,
+            Stmt::Wait { buf: None, .. }
+        ));
+    }
+
+    #[test]
     fn interrupts_events_and_critical_sections_are_parsed() {
         let p = parse(
             "event tick;
@@ -1692,7 +1720,7 @@ mod tests {
         assert_eq!(h.irq.map(|(n, _)| n), Some(8));
         assert!(matches!(&h.body.stmts[0].node, Stmt::Signal { name } if name == "tick"));
         let Item::Fn(m) = &p.items[3] else { panic!() };
-        assert!(matches!(&m.body.stmts[0].node, Stmt::Wait { name } if name == "tick"));
+        assert!(matches!(&m.body.stmts[0].node, Stmt::Wait { name, buf: None } if name == "tick"));
         let Stmt::Critical { body } = &m.body.stmts[1].node else {
             panic!()
         };

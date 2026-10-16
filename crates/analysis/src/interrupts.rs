@@ -32,7 +32,8 @@ struct Facts {
     calls: Vec<(String, Span)>,
     /// (device, register, field, span, inside `critical`)
     writes: Vec<(String, String, Option<String>, Span, bool)>,
-    waits: Vec<(String, Span, bool)>,
+    /// (event, span, inside `critical`, the buffer it hands over)
+    waits: Vec<(String, Span, bool, Option<String>)>,
     signals: Vec<(String, Span)>,
     returns_in_critical: Vec<Span>,
 }
@@ -110,7 +111,7 @@ fn walk_block(b: &Block, critical: bool, f: &mut Facts) {
             }
             Stmt::Critical { body } => walk_block(body, true, f),
             Stmt::Signal { name } => f.signals.push((name.clone(), span)),
-            Stmt::Wait { name } => f.waits.push((name.clone(), span, critical)),
+            Stmt::Wait { name, buf } => f.waits.push((name.clone(), span, critical, buf.clone())),
             _ => {}
         }
     }
@@ -276,7 +277,7 @@ pub(crate) fn check(program: &Program, devices: &HashSet<&str>, errors: &mut Vec
             .signals
             .iter()
             .map(|(e, s)| (e, s))
-            .chain(x.waits.iter().map(|(e, s, _)| (e, s)));
+            .chain(x.waits.iter().map(|(e, s, _, _)| (e, s)));
         for (ev, span) in uses {
             if !events.contains_key(ev.as_str()) {
                 let mut known: Vec<&str> = events.keys().copied().collect();
@@ -294,7 +295,27 @@ pub(crate) fn check(program: &Program, devices: &HashSet<&str>, errors: &mut Vec
                 );
             }
         }
-        for (ev, span, critical) in &x.waits {
+        // v2.3: an event hands over one buffer. Within a function, every
+        // `wait E for b` names the same `b` -- `wait ht for hi` after
+        // `wait ht for lo` is processing the wrong half.
+        let mut hands_over: HashMap<&str, (&str, Span)> = HashMap::new();
+        for (ev, span, _, buf) in &x.waits {
+            let Some(b) = buf else { continue };
+            match hands_over.get(ev.as_str()) {
+                Some((first, first_span)) if first != b => errors.push(
+                    err(format!(
+                        "`wait {ev} for {b}`, but `{ev}` hands over '{first}' earlier in this function: an event means one transfer is done, so it can only give back one buffer"
+                    ))
+                    .at(*span)
+                    .note(*first_span, format!("`{ev}` hands over '{first}' here")),
+                ),
+                Some(_) => {}
+                None => {
+                    hands_over.insert(ev, (b, *span));
+                }
+            }
+        }
+        for (ev, span, critical, _) in &x.waits {
             if *critical {
                 errors.push(
                     err(format!(
@@ -317,7 +338,7 @@ pub(crate) fn check(program: &Program, devices: &HashSet<&str>, errors: &mut Vec
     let in_handlers = reachable(&handler_roots, &facts, &fns);
     let mut reported_waits: HashSet<Span> = HashSet::new();
     for (f, path) in sorted(&in_handlers) {
-        for (ev, span, _) in &facts[f].waits {
+        for (ev, span, _, _) in &facts[f].waits {
             if !reported_waits.insert(*span) {
                 continue;
             }
@@ -339,6 +360,34 @@ pub(crate) fn check(program: &Program, devices: &HashSet<&str>, errors: &mut Vec
         }
     }
 
+    // v2.3: a `wait` on an event nothing signals never returns. Signals
+    // count from code that runs: `main`, the handlers, and what they call.
+    let thread_roots: Vec<&str> = fns.keys().copied().filter(|n| *n == "main").collect();
+    let in_thread = reachable(&thread_roots, &facts, &fns);
+    let signalled: HashSet<&str> = in_thread
+        .keys()
+        .chain(in_handlers.keys())
+        .flat_map(|f| facts[f].signals.iter().map(|(e, _)| e.as_str()))
+        .collect();
+    let mut names: Vec<&&str> = facts.keys().collect();
+    names.sort();
+    for name in names {
+        for (ev, span, _, _) in &facts[*name].waits {
+            if events.contains_key(ev.as_str())
+                && !signalled.contains(ev.as_str())
+                && !reported_waits.contains(span)
+            {
+                errors.push(
+                    err(format!(
+                        "`wait {ev}` never returns: nothing signals '{ev}' (an interrupt handler raises it with `signal {ev};`)"
+                    ))
+                    .at(*span)
+                    .note(events[ev.as_str()], format!("'{ev}' is declared here")),
+                );
+            }
+        }
+    }
+
     // Thread code: no unprotected read-modify-write of a register a handler
     // writes.
     let mut handler_writes: HashMap<(&str, &str), (&str, Span)> = HashMap::new();
@@ -351,8 +400,6 @@ pub(crate) fn check(program: &Program, devices: &HashSet<&str>, errors: &mut Vec
             }
         }
     }
-    let thread_roots: Vec<&str> = fns.keys().copied().filter(|n| *n == "main").collect();
-    let in_thread = reachable(&thread_roots, &facts, &fns);
     let mut reported: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
     for (f, _) in sorted(&in_thread) {
         if handler_names.contains(f) {
@@ -517,5 +564,68 @@ mod tests {
             "event main; fn main() {}",
             "'main' is declared as an event and as something else",
         );
+    }
+
+    const RING: &str = r#"
+        event ht;
+        event tc;
+        interrupt fn on_dma() @ irq 11 { signal ht; signal tc; }
+        extern fn start(lo: write buffer<u8, 4> @RAM -> @DMA, hi: write buffer<u8, 4> @RAM -> @DMA);
+        extern fn use_it(b: read buffer<u8, 4> @RAM);
+    "#;
+
+    fn ring(body: &str) -> String {
+        format!(
+            "{RING}\nfn main() {{ buffer<u8, 8> r @RAM; split r into lo, hi; start(lo, hi); {body} join lo, hi into r; }}"
+        )
+    }
+
+    #[test]
+    fn an_interrupt_hands_a_buffer_back_with_wait_for() {
+        check(&ring(
+            "let n: u32 = 0;
+             while n < 3 {
+                 wait ht for lo; use_it(lo); move lo -> @DMA;
+                 wait tc for hi; use_it(hi); move hi -> @DMA;
+                 n = n + 1;
+             }
+             wait ht for lo; wait tc for hi;",
+        ))
+        .unwrap();
+        // Without the wait, `lo` is still the engine's.
+        rejects(&ring("use_it(lo); sync(lo); sync(hi);"), "'lo'");
+    }
+
+    #[test]
+    fn an_event_hands_back_one_buffer() {
+        rejects(
+            &ring(
+                "wait ht for lo; move lo -> @DMA; wait ht for hi; wait ht for lo; wait tc for hi;",
+            ),
+            "`wait ht for hi`, but `ht` hands over 'lo' earlier in this function",
+        );
+        // Waiting for a buffer the hardware doesn't have.
+        rejects(
+            &ring("wait ht for lo; wait ht for lo; wait tc for hi;"),
+            "`wait ht for lo`, but 'lo' is in @RAM: the hardware doesn't have it",
+        );
+    }
+
+    #[test]
+    fn a_wait_nothing_signals_is_rejected() {
+        rejects(
+            "event done; event other; interrupt fn h() @ irq 3 { signal other; } fn main() { wait done; }",
+            "`wait done` never returns: nothing signals 'done'",
+        );
+        // A signal in a function nothing calls doesn't count.
+        rejects(
+            "event done; fn unused() { signal done; } fn main() { wait done; }",
+            "`wait done` never returns",
+        );
+        // From a helper a handler calls, it does.
+        check(
+            "event done; fn raise() { signal done; } interrupt fn h() @ irq 3 { raise(); } fn main() { wait done; }",
+        )
+        .unwrap();
     }
 }

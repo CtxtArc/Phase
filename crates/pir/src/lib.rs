@@ -297,9 +297,10 @@ pub enum PirInst {
     Signal {
         event: String,
     },
-    /// `wait E;` (v2.2).
+    /// `wait E;` (v2.2), `wait E for buf;` (v2.3).
     Wait {
         event: String,
+        buf: Option<String>,
     },
     /// `critical { .. }` (v2.2): `body` with interrupts disabled.
     Critical {
@@ -868,9 +869,13 @@ impl<'a> Lowerer<'a> {
                 });
                 Ok(())
             }
-            Stmt::Wait { name } => {
+            Stmt::Wait { name, buf } => {
+                if let Some(b) = buf {
+                    self.domains.insert(b.clone(), Domain::Ram);
+                }
                 out.push(PirInst::Wait {
                     event: name.clone(),
+                    buf: buf.clone(),
                 });
                 Ok(())
             }

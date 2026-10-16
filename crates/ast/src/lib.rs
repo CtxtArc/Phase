@@ -388,7 +388,9 @@ pub enum Stmt {
     /// `signal tick;` (v2.2) -- raise an event.
     Signal { name: String },
     /// `wait tick;` (v2.2) -- sleep until the event is raised, then clear it.
-    Wait { name: String },
+    /// `wait ht for lo;` (v2.3) -- and the event hands buffer `lo` back to
+    /// the CPU, like `sync(lo)` completed by an interrupt.
+    Wait { name: String, buf: Option<String> },
     /// `critical { .. }` (v2.2) -- the block runs with interrupts disabled.
     Critical { body: Block },
 }

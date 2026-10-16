@@ -116,6 +116,20 @@
           }
         },
         {
+          "match": "^\\s*(wait)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+(for)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*;",
+          "captures": {
+            "1": {
+              "name": "keyword.control.event.phase"
+            },
+            "2": {
+              "name": "variable.other.event.phase"
+            },
+            "3": {
+              "name": "keyword.control.event.phase"
+            }
+          }
+        },
+        {
           "match": "^\\s*(signal|wait)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*;",
           "captures": {
             "1": {

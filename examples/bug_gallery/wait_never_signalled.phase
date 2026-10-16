@@ -1,0 +1,32 @@
+// Bug gallery #44: waiting for an event nothing raises. The UART handler
+// acknowledges the receive interrupt and stores the byte -- but the line
+// that told `main` a byte had arrived was dropped in a refactor. `main`
+// sleeps in `wait rx_ready` forever; on the bench the board just stops
+// responding.
+// Expected: "`wait rx_ready` never returns: nothing signals 'rx_ready'"
+
+device Uart0 @ 0x40004000 {
+    DATA:      read write u32 @ 0x00;
+    INTSTATUS: read write u32 @ 0x0C { TX: bit 0, RX: bit 1 }
+}
+
+event rx_ready;
+
+extern fn store(c: u32);
+extern fn handle_line();
+
+interrupt fn on_rx() @ irq 0 {
+    let c: u32 = volatile_read(Uart0.DATA);
+    volatile_write(Uart0.INTSTATUS, 2);
+    store(c);
+    // BUG: `signal rx_ready;` used to be here.
+}
+
+fn main() {
+    let n: u32 = 0;
+    while n < 10 {
+        wait rx_ready;
+        handle_line();
+        n = n + 1;
+    }
+}

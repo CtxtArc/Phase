@@ -576,8 +576,10 @@ fn format_interrupt_support(program: &PirProgram) -> String {
     s.push_str(&format!(
         "{unused}static void phase_irq_restore(uint32_t m) {{\n    (void)m;\n}}\n"
     ));
-    s.push_str("/* Host build: nothing raises interrupts, so sleeping runs every handler\n * once, in IRQ order, as if each one's interrupt had just arrived. */\n");
+    s.push_str("/* Host build: nothing raises interrupts, so sleeping runs every handler\n * once, in IRQ order, as if each one's interrupt had just arrived. First,\n * phase_sim_hardware() -- if the program's C side defines it -- plays the\n * hardware: it can set the status bits the handlers test. */\n");
+    s.push_str("#if defined(__GNUC__)\nextern void phase_sim_hardware(void) __attribute__((weak));\n#endif\n");
     s.push_str(&format!("{unused}static void phase_sleep(void) {{\n"));
+    s.push_str("#if defined(__GNUC__)\n    if (phase_sim_hardware) {\n        phase_sim_hardware();\n    }\n#endif\n");
     for h in &handlers {
         s.push_str(&format!("    {}();\n", h.sig.name));
     }
@@ -905,8 +907,17 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
     let pad = "    ".repeat(indent);
     match inst {
         PirInst::Signal { event } => format!("{pad}phase_event_{event} = true;\n"),
-        PirInst::Wait { event } => {
-            format!("{pad}phase_wait(&phase_event_{event}, \"{event}\");\n")
+        PirInst::Wait { event, buf } => {
+            let mut s = format!("{pad}phase_wait(&phase_event_{event}, \"{event}\");\n");
+            if let Some(b) = buf {
+                s.push_str(&format!(
+                    "{pad}/* the interrupt that signalled {event} hands {b} back to the CPU */\n"
+                ));
+                if cx.checked && cx.is_buffer(b) {
+                    s.push_str(&format!("{pad}phase_chk_sync({b}, \"{b}\");\n"));
+                }
+            }
+            s
         }
         PirInst::Critical { body } => {
             let inner = format_block(body, cx, indent + 1);
@@ -2048,7 +2059,8 @@ mod tests {
             "__asm__ volatile(\"mrs %0, primask\\n\\tcpsid i\"",
             "__asm__ volatile(\"wfi\" : : : \"memory\");",
             // Host: sleeping runs the handlers.
-            "static void phase_sleep(void) {\n    on_timer();\n}",
+            "#endif\n    on_timer();\n}",
+            "extern void phase_sim_hardware(void) __attribute__((weak));",
             "phase_event_tick = true;",
             "phase_wait(&phase_event_tick, \"tick\");",
             "uint32_t phase_irq_state = phase_irq_save();",

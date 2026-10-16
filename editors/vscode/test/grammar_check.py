@@ -179,6 +179,9 @@ CASES = [
     ("interrupt fn on_t() @ irq 8 {\n    signal tick;\n}", 2, "signal", "keyword.control.event.phase"),
     ("fn main() {\n    wait tick;\n    critical {\n    }\n}", 2, "wait", "keyword.control.event.phase"),
     ("fn main() {\n    wait tick;\n    critical {\n    }\n}", 3, "critical", "keyword.control.critical.phase"),
+    ("fn main() {\n    wait ht for lo;\n}", 2, "wait", "keyword.control.event.phase"),
+    ("fn main() {\n    wait ht for lo;\n}", 2, "ht", "variable.other.event.phase"),
+    ("fn main() {\n    wait ht for lo;\n}", 2, "for", "keyword.control.event.phase"),
     # An instance line has no block: the next line is ordinary code again.
     ("device Uart0: Uart @ 0x40004000;\nfn main() { move x -> @DMA; }", 2, "main", "entity.name.function.phase"),
 ]

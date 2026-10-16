@@ -1,0 +1,44 @@
+// Bug gallery #43: the wrong half for an interrupt. The engine raises
+// half_done when it has filled `lo` and full_done when it has filled `hi`.
+// The shutdown code after the loop was copy-pasted with the events
+// swapped: on half_done it reads `hi` -- which the engine is still writing
+// into -- and on full_done it reads `lo`, which it has started refilling.
+// Each half has been handed to the engine, so ownership alone can't tell;
+// what can is that half_done already means `lo` in this function.
+// Expected: "`wait half_done for hi`, but `half_done` hands over 'lo' earlier in this function"
+
+event half_done;
+event full_done;
+
+interrupt fn dma0_irq() @ irq 11 {
+    signal half_done;
+    signal full_done;
+}
+
+extern fn start_circular(lo: write buffer<u16, 64> @RAM -> @DMA,
+                         hi: write buffer<u16, 64> @RAM -> @DMA);
+extern fn process(h: read buffer<u16, 64> @RAM);
+extern fn stop_circular();
+
+fn main() {
+    buffer<u16, 128> ring @RAM;
+    let n: u32 = 0;
+    split ring into lo, hi;
+    start_circular(lo, hi);
+    while n < 4 {
+        wait half_done for lo;
+        process(lo);
+        move lo -> @DMA;
+        wait full_done for hi;
+        process(hi);
+        move hi -> @DMA;
+        n = n + 1;
+    }
+    // BUG: the events are swapped.
+    wait half_done for hi;
+    process(hi);
+    wait full_done for lo;
+    process(lo);
+    stop_circular();
+    join lo, hi into ring;
+}

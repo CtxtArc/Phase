@@ -19,7 +19,7 @@ OK: examples/branching_pipeline.phase parsed and passed domain/ownership analysi
 ### `examples/circular_dma.phase`
 
 ```
-OK: examples/circular_dma.phase parsed and passed domain/ownership analysis (1 entity, 1 fn)
+OK: examples/circular_dma.phase parsed and passed domain/ownership analysis (1 entity, 2 fns)
 ```
 
 ### `examples/counting_loop.phase`
@@ -957,6 +957,25 @@ error: `wait tx_done` in interrupt handler code would never return: nothing can 
 examples/bug_gallery/wait_in_handler.phase: 1 error found
 ```
 
+### `examples/bug_gallery/wait_never_signalled.phase`
+
+Bug gallery #44: waiting for an event nothing raises. The UART handler
+
+```
+error: `wait rx_ready` never returns: nothing signals 'rx_ready' (an interrupt handler raises it with `signal rx_ready;`)
+  --> examples/bug_gallery/wait_never_signalled.phase:28:9
+   |
+28 |         wait rx_ready;
+   |         ^^^^^^^^^^^^^^
+note: 'rx_ready' is declared here
+  --> examples/bug_gallery/wait_never_signalled.phase:13:7
+   |
+13 | event rx_ready;
+   |       --------
+
+examples/bug_gallery/wait_never_signalled.phase: 1 error found
+```
+
 ### `examples/bug_gallery/write_borrow_conflict.phase`
 
 Bug gallery #3: two exclusive write borrows of the same entity at once.
@@ -1012,5 +1031,35 @@ note: 'view' is a read borrow taken here
    |     -----------------------------
 
 examples/bug_gallery/write_through_read_borrow.phase: 1 error found
+```
+
+### `examples/bug_gallery/wrong_half_event.phase`
+
+Bug gallery #43: the wrong half for an interrupt. The engine raises
+
+```
+error: `wait half_done for hi`, but `half_done` hands over 'lo' earlier in this function: an event means one transfer is done, so it can only give back one buffer
+  --> examples/bug_gallery/wrong_half_event.phase:38:5
+   |
+38 |     wait half_done for hi;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+note: `half_done` hands over 'lo' here
+  --> examples/bug_gallery/wrong_half_event.phase:29:9
+   |
+29 |         wait half_done for lo;
+   |         ----------------------
+
+error: `wait full_done for lo`, but `full_done` hands over 'hi' earlier in this function: an event means one transfer is done, so it can only give back one buffer
+  --> examples/bug_gallery/wrong_half_event.phase:40:5
+   |
+40 |     wait full_done for lo;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+note: `full_done` hands over 'hi' here
+  --> examples/bug_gallery/wrong_half_event.phase:32:9
+   |
+32 |         wait full_done for hi;
+   |         ----------------------
+
+examples/bug_gallery/wrong_half_event.phase: 2 errors found
 ```
 

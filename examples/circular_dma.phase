@@ -1,4 +1,4 @@
-// v1.4 example: circular DMA with half-transfer interrupts -- the way most
+// Circular DMA with half-transfer interrupts -- the way most
 // microcontroller ADC drivers (STM32 and friends) stream continuously.
 //
 // The DMA engine runs in circular mode over one buffer, forever: it fills
@@ -10,21 +10,48 @@
 // `split ring into lo, hi` makes the two halves separately tracked
 // buffers, so the checker can tell which half the CPU may touch at each
 // point; `ring` itself is off limits until `join lo, hi into ring`.
+//
+// v2.3: the interrupt handler hands the halves over. It raises
+// `half_done` or `full_done`, and `wait half_done for lo` gives `lo` back
+// to the CPU -- no blocking driver call. Within a function, an event
+// always gives back the same half: `wait half_done for hi` here would be
+// an error.
 
 entity Sample : @RAM {
     value: f32
 }
 
-// Start circular mode over both halves: the engine owns both.
+// A simple DMA controller, invented for this example (QEMU's model of the
+// MPS2 board has none; a host build simulates it, see
+// runtime/circular_dma_extern.c).
+device Dma0 @ 0x40020000 {
+    // Which halves are done: half transfer, transfer complete.
+    STATUS: read u32 @ 0x00 { HT: bit 0, TC: bit 1 }
+    // Write 1 to a bit to clear that bit of STATUS.
+    CLEAR: write u32 @ 0x04;
+    CTRL: read write u32 @ 0x08 = 0 {
+        ENABLE: bit 0, CIRCULAR: bit 1, HT_IRQ: bit 2, TC_IRQ: bit 3
+    }
+}
+
+event half_done;
+event full_done;
+
+interrupt fn dma0_irq() @ irq 11 {
+    if volatile_read(Dma0.STATUS.HT) == 1 {
+        volatile_write(Dma0.CLEAR, 1);
+        signal half_done;
+    }
+    if volatile_read(Dma0.STATUS.TC) == 1 {
+        volatile_write(Dma0.CLEAR, 2);
+        signal full_done;
+    }
+}
+
+// Point the engine at the two halves (their addresses go into its
+// address registers, which is C's job); from here on, the engine owns both.
 extern fn start_circular(lo: write buffer<Sample, 64> @RAM -> @DMA,
                          hi: write buffer<Sample, 64> @RAM -> @DMA);
-// Wait for the half-transfer / transfer-complete interrupt for this half:
-// the engine has filled it and moved on to the other one.
-extern fn wait_half(h: buffer<Sample, 64> @DMA -> @RAM);
-// Hand the half back before the engine wraps around to it.
-extern fn requeue(h: write buffer<Sample, 64> @RAM -> @DMA);
-extern fn stop_circular(lo: buffer<Sample, 64> @DMA -> @RAM,
-                        hi: buffer<Sample, 64> @DMA -> @RAM);
 
 extern fn process(h: read buffer<Sample, 64> @RAM);
 extern fn summarize(x: read buffer<Sample, 128> @RAM);
@@ -35,18 +62,23 @@ fn main() {
 
     split ring into lo, hi;
     start_circular(lo, hi);
+    // Enable, circular mode, both interrupts.
+    volatile_write(Dma0.CTRL, 15);
 
     while n < 4 {
-        wait_half(lo);      // half-transfer: the engine is filling hi now
+        wait half_done for lo;  // the engine is filling hi now
         process(lo);
-        requeue(lo);
-        wait_half(hi);      // transfer complete: the engine wrapped to lo
+        move lo -> @DMA;        // back to the engine before it wraps around
+        wait full_done for hi;  // the engine wrapped around to lo
         process(hi);
-        requeue(hi);
+        move hi -> @DMA;
         n = n + 1;
     }
 
-    stop_circular(lo, hi);
+    // Switch the engine off and wait for it to let go of both halves.
+    volatile_write(Dma0.CTRL.ENABLE, 0);
+    sync(lo);
+    sync(hi);
     join lo, hi into ring;
     summarize(ring);        // the whole buffer is the CPU's again
 }
