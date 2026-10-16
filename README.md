@@ -589,7 +589,8 @@ Likely next:
 - **M12 — An LLVM backend**, removing the dependency on an external `cc`
   ([`phase_specification.md`](phase_specification.md) §9).
 - **Real boards** — an STM32 Nucleo, with its own DMA controller and
-  interrupts, run on silicon instead of QEMU.
+  interrupts, run on silicon instead of QEMU. What the language needs for
+  that is in [`docs/real_boards.md`](docs/real_boards.md).
 - **More from the language server** — completion of names and register
   fields, rename.
 
