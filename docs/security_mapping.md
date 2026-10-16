@@ -725,6 +725,48 @@ deliver: the system hangs with that priority level masked.
 
 ---
 
+## #43 — An event handing back the wrong half
+
+**`examples/bug_gallery/wrong_half_event.phase`**
+
+**Category:** [CWE-362](https://cwe.mitre.org/data/definitions/362.html) —
+Concurrent execution using a shared resource with improper
+synchronization; [CWE-367](https://cwe.mitre.org/data/definitions/367.html)
+— time-of-check to time-of-use.
+
+**Real-world precedent:** the half-transfer / transfer-complete pair of a
+circular DMA stream (STM32 HAL's `HalfCpltCallback` and `CpltCallback`)
+handled the wrong way round: on "first half done", the code reads the
+second half — which the engine is writing at that moment. The data looks
+plausible and is torn, and nothing crashes.
+
+**What PHASE does:** `wait E for b` hands `b` back when the interrupt
+signals `E`. Within a function an event hands back one buffer: the first
+`wait half_done for lo` fixes it, and `wait half_done for hi` later is an
+error. (Both halves are with the engine here, so ownership alone can't
+tell them apart.)
+
+---
+
+## #44 — Waiting for an event nothing signals
+
+**`examples/bug_gallery/wait_never_signalled.phase`**
+
+**Category:** [CWE-835](https://cwe.mitre.org/data/definitions/835.html) —
+Loop with unreachable exit condition.
+
+**Real-world precedent:** a flag-based handshake whose setter was removed
+or never written — the receive handler still acknowledges the interrupt,
+but no longer sets the "data ready" flag — so the main loop sleeps
+forever; on the bench the device just stops responding.
+
+**What PHASE does:** a `wait E` is an error when no code reachable from
+`main` or a handler signals `E`. (A host build also stops a `wait` that
+1,000 rounds of handlers don't satisfy, for signals that exist but never
+run.)
+
+---
+
 ## Summary table
 
 | # | Bug-gallery file | CWE | Named real-world precedent |
@@ -771,3 +813,5 @@ deliver: the system hangs with that priority level masked.
 | 40 | `overlapping_devices.phase` | CWE-684 | a copy-pasted base address in a board file |
 | 41 | `interrupted_field_write.phase` | CWE-362 | `REG \|= BIT` racing an interrupt handler |
 | 42 | `wait_in_handler.phase` | CWE-833 | a handler blocking on an interrupt that can't run |
+| 43 | `wrong_half_event.phase` | CWE-362, CWE-367 | half-transfer and transfer-complete callbacks swapped |
+| 44 | `wait_never_signalled.phase` | CWE-835 | a "data ready" flag no handler sets any more |

@@ -7,7 +7,7 @@
 **A compiler that statically checks memory safety for hardware pipelines — DMA, MMIO, and zero-copy devices — before the code ever runs.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.2.0-success" alt="Version 2.2.0">
+  <img src="https://img.shields.io/badge/version-2.3.0-success" alt="Version 2.3.0">
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
 </p>
@@ -74,7 +74,10 @@ compiler guarantees:
 7. **Interrupt safety** — an `interrupt fn` handler can't lose a register
    write to the code it interrupts: a field write (read-modify-write) to a
    register a handler also writes must be inside `critical { }`. Nothing a
-   handler runs can `wait` for an event, which would never come.
+   handler runs can `wait` for an event, which would never come, and
+   nothing waits for an event no code signals. A handler can hand `main`
+   a buffer: `wait half_done for lo;` takes back the half of a circular
+   DMA buffer the engine just finished — and only that half.
 
 The precise rules, and the trust boundary they hold within, are in
 [`phase_specification.md`](phase_specification.md) §4.4.
@@ -87,21 +90,26 @@ itself at run time:
 ```
 $ phase build --checked --stub-externs program.phase   # instrumented build
 $ cargo run --release -p phase_fuzz -- --count 1000     # differential fuzzing
-1000 programs generated, 499 accepted by `phase check` (0 more only with warnings, not run), 0 soundness violations, 0 pipeline failures
+1000 programs generated, 456 accepted by `phase check` (0 more only with warnings, not run), 0 soundness violations, 0 pipeline failures
 ```
 
 - **`phase build --checked`** emits C that verifies every ownership rule
   on the path the program actually takes — a shadow state per buffer
   (size, domain, borrows, split) and per typestate value (state,
   consumed), checked at every move, sync, borrow, call, swap, rotate,
-  split, join and scope exit — and exits with status 70 on any violation.
-  It never reasons about branches or loops, so it is independent of the
-  analyzer.
+  split, join and scope exit — and every register access against its
+  declared map, every `wait` against where it may run, and every field
+  write against the interrupt handlers (it runs them between the read and
+  the write, and catches the write they'd lose). It exits with status 70
+  on any violation, and never reasons about branches or loops, so it is
+  independent of the analyzer.
 - **`phase-fuzz`** generates thousands of random programs — three buffer
   types with fixed and generic lengths, typestate values, borrows,
-  rotations, nested splits — builds every one the analyzer accepts in
-  checked mode, and runs it down different paths. An accepted program that
-  trips a runtime check is an analyzer soundness bug.
+  rotations, nested splits, and a device with interrupt handlers, events,
+  waits, buffer hand-offs and critical sections — builds every one the
+  analyzer accepts in checked mode, and runs it down different paths. An
+  accepted program that trips a runtime check is an analyzer soundness
+  bug.
 
 Its first runs found four real bugs — two analyzer holes (a buffer left
 DMA-owned at the end of an `if` block, and `swap` across blocks leaving a
@@ -116,9 +124,9 @@ every push.
 And the fuzzer demonstrably finds bugs when they exist: with one of the
 fixed analyzer holes deliberately put back, it reported 8 violations in
 the same first 1,000 programs that the real analyzer passes cleanly — and
-every rule family added in 1.4 (buffer types, typestate consumption,
-forged states, split and join) was checked the same way, one analyzer
-check removed at a time, and caught. Details, including the cases that
+every rule family added since (buffer types, typestate consumption,
+forged states, split and join, and in 2.3 registers and interrupts) was
+checked the same way, one analyzer check removed at a time, and caught. Details, including the cases that
 were *not* caught until the generator was fixed, in
 [`phase_specification.md`](phase_specification.md) §6.7.
 
@@ -255,9 +263,9 @@ deliberately broken program per rule, each rejected at compile time:
 - **[CWE-696/691] Inconsistent paths** — [`branch_domain_disagreement.phase`](examples/bug_gallery/branch_domain_disagreement.phase): two branches leaving a buffer in different domains.
 - **[CWE-362] Writing through read-only views** — [`write_through_read_borrow.phase`](examples/bug_gallery/write_through_read_borrow.phase), [`read_param_handed_to_writer.phase`](examples/bug_gallery/read_param_handed_to_writer.phase), [`read_only_to_unannotated_param.phase`](examples/bug_gallery/read_only_to_unannotated_param.phase): a read borrow or a `read` parameter handed to a kernel that writes, or to one that never said it only reads.
 - **[CWE-362/367] Broken double buffering** — [`refill_while_processing.phase`](examples/bug_gallery/refill_while_processing.phase), [`ping_pong_without_swap.phase`](examples/bug_gallery/ping_pong_without_swap.phase), [`swap_while_borrowed.phase`](examples/bug_gallery/swap_while_borrowed.phase): refilling the buffer the CPU is processing (a torn frame), forgetting to trade buffers, or swapping one out from under a live view.
-- **[CWE-362/367] Ring buffers and circular DMA** — [`process_half_in_flight.phase`](examples/bug_gallery/process_half_in_flight.phase), [`use_ring_while_split.phase`](examples/bug_gallery/use_ring_while_split.phase), [`join_with_half_in_flight.phase`](examples/bug_gallery/join_with_half_in_flight.phase), [`rotate_wrong_direction.phase`](examples/bug_gallery/rotate_wrong_direction.phase): processing the half the engine is still filling (the classic off-by-one-half in circular ADC drivers), using the whole buffer while half of it is in flight, treating it as whole again with one half still streaming, or rotating a triple-buffer ring the wrong way.
+- **[CWE-362/367] Ring buffers and circular DMA** — [`process_half_in_flight.phase`](examples/bug_gallery/process_half_in_flight.phase), [`use_ring_while_split.phase`](examples/bug_gallery/use_ring_while_split.phase), [`join_with_half_in_flight.phase`](examples/bug_gallery/join_with_half_in_flight.phase), [`rotate_wrong_direction.phase`](examples/bug_gallery/rotate_wrong_direction.phase), [`wrong_half_event.phase`](examples/bug_gallery/wrong_half_event.phase): processing the half the engine is still filling (the classic off-by-one-half in circular ADC drivers), using the whole buffer while half of it is in flight, treating it as whole again with one half still streaming, rotating a triple-buffer ring the wrong way, or taking the wrong half on a half-transfer interrupt.
 - **[CWE-684/908/197] Hardware register misuse** — [`write_read_only_register.phase`](examples/bug_gallery/write_read_only_register.phase), [`read_write_only_register.phase`](examples/bug_gallery/read_write_only_register.phase), [`field_write_on_write_only_register.phase`](examples/bug_gallery/field_write_on_write_only_register.phase), [`field_value_too_wide.phase`](examples/bug_gallery/field_value_too_wide.phase), [`overlapping_registers.phase`](examples/bug_gallery/overlapping_registers.phase), [`overlapping_devices.phase`](examples/bug_gallery/overlapping_devices.phase): clearing a flag through a read-only status register, trusting what a write-only register reads back as, `CMD |= START` on a write-only register, a prescaler value spilling into the enable bit, and copy-pasted register maps with two registers — or two whole devices — at one address.
-- **[CWE-362/833] Interrupt races and deadlocks** — [`interrupted_field_write.phase`](examples/bug_gallery/interrupted_field_write.phase), [`wait_in_handler.phase`](examples/bug_gallery/wait_in_handler.phase): a one-shot timer that keeps firing because `main`'s read-modify-write of its control register overwrote the handler's, and a handler that waits for an interrupt that can't run until it returns.
+- **[CWE-362/833] Interrupt races and deadlocks** — [`interrupted_field_write.phase`](examples/bug_gallery/interrupted_field_write.phase), [`wait_in_handler.phase`](examples/bug_gallery/wait_in_handler.phase), [`wait_never_signalled.phase`](examples/bug_gallery/wait_never_signalled.phase): a one-shot timer that keeps firing because `main`'s read-modify-write of its control register overwrote the handler's, a handler that waits for an interrupt that can't run until it returns, and a `main` that waits for an event a refactor stopped signalling.
 - **[CWE-416/825] Found by the fuzzer** — [`dma_into_dead_block.phase`](examples/bug_gallery/dma_into_dead_block.phase), [`swap_across_blocks.phase`](examples/bug_gallery/swap_across_blocks.phase): a buffer abandoned to the DMA engine at the end of an `if` block, or swapped with one from an inner block and left dangling.
 - **[CWE-787/843] Wrong buffer type** — [`buffer_length_mismatch.phase`](examples/bug_gallery/buffer_length_mismatch.phase), [`buffer_element_mismatch.phase`](examples/bug_gallery/buffer_element_mismatch.phase), [`runtime_length_to_fixed.phase`](examples/bug_gallery/runtime_length_to_fixed.phase): a shorter buffer where a longer one is required (a real overflow), bytes where samples are expected, or a run-time length where an exact one is assumed.
 - **[CWE-758] Aliasing and silent MMIO optimization** — [`aliased_arguments.phase`](examples/bug_gallery/aliased_arguments.phase) passes one buffer as both input and output of a kernel; [`volatile_wrong_domain.phase`](examples/bug_gallery/volatile_wrong_domain.phase) points a register access at RAM. `@MMIO` registers always lower to `volatile` C globals, so the C standard itself — not convention or code review — forbids the compiler from deleting or reordering the access.
@@ -433,8 +441,11 @@ the ring. Eight frames, processed in order across the three buffers.
 `examples/circular_dma.phase`: a DMA engine in circular mode over one
 buffer with half-transfer interrupts, the way most microcontroller ADC
 drivers stream. `split ring into lo, hi;` gives each half its own
-ownership, so the checker knows which half the CPU may touch; after
-`join lo, hi into ring;` the whole buffer is the CPU's again.
+ownership, so the checker knows which half the CPU may touch, and the
+interrupt handler hands each half to `main` as the engine finishes it
+(`wait half_done for lo;`); after `join lo, hi into ring;` the whole
+buffer is the CPU's again. A host build runs the real handler against a
+simulated DMA controller.
 
 `examples/multi_rate.phase`: one set of helpers, written once with
 length-generic parameters (`buffer<Sample, _>`), used for a 64- and a
@@ -510,27 +521,31 @@ has to discover the hard way:
   *prototype* for `extern fn`, never a body. `phase build` fails early
   with a clear message naming the missing file — or, with
   `--stub-externs`, generates placeholders to try the program without one.
-- **The runtime checker and the fuzzer cover buffers and typestate.**
-  Plain struct entities and device registers are checked statically but
-  not at run time, and the fuzzer uses three buffer types and one
-  typestate machine. Their silence is strong evidence for the rules they
-  exercise, not a proof of everything.
+- **The runtime checker and the fuzzer cover buffers, typestate,
+  registers and interrupts.** Plain struct entities are checked statically
+  but not at run time, and the fuzzer uses three buffer types, one
+  typestate machine and one device. Their silence is strong evidence for
+  the rules they exercise, not a proof of everything.
 - **One hardware target.** `--target=mps2-an385` (ARM Cortex-M3, validated
   on QEMU's model of the board). Another board needs its own startup code,
   linker script and wait functions under `runtime/`. There are no arrays
   of registers yet (a FIFO of 16 identical registers is 16 declarations).
 - **Interrupts are modeled simply.** One core, one priority level
   (handlers don't preempt each other), and events are flags, not
-  counters: two signals before a `wait` count as one. Handlers can't share
-  buffers with `main` — a DMA half-transfer handler can't hand `main` the
-  half it just finished, so `examples/circular_dma.phase` still waits for
-  each half with a blocking call. A host build has no interrupt sources:
-  each `wait` runs every handler once.
+  counters: two signals before a `wait` count as one. A handler hands
+  `main` a buffer through an event (`wait E for b`), not directly:
+  handlers have no parameters and there are no globals. That an event
+  gives back the right buffer is checked within a function, by name — an
+  event that hands back `lo` in one place and `hi` in another is caught,
+  but consistently swapped events are not. A host build has no interrupt
+  sources: each `wait` runs every handler once (after an optional C hook
+  that plays the hardware).
 - **Imports share one namespace.** `import` brings in every item of a
   file; there are no modules, qualified names or private items, so two
   files can't both declare a `send`.
-- **The language server reports diagnostics and symbols only.** No hover,
-  go-to-definition or completion yet.
+- **The language server has no completion or rename.** It reports
+  diagnostics and symbols, shows a local's owner and history on hover,
+  and jumps to declarations.
 - **No LLVM backend.** Compiling to readable C was a deliberate choice so
   the engineering effort goes into the analysis passes, not backend
   plumbing.
@@ -553,20 +568,20 @@ Full rationale for all of these is in
 
 ## What's next
 
-2.2 adds interrupts — handlers, events and critical sections — on top of
-2.1's imports and device types and 2.0's register maps, Cortex-M3 target
-and language server (see [`CHANGELOG.md`](CHANGELOG.md)). Likely next:
+2.3 lets interrupts hand buffers to `main`, fuzzes register and
+interrupt code, and adds hover and go-to-definition, on top of 2.2's
+interrupts, 2.1's imports and device types and 2.0's register maps,
+Cortex-M3 target and language server (see [`CHANGELOG.md`](CHANGELOG.md)).
+Likely next:
 
-- **Buffers handed over by interrupts** — a DMA half-transfer handler
-  giving `main` the half it just finished, checked like any other
-  hand-off, so circular DMA no longer needs a blocking wait.
+- **The VS Code extension**, packaged and tested.
 - **M12 — An LLVM backend**, removing the dependency on an external `cc`
   ([`phase_specification.md`](phase_specification.md) §9).
 - **A real DMA controller** — the ping-pong pipeline on a board with one
   (e.g. an STM32 Nucleo), instead of QEMU's MPS2 model, which has none —
   with its registers declared as a `device`.
-- **More from the language server** — hover with an entity's domain and
-  history, go-to-definition.
+- **More from the language server** — completion of names and register
+  fields, rename.
 
 For the complete language specification, domain model, type system, and
 full milestone roadmap, see

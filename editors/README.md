@@ -11,8 +11,11 @@ Two pieces, usable separately:
   and publishes the same diagnostics: the same underlines, warnings as
   warnings, and every note ("'b' is moved to @DMA here") as related
   information you can jump to. It also lists a file's functions and
-  devices (with their registers) as document symbols. It needs nothing
-  but the `phase` binary.
+  devices (with their registers) as document symbols. Hover over a buffer
+  to see who owns it at that line and the statements that got it there;
+  over a function, register, field or event to see its declaration.
+  Go-to-definition jumps to declarations, in imported files too. It needs
+  nothing but the `phase` binary.
 
 ## VS Code
 
@@ -27,8 +30,8 @@ The extension in [`vscode/`](vscode/) highlights `.phase` files and starts
 ```sh
 cd editors/vscode
 npm install                      # vscode-languageclient
-npx @vscode/vsce package         # -> phase-language-2.0.0.vsix
-code --install-extension phase-language-2.0.0.vsix
+npx @vscode/vsce package         # -> phase-language-2.3.0.vsix
+code --install-extension phase-language-2.3.0.vsix
 ```
 
 Setting `phase.serverPath` to an empty string keeps highlighting only.
@@ -67,7 +70,8 @@ Without lazy.nvim, put the first block in your `init.lua` and add
 `editors/vim` to `runtimepath` (`vim.opt.rtp:append(...)`). Errors appear
 inline; `vim.diagnostic.open_float()` (LazyVim: `<leader>cd`) shows one
 with its notes, and `]d`/`[d` jump between them. An error inside an
-imported file is shown on its `import` line.
+imported file is shown on its `import` line. `K` shows the hover (a
+buffer's owner and history) and `gd` goes to a definition.
 
 ## Vim
 

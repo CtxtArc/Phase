@@ -2,7 +2,7 @@
 
 **A physical-domain safety language for signal, RF, and embedded pipelines**
 
-Version 2.2
+Version 2.3
 
 ---
 
@@ -622,23 +622,64 @@ both). The analyzer follows the call graph to check:
 - **No early exit from `critical`.** A `return` inside it would leave
   interrupts disabled.
 
+- **No wait that never returns.** A `wait E` where no thread or handler
+  code signals `E` is an error (#44). (A `signal` that exists but is never
+  executed at run time can't be seen statically; a host build stops such a
+  program, below.)
+
 The model assumes one core and handlers that don't preempt each other
-(one priority level). Handlers have no access to `main`'s buffers — they
-have no parameters and PHASE has no globals — so ownership hand-offs
-between a handler and `main` (a DMA half-transfer handler giving `main`
-the half it just finished) are not expressible yet; events carry the
-"it happened", and registers the data.
+(one priority level).
+
+**Interrupts that hand over buffers (v2.3).** `wait E for b;` waits for
+`E` like `wait E;` and then hands `b` back to the CPU, like `sync(b)`:
+the event is the hardware saying it is done with `b` — a DMA engine's
+half-transfer interrupt saying the first half of a circular buffer is
+full:
+
+```phase
+interrupt fn dma0_irq() @ irq 11 {
+    if volatile_read(Dma0.STATUS.HT) == 1 { volatile_write(Dma0.CLEAR, 1); signal half_done; }
+    if volatile_read(Dma0.STATUS.TC) == 1 { volatile_write(Dma0.CLEAR, 2); signal full_done; }
+}
+...
+while n < 4 {
+    wait half_done for lo;   // the engine is filling hi now
+    process(lo);
+    move lo -> @DMA;         // back to the engine before it wraps around
+    wait full_done for hi;
+    process(hi);
+    move hi -> @DMA;
+    n = n + 1;
+}
+```
+
+`b` must be owned by the hardware (`@DMA` or `@DEVICE`) at the `wait`,
+exactly as for `sync`; afterwards it is `@RAM`. Within one function, every
+`wait E for ..` names the same buffer: an event means one particular
+transfer finished. `wait half_done for hi` after `wait half_done for lo`
+is an error (#43) — the classic wrong-half bug, which ownership alone
+can't see when both halves are with the engine. The rule is per function
+and by name: the first `wait E for b` in a function decides which buffer
+`E` gives back there, so swapping the events consistently throughout a
+function is not caught. Handlers still have no access to `main`'s buffers
+(no parameters, no globals): the hand-off is a promise the hardware and
+the handler keep — that `E` is signalled when the transfer of `b` is
+done — like the promise behind `sync`.
 
 In C, an event is a `volatile bool`; `critical` saves PRIMASK and executes
 `cpsid i`, restoring PRIMASK at the end; `wait` tests and clears its event
 with interrupts disabled and sleeps with `wfi` in between (which wakes on
 a pending interrupt even while they are disabled), so a signal can't slip
-in between the test and the sleep. Each handler becomes `IRQn_Handler`,
-replacing a weak entry of the vector table (`runtime/hw/startup.c`). A
-host build has no interrupt sources: there, sleeping runs every handler
-once, in IRQ order — as if each one's interrupt had just arrived — and a
-`wait` that 1,000 such rounds don't satisfy stops the program with a
-message rather than hanging it.
+in between the test and the sleep. `wait E for b` adds nothing at run
+time: the hand-off is ownership the compiler tracks. Each handler becomes
+`IRQn_Handler`, replacing a weak entry of the vector table
+(`runtime/hw/startup.c`). A host build has no interrupt sources: there,
+sleeping first calls `phase_sim_hardware()` — if the program's C side
+defines it, to play the hardware: set the status bits the handlers test
+(`runtime/circular_dma_extern.c` simulates a circular DMA engine this
+way) — and then runs every handler once, in IRQ order, as if each one's
+interrupt had just arrived. A `wait` that 1,000 such rounds don't satisfy
+stops the program with a message rather than hanging it.
 
 ---
 
@@ -742,7 +783,10 @@ For every program `phase check` accepts, within a function body:
 - **Interrupts.** No field write in thread code can lose a write made by
   an interrupt handler (it is inside `critical`, or no handler writes that
   register); no `wait` is reachable from a handler or inside `critical`;
-  interrupts are re-enabled at the end of every `critical` block (§3.16).
+  every `wait`ed event is signalled somewhere; interrupts are re-enabled
+  at the end of every `critical` block. A buffer handed back by `wait E
+  for b` was the hardware's, and within a function `E` always hands back
+  the same buffer (§3.16).
 
 **Trust boundary.** `extern fn` bodies are not analyzed (§3.9): PHASE
 trusts that a kernel does only what its signature says — touches only the
@@ -940,8 +984,23 @@ then from disk; a problem inside an imported file is shown on the
 linked to the real location. It answers `textDocument/documentSymbol` with the
 file's functions and devices (with their registers), follows the
 `shutdown`/`exit` protocol, and converts columns to UTF-16 as the
-protocol requires. Nothing else is implemented yet; other requests get
-`MethodNotFound`.
+protocol requires.
+
+**Hover and go-to-definition (v2.3).** Hovering a buffer or another
+local shows what the analyzer knows about it at that line — its type, its
+domain (and so who owns it), whether it is borrowed, split, a part of a
+split buffer, destroyed or consumed — followed by the statements before
+that line in the function that changed it (`- line 12: start(b); → in
+@DMA (the DMA engine has it)`). The state shown is the one the statement
+under the cursor starts in; on a line that declares the name, the one it
+ends in. A statement checked more than once (in a loop, or on paths that
+disagree in a rejected program) shows each state it was seen in.
+Hovering a function, extern, device, register, field or event shows its
+declaration; an event also lists the functions that signal and wait for
+it, a device its registers. `textDocument/definition` jumps to the
+declaration of the same names — a local's `let`/`buffer`/`split`, a
+parameter in its function's header, a register field in another file of
+the program. Other requests get `MethodNotFound`.
 
 `editors/` has a TextMate grammar (in a VS Code extension that also
 starts `phase lsp`), a Vim syntax file, and setup notes for Neovim,
@@ -974,6 +1033,19 @@ passed for a `_` parameter), extern domain change, parameter exit, and
 scope exit (every block end and every `return`). A split buffer's parts
 are checked to be its slices, and `join` checks that each part still
 holds its own slice and that all are in one domain.
+
+Registers and interrupts (v2.3): every register access is checked
+against the register's declared access, and every written value — a
+literal, or one computed at run time, which the analyzer doesn't see —
+against the width of the register or field. A `wait` inside a handler or
+inside `critical` fails; so does a `wait` 1,000 rounds of handlers don't
+satisfy, a function or `main` returning inside `critical`, and a `wait E
+for b` naming a different buffer than an earlier one for `E` in the same
+function (and `b` itself is checked like a `sync`). Lost writes are found
+by making them happen: a field write in thread code outside `critical`
+reads the register, runs every interrupt handler, and writes the result —
+and a handler writing that same register in between is reported as the
+lost write it would be.
 
 Typestate values are tracked by the address of the variable holding
 them: their state comes from the callee's *declared* return state (or,
@@ -1058,10 +1130,53 @@ changes, another 4,000 (1,710 accepted and run, including 1,000 at
 `--chaos 0.3`) produced none either; after 2.1's, another 4,000
 (1,740 accepted and run), and after 2.2's, another 4,000 (1,816).
 
+**Registers and interrupts (v2.3).** The generator now declares a device
+— four registers: read-write with fields, read-only, write-only, and a
+narrow read-write one with fields — and three events, and most programs
+get one or two interrupt handlers that write registers and signal
+events, unconditionally, every time they run. The code they interrupt
+reads and writes registers, waits for events, has buffers handed over
+with `wait E for b`, signals, and runs blocks in `critical`. Signals in
+thread code are only generated for events a handler signals too: a
+`signal` on a path not taken would hang a `wait` the analyzer accepted,
+which it doesn't promise against. A handler deviates as a whole (it
+waits, or writes a register wrongly) or not at all, and the rules about
+*where* something happens — a field write outside `critical`, a `wait`
+or `return` inside it, an event handing back a second buffer, a buffer
+handed back that the hardware doesn't have — deviate at a higher rate.
+`main` ends by calling every helper once with fresh buffers, so helper
+bodies run at least once. Mutation results, one analyzer check removed at
+a time, against the first 1,500 programs of a seed range the real
+analyzer passes cleanly:
+
+| Check removed from the analyzer | Violations found |
+|---|---|
+| field write in thread code to a register a handler writes | 9 (lost writes) |
+| `wait` in handler code | 9 |
+| `wait` inside `critical` | 4 |
+| `return` inside `critical` | 2 |
+| `wait` on an event nothing signals | 16 |
+| an event hands back one buffer per function | 3 |
+| `wait E for b`: `b` must be the hardware's | 11 |
+| reading a write-only register | 8 |
+| writing a read-only register | 5 |
+| a literal fits its register or field | 39 |
+
+Three of these were *not* caught by the first version of the generator:
+a `return` inside `critical` always left statements after the block (so
+every such program was rejected as unreachable code), and the two
+`wait E for b` mutants were reached only in helpers nothing called.
+Ending generation at that `return`, the targeted deviations, and calling
+every helper from `main` fixed that. With the real analyzer, 5,000 freshly
+generated programs from the 2.3 generator (1,925 accepted and run with
+several stub seeds each, including 1,000 at `--chaos 0.3`) produced no
+violations.
+
 **Scope of the evidence.** Struct entities other than typestate values
 are not tracked at run time; the generator covers one typestate machine,
-three buffer types, and no MMIO. Those parts are covered by the static
-tests and the bug gallery, not by fuzzing.
+three buffer types and one device, with handlers that call nothing. Those
+parts are covered by the static tests and the bug gallery, not by
+fuzzing.
 
 ---
 
@@ -1167,6 +1282,8 @@ for the analyzer and as the security narrative for the portfolio write-up.
 | 40 | Two devices at one address | A copy-pasted base address in a board file | "devices `DebugUart` (0x40005000..0x40005014) and `ModemUart` (0x40005000..0x40005014) overlap" |
 | 41 | A field write an interrupt handler can split | A lost register update: a one-shot timer that keeps firing | "writing field `Timer0.CTRL.ENABLE` reads `Timer0.CTRL` … interrupt handler `on_timer0` (IRQ 8) also writes `Timer0.CTRL`" |
 | 42 | Waiting inside an interrupt handler | A handler that sleeps forever, blocking its priority level | "`wait tx_done` in interrupt handler code would never return" |
+| 43 | An event handing back the wrong half | Processing the half of a circular buffer the DMA engine is still writing | "`wait half_done for hi`, but `half_done` hands over 'lo' earlier in this function" |
+| 44 | Waiting for an event nothing signals | A board that hangs because a refactor dropped a handler's `signal` | "`wait rx_ready` never returns: nothing signals 'rx_ready'" |
 
 Every file in `examples/bug_gallery/` carries its expected error in an
 `// Expected: "..."` header, and a test asserts the analyzer produces it.
@@ -1382,6 +1499,19 @@ graph from every handler to catch a field write a handler can split and a
 `wait` that can never return. Output: `examples/timer_ticks.phase` takes
 five real timer interrupts on QEMU's MPS2 AN385 model; bug-gallery
 #41–#42; a tutorial step.
+
+**v2.3 — Interrupts hand over buffers; fuzzing hardware code; hover**
+`wait E for b` lets the interrupt that signals `E` hand buffer `b` back to
+`main`, checked like `sync`, with an event always handing back the same
+buffer within a function; a `wait` on an event nothing signals is an
+error (§3.16). Checked builds verify register accesses and interrupt
+rules at run time, including lost writes (§6.7), and the fuzzer generates
+devices, handlers, events, waits, hand-offs and critical sections, each
+rule validated by mutation. The language server shows a local's owner and
+history on hover and jumps to declarations (§6.8). Output:
+`examples/circular_dma.phase` streams eight blocks from its interrupt
+handler, against a simulated DMA controller in a host build; bug-gallery
+#43–#44.
 
 **M12 — LLVM backend** *(not yet started)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead

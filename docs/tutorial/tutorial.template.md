@@ -303,6 +303,34 @@ when the `wait` is in a function the handler calls:
 On QEMU's model of the board, `examples/timer_ticks.phase` takes five real
 timer interrupts this way.
 
+### Interrupts that hand over buffers
+
+In section 6 the CPU waited for each half of the circular buffer with a
+blocking driver call. On a real chip it's the DMA engine's interrupt
+that knows a half is full, so let the handler say so: `wait E for b`
+waits for event `E`, and the interrupt that signalled it hands `b` back
+to the CPU — like `sync(b)`, completed by the hardware.
+`examples/circular_dma.phase` streams this way:
+
+{{excerpt ../../examples/circular_dma.phase 40-49}}
+
+{{excerpt ../../examples/circular_dma.phase 68-76}}
+
+`b` must be the hardware's when you wait for it, as for `sync`. And
+within a function an event always hands back the same buffer: once
+`half_done` gives back `lo`, it can't give back `hi` — the half the
+engine is still filling:
+
+{{excerpt 9_wrong_half.phase 17-22}}
+
+{{run phase check 9_wrong_half.phase}}
+
+A host build of the example plays the DMA controller in C
+(`runtime/circular_dma_extern.c` sets the engine's status bits), and the
+real handler hands the halves over:
+
+{{run phase build --run ../../examples/circular_dma.phase}}
+
 ## 10. Trust, and checking the checker
 
 PHASE can't see inside your C. It trusts that an `extern fn` does what

@@ -4,6 +4,60 @@ All notable changes to PHASE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] — 2026-10-16
+
+Interrupts hand over buffers: `wait half_done for lo;` lets the interrupt
+that signals an event give `main` the buffer the hardware just finished —
+checked like `sync`, and an event always gives back the same buffer
+within a function — so circular DMA runs off its interrupt instead of a
+blocking call. Register and interrupt code is now fuzzed, and the
+language server explains who owns a buffer on hover.
+
+Every program 2.2 accepted is still accepted, unless it waits for an
+event nothing signals — which would hang.
+
+Each of the analyzer's ten register and interrupt checks, removed in turn,
+was caught by the fuzzer within 1,500 programs; with the real analyzer,
+5,000 freshly fuzzed programs (1,925 accepted and run in checked mode,
+including 1,000 at `--chaos 0.3`) produced no soundness violations.
+
+### Added
+
+- **`wait E for b;`** (spec §3.16): waits for `E`, then hands `b` back to
+  the CPU. `b` must be `@DMA`/`@DEVICE`-owned, as for `sync`; within a
+  function, every `wait E for ..` names the same buffer (bug gallery
+  #43).
+- **A `wait` on an event no reachable code signals is an error** (#44).
+- **Host builds can play the hardware**: before running the handlers, a
+  `wait` calls `phase_sim_hardware()` if the program's C side defines it.
+- `examples/circular_dma.phase` now declares a DMA controller and its
+  interrupt handler, and runs it against a simulated engine.
+- **Checked builds verify registers and interrupts at run time** (spec
+  §6.7): register access modes, written values (including computed
+  ones), `wait` in handlers or `critical`, waits no handler satisfies,
+  `return` inside `critical`, and an event handing back two buffers. A
+  field write outside `critical` runs the handlers between its read and
+  its write, and reports a handler write to the same register as the
+  lost write it would be.
+- **The fuzzer generates register and interrupt code**: a device with
+  four registers of different modes and widths, interrupt handlers that
+  write registers and signal events, and register reads and writes,
+  waits, buffer hand-offs, signals and critical sections in the code they
+  interrupt. Each of the analyzer's register and interrupt checks was
+  removed in turn to confirm the fuzzer catches it (spec §6.7).
+- **Language server: hover and go-to-definition** (spec §6.8). Hovering a
+  local shows its type, owner, borrows and split state at that line and
+  the statements that changed it; hovering a function, device, register,
+  field or event shows its declaration (an event: who signals and waits
+  for it). Definitions are found across imports.
+- Tutorial: interrupts that hand over buffers. Grammar and Vim syntax for
+  `wait E for b`.
+
+### Changed
+
+- Internal crate APIs: `Stmt::Wait` and `PirInst::Wait` carry the buffer
+  handed over; `RegRef` carries the register's access; `phase_analysis::trace`.
+
 ## [2.2.0] — 2026-10-16
 
 Interrupts. A handler is an `interrupt fn` bound to its IRQ; it tells the

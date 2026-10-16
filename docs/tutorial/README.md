@@ -28,7 +28,7 @@ $ cd docs/tutorial
 
 ```console
 $ phase --version
-phase 2.2.0
+phase 2.3.0
 ```
 
 Work inside the clone (here, `docs/tutorial/`): `phase build` finds the
@@ -892,6 +892,107 @@ error: `wait sent` in interrupt handler code would never return: nothing can int
 
 On QEMU's model of the board, `examples/timer_ticks.phase` takes five real
 timer interrupts this way.
+
+### Interrupts that hand over buffers
+
+In section 6 the CPU waited for each half of the circular buffer with a
+blocking driver call. On a real chip it's the DMA engine's interrupt
+that knows a half is full, so let the handler say so: `wait E for b`
+waits for event `E`, and the interrupt that signalled it hands `b` back
+to the CPU — like `sync(b)`, completed by the hardware.
+`examples/circular_dma.phase` streams this way:
+
+`../../examples/circular_dma.phase`, lines 40-49:
+
+```phase
+interrupt fn dma0_irq() @ irq 11 {
+    if volatile_read(Dma0.STATUS.HT) == 1 {
+        volatile_write(Dma0.CLEAR, 1);
+        signal half_done;
+    }
+    if volatile_read(Dma0.STATUS.TC) == 1 {
+        volatile_write(Dma0.CLEAR, 2);
+        signal full_done;
+    }
+}
+```
+
+`../../examples/circular_dma.phase`, lines 68-76:
+
+```phase
+    while n < 4 {
+        wait half_done for lo;  // the engine is filling hi now
+        process(lo);
+        move lo -> @DMA;        // back to the engine before it wraps around
+        wait full_done for hi;  // the engine wrapped around to lo
+        process(hi);
+        move hi -> @DMA;
+        n = n + 1;
+    }
+```
+
+`b` must be the hardware's when you wait for it, as for `sync`. And
+within a function an event always hands back the same buffer: once
+`half_done` gives back `lo`, it can't give back `hi` — the half the
+engine is still filling:
+
+`9_wrong_half.phase`, lines 17-22:
+
+```phase
+    wait half_done for lo;
+    process(lo);
+    move lo -> @DMA;
+    wait half_done for hi;   // should be full_done
+    process(hi);
+    wait full_done for lo;
+```
+
+```console
+$ phase check 9_wrong_half.phase
+error: `wait half_done for hi`, but `half_done` hands over 'lo' earlier in this function: an event means one transfer is done, so it can only give back one buffer
+  --> 9_wrong_half.phase:20:5
+   |
+20 |     wait half_done for hi;   // should be full_done
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+note: `half_done` hands over 'lo' here
+  --> 9_wrong_half.phase:17:5
+   |
+17 |     wait half_done for lo;
+   |     ----------------------
+
+9_wrong_half.phase: 1 error found
+```
+
+A host build of the example plays the DMA controller in C
+(`runtime/circular_dma_extern.c` sets the engine's status bits), and the
+real handler hands the halves over:
+
+```console
+$ phase build --run ../../examples/circular_dma.phase
+OK: built /path/to/phase/build/circular_dma
+[sim] start_circular: engine set up over 64 + 64 samples
+[sim] DMA: lo is full (block 0), interrupt
+[sim] process: block 0 from lo
+[sim] DMA: hi is full (block 1), interrupt
+[sim] process: block 1 from hi
+[sim] DMA: lo is full (block 2), interrupt
+[sim] process: block 2 from lo
+[sim] DMA: hi is full (block 3), interrupt
+[sim] process: block 3 from hi
+[sim] DMA: lo is full (block 4), interrupt
+[sim] process: block 4 from lo
+[sim] DMA: hi is full (block 5), interrupt
+[sim] process: block 5 from hi
+[sim] DMA: lo is full (block 6), interrupt
+[sim] process: block 6 from lo
+[sim] DMA: hi is full (block 7), interrupt
+[sim] process: block 7 from hi
+[sim] sim_dma_wait("lo"): waiting for DMA transfer to complete (256 bytes)...
+[sim] sim_dma_wait("lo"): DMA transfer complete
+[sim] sim_dma_wait("hi"): waiting for DMA transfer to complete (256 bytes)...
+[sim] sim_dma_wait("hi"): DMA transfer complete
+[sim] summarize: 128 samples, halves hold blocks 6 and 7
+```
 
 ## 10. Trust, and checking the checker
 

@@ -17,7 +17,9 @@
  *
  * Buffers are tracked by storage (domain, size, borrows, destroyed) and
  * typestate values by their address (state, consumed). Struct entities
- * that are not typestate values are not tracked.
+ * that are not typestate values are not tracked. Since v2.3, register
+ * accesses are checked against their declared map, and interrupts against
+ * where a `wait` may run and which writes a handler would lose.
  *
  * On a violation the process prints "PHASE runtime check failed: ..." to
  * stderr and exits with status 70.
