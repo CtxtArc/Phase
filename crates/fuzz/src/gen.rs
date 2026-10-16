@@ -12,6 +12,13 @@
 //! Buffers come in three types (`u8` x 8, `u8` x 16, `f32` x 8) and meet
 //! externs and helpers with fixed and `_` lengths; typestate values follow
 //! a `Pkt { Raw -> Parsed -> Checked }` machine.
+//!
+//! Since v2.3 every program also has a device (`Fz`, four registers of
+//! different access modes and widths, two with fields) and three events,
+//! and most have interrupt handlers: they write registers and signal
+//! events, and the code they interrupt reads and writes registers, waits
+//! (and has the handlers hand it buffers with `wait E for b`), signals, and
+//! runs blocks in `critical`.
 
 use std::fmt::Write as _;
 
@@ -360,7 +367,69 @@ fn tparse(p: Pkt<Raw>) -> Pkt<Parsed> {
 fn tshow(p: read Pkt<Checked>) {
     peek(p);
 }
+
+device Fz @ 0x40000000 {
+    CTRL: read write u32 @ 0x00 = 0 { EN: bit 0, MODE: bits 1..=3, IE: bit 4 }
+    STAT: read u8 @ 0x04;
+    LOAD: write u16 @ 0x08;
+    ACK: read write u8 @ 0x0C { DONE: bit 0, ERR: bit 1 }
+}
+
+event ev0;
+event ev1;
+event ev2;
 ";
+
+/// A register of `Fz`: name, readable, writable, width, fields.
+struct Reg {
+    name: &'static str,
+    readable: bool,
+    writable: bool,
+    bits: u32,
+    fields: &'static [(&'static str, u32)],
+}
+
+const REGS: &[Reg] = &[
+    Reg {
+        name: "CTRL",
+        readable: true,
+        writable: true,
+        bits: 32,
+        fields: &[("EN", 1), ("MODE", 3), ("IE", 1)],
+    },
+    Reg {
+        name: "STAT",
+        readable: true,
+        writable: false,
+        bits: 8,
+        fields: &[],
+    },
+    Reg {
+        name: "LOAD",
+        readable: false,
+        writable: true,
+        bits: 16,
+        fields: &[],
+    },
+    Reg {
+        name: "ACK",
+        readable: true,
+        writable: true,
+        bits: 8,
+        fields: &[("DONE", 1), ("ERR", 1)],
+    },
+];
+
+const EVENTS: [&str; 3] = ["ev0", "ev1", "ev2"];
+
+/// What the program's interrupt handlers do, for the code they interrupt.
+#[derive(Default)]
+struct Hw {
+    /// Events some handler signals (every time it runs).
+    signalled: Vec<&'static str>,
+    /// Registers some handler writes.
+    handler_regs: Vec<&'static str>,
+}
 
 struct FnGen<'a> {
     rng: &'a mut Rng,
@@ -374,6 +443,40 @@ struct FnGen<'a> {
     /// Typestate values below this index were created outside the
     /// innermost loop: consuming one there would reuse it next iteration.
     pkt_floor: usize,
+    hw: &'a Hw,
+    /// Generating an interrupt handler's body.
+    in_handler: bool,
+    /// Inside `critical { }`.
+    in_critical: bool,
+    /// `wait E for b` so far in this function: (E, b).
+    handovers: Vec<(&'static str, String)>,
+    /// Registers this function writes.
+    written: Vec<&'static str>,
+    /// No register or interrupt deviations at all (a handler that isn't
+    /// the one deviating).
+    clean: bool,
+}
+
+impl<'a> FnGen<'a> {
+    fn new(rng: &'a mut Rng, cfg: Config, helpers: &'a [Helper], hw: &'a Hw) -> Self {
+        FnGen {
+            rng,
+            cfg,
+            helpers,
+            out: String::new(),
+            counter: 0,
+            bufs: Vec::new(),
+            handles: Vec::new(),
+            pkts: Vec::new(),
+            pkt_floor: 0,
+            hw,
+            in_handler: false,
+            in_critical: false,
+            handovers: Vec::new(),
+            written: Vec::new(),
+            clean: false,
+        }
+    }
 }
 
 impl FnGen<'_> {
@@ -492,7 +595,7 @@ impl FnGen<'_> {
 
     /// Emit one statement. Returns true if it was a `return`.
     fn stmt(&mut self, depth: usize, in_loop: bool) -> bool {
-        match self.rng.below(146) {
+        match self.rng.below(200) {
             0..=11 => self.declare(depth),
             12..=19 => self.op_move(depth),
             20..=27 => self.op_sync(depth),
@@ -504,7 +607,9 @@ impl FnGen<'_> {
             73..=80 if depth < self.cfg.max_depth => self.op_if(depth, in_loop),
             81..=86 if depth < self.cfg.max_depth => self.op_while(depth),
             87..=91 => self.op_helper_call(depth),
-            92..=93 if depth > 0 && !in_loop => {
+            // (A `return` inside `critical` would leave interrupts off:
+            // only as a deviation.)
+            92..=93 if depth > 0 && !in_loop && (!self.in_critical || self.targeted()) => {
                 self.repair_all(depth);
                 self.line(depth, "return;");
                 return true;
@@ -516,6 +621,12 @@ impl FnGen<'_> {
             130..=135 => self.op_split(depth),
             136..=140 => self.op_join(depth),
             141..=145 => self.op_rotate(depth),
+            146..=155 => self.op_reg_write(depth),
+            156..=161 => self.op_reg_read(depth),
+            162..=169 => self.op_wait(depth),
+            170..=175 if depth < self.cfg.max_depth => return self.op_critical(depth, in_loop),
+            176..=177 => self.op_signal(depth),
+            178..=199 => self.op_wait_for(depth),
             _ => self.op_call(depth),
         }
         false
@@ -640,6 +751,246 @@ impl FnGen<'_> {
             (Elem::F32, Dom::Device) => "femit",
             (Elem::F32, _) => "fstart",
         }
+    }
+
+    // ---- registers and interrupts ---------------------------------------
+
+    /// Interrupt deviations are a small share of statements, so they get a
+    /// higher rate than the global chaos setting (like typestate's, if less
+    /// so: a program has several register accesses, each a chance to
+    /// deviate).
+    fn hw_chaos(&mut self) -> bool {
+        !self.clean && self.rng.chance((self.cfg.chaos * 1.5).min(0.5))
+    }
+
+    /// The interrupt rules about *where* something happens (a field write
+    /// outside `critical`, a `wait` or `return` inside it) only get a
+    /// chance to deviate in the rare places they apply, so those get a
+    /// higher rate still.
+    fn targeted(&mut self) -> bool {
+        !self.clean && self.rng.chance((self.cfg.chaos * 4.0).min(0.5))
+    }
+
+    fn op_reg_write(&mut self, depth: usize) {
+        let wrong_reg = self.hw_chaos();
+        let regs: Vec<usize> = (0..REGS.len())
+            .filter(|&i| wrong_reg || REGS[i].writable)
+            .collect();
+        let r = &REGS[*self.rng.pick(&regs).unwrap()];
+        let field = if !r.fields.is_empty() && self.rng.chance(0.65) {
+            Some(r.fields[self.rng.below(r.fields.len())])
+        } else {
+            None
+        };
+        let width = field.map_or(r.bits, |(_, w)| w);
+        let max = if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
+        let value = if self.hw_chaos() {
+            max + 1 + self.rng.below(3) as u64
+        } else {
+            match self.rng.below(3) {
+                0 => 0,
+                1 => max,
+                _ => self.next_below(max),
+            }
+        };
+        let target = match field {
+            Some((f, _)) => format!("Fz.{}.{f}", r.name),
+            None => format!("Fz.{}", r.name),
+        };
+        let write = format!("volatile_write({target}, {value});");
+        if !self.written.contains(&r.name) {
+            self.written.push(r.name);
+        }
+        // A field write is read-modify-write: if a handler writes the same
+        // register, the code it interrupts must do it in `critical`.
+        let racy = field.is_some()
+            && !self.in_handler
+            && !self.in_critical
+            && self.hw.handler_regs.contains(&r.name);
+        if racy && !self.targeted() {
+            self.line(depth, &format!("critical {{ {write} }}"));
+        } else {
+            self.line(depth, &write);
+        }
+    }
+
+    fn next_below(&mut self, max: u64) -> u64 {
+        self.rng.next_u64() % (max.min(1 << 20) + 1)
+    }
+
+    fn op_reg_read(&mut self, depth: usize) {
+        let wrong_reg = self.hw_chaos();
+        let regs: Vec<usize> = (0..REGS.len())
+            .filter(|&i| wrong_reg || REGS[i].readable)
+            .collect();
+        let r = &REGS[*self.rng.pick(&regs).unwrap()];
+        let target = if !r.fields.is_empty() && self.rng.chance(0.5) {
+            format!(
+                "Fz.{}.{}",
+                r.name,
+                r.fields[self.rng.below(r.fields.len())].0
+            )
+        } else {
+            format!("Fz.{}", r.name)
+        };
+        let v = self.fresh("v");
+        self.line(depth, &format!("let {v}: u32 = volatile_read({target});"));
+    }
+
+    /// An event a `wait` can rely on: one a handler signals -- or, as a
+    /// deviation, any event.
+    fn wait_event(&mut self) -> Option<&'static str> {
+        if self.hw_chaos() {
+            return Some(EVENTS[self.rng.below(EVENTS.len())]);
+        }
+        self.rng.pick(&self.hw.signalled).copied()
+    }
+
+    /// Whether a `wait` may go here: not in a handler, not in `critical`
+    /// (both only as deviations).
+    fn may_wait(&mut self) -> bool {
+        !(self.in_handler || self.in_critical) || self.targeted()
+    }
+
+    fn op_wait(&mut self, depth: usize) {
+        if !self.may_wait() {
+            return;
+        }
+        if let Some(e) = self.wait_event() {
+            self.line(depth, &format!("wait {e};"));
+        }
+    }
+
+    fn op_signal(&mut self, depth: usize) {
+        // Only events a handler signals anyway: a `signal` in thread code
+        // that a `wait` depended on could be on a path not taken, and the
+        // program would hang (which the analyzer doesn't promise against).
+        if let Some(&e) = self.rng.pick(&self.hw.signalled) {
+            self.line(depth, &format!("signal {e};"));
+        }
+    }
+
+    /// `wait E for b`: the handler signalling E hands `b` back.
+    fn op_wait_for(&mut self, depth: usize) {
+        if !self.may_wait() {
+            return;
+        }
+        let mut in_flight = self.candidates(Some(Dom::Dma), true, true);
+        in_flight.extend(self.candidates(Some(Dom::Device), true, true));
+        if in_flight.is_empty() && !self.hw.signalled.is_empty() {
+            match self.start_transfer(depth) {
+                Some(b) => in_flight.push(b),
+                None => return,
+            }
+        }
+        let deviation = if self.targeted() {
+            self.wait_for_deviation(depth, &in_flight)
+        } else {
+            None
+        };
+        let (event, buf) = match deviation {
+            Some(pair) => pair,
+            None => {
+                // An event already handing over a buffer that is in flight,
+                // or a new event for one.
+                let mapped: Vec<(&'static str, String)> = self
+                    .handovers
+                    .iter()
+                    .filter(|(_, b)| in_flight.contains(b))
+                    .cloned()
+                    .collect();
+                let free = self.free_events();
+                if !mapped.is_empty() && (free.is_empty() || self.rng.chance(0.6)) {
+                    self.rng.pick(&mapped).cloned().unwrap()
+                } else {
+                    let (Some(&e), Some(b)) = (self.rng.pick(&free), self.rng.pick(&in_flight))
+                    else {
+                        return;
+                    };
+                    (e, b.clone())
+                }
+            }
+        };
+        self.line(depth, &format!("wait {event} for {buf};"));
+        if !self.handovers.iter().any(|(e, _)| *e == event) {
+            self.handovers.push((event, buf.clone()));
+        }
+        self.set_dom(&buf, Dom::Ram);
+    }
+
+    /// Hand a CPU buffer to the DMA engine, to have one to wait for.
+    fn start_transfer(&mut self, depth: usize) -> Option<String> {
+        let free = self.candidates(Some(Dom::Ram), true, true);
+        let b = self.rng.pick(&free)?.clone();
+        let ty = self.ty_of(&b)?;
+        let f = Self::handoff_extern(ty, Dom::Dma);
+        self.line(depth, &format!("{f}({b});"));
+        self.set_dom(&b, Dom::Dma);
+        Some(b)
+    }
+
+    /// Signalled events not yet handing over a buffer in this function.
+    fn free_events(&self) -> Vec<&'static str> {
+        self.hw
+            .signalled
+            .iter()
+            .copied()
+            .filter(|e| !self.handovers.iter().any(|(m, _)| m == e))
+            .collect()
+    }
+
+    /// A `wait E for b` that breaks exactly one rule, if one can be made
+    /// here: an event that hands over another buffer in this function
+    /// (with `b` in flight, so ownership alone is fine), or a buffer the
+    /// hardware doesn't have (with `E` free to hand it over).
+    fn wait_for_deviation(
+        &mut self,
+        depth: usize,
+        in_flight: &[String],
+    ) -> Option<(&'static str, String)> {
+        if !self.handovers.is_empty() && self.rng.chance(0.8) {
+            let mut in_flight = in_flight.to_vec();
+            if !self.handovers.is_empty() && in_flight.len() < 2 {
+                in_flight.extend(self.start_transfer(depth));
+            }
+            let pairs: Vec<(&'static str, String)> = self
+                .handovers
+                .iter()
+                .flat_map(|(e, mapped)| {
+                    in_flight
+                        .iter()
+                        .filter(move |b| *b != mapped)
+                        .map(move |b| (*e, b.clone()))
+                })
+                .collect();
+            self.rng.pick(&pairs).cloned()
+        } else {
+            let cpu = self.candidates(Some(Dom::Ram), true, true);
+            let b = self.rng.pick(&cpu)?.clone();
+            let mut events = self.free_events();
+            events.extend(
+                self.handovers
+                    .iter()
+                    .filter(|(_, m)| *m == b)
+                    .map(|(e, _)| *e),
+            );
+            let e = *self.rng.pick(&events)?;
+            Some((e, b))
+        }
+    }
+
+    /// Returns true if the block returned (so nothing may follow it).
+    fn op_critical(&mut self, depth: usize, in_loop: bool) -> bool {
+        self.line(depth, "critical {");
+        let was = std::mem::replace(&mut self.in_critical, true);
+        let returned = self.scoped_block(depth + 1, in_loop);
+        self.in_critical = was;
+        self.line(depth, "}");
+        returned
     }
 
     // ---- typestate values ----------------------------------------------
@@ -1090,6 +1441,43 @@ impl FnGen<'_> {
         }
     }
 
+    /// At the end of `main`: call every helper once more, with fresh
+    /// buffers prepared for it, so its body runs (and is checked at run
+    /// time) even when no random call reached it.
+    fn call_every_helper(&mut self, depth: usize) {
+        let helpers = self.helpers.to_vec();
+        for h in &helpers {
+            let mut args = Vec::new();
+            for p in &h.params {
+                let ty = Ty::new(p.ty.elem, p.ty.len.unwrap_or(8));
+                let b = self.fresh("b");
+                self.line(depth, &format!("{} {b} @RAM;", ty.text()));
+                self.bufs.push(Buf {
+                    name: b.clone(),
+                    ty,
+                    dom: Dom::Ram,
+                    destroyed: false,
+                    exit_dom: None,
+                    read_only: false,
+                    depth,
+                    split: None,
+                    part_of: None,
+                });
+                if p.entry != Dom::Ram {
+                    let f = Self::handoff_extern(ty, p.entry);
+                    self.line(depth, &format!("{f}({b});"));
+                    self.set_dom(&b, p.entry);
+                }
+                args.push((b, p.exit));
+            }
+            let names: Vec<&str> = args.iter().map(|(a, _)| a.as_str()).collect();
+            self.line(depth, &format!("{}({});", h.name, names.join(", ")));
+            for (a, exit) in args {
+                self.set_dom(&a, exit);
+            }
+        }
+    }
+
     fn op_helper_call(&mut self, depth: usize) {
         let Some(h) = self.rng.pick(self.helpers).cloned() else {
             self.op_call(depth);
@@ -1150,7 +1538,8 @@ impl FnGen<'_> {
     }
 
     /// A nested block: names declared inside go out of scope at its end.
-    fn scoped_block(&mut self, depth: usize, in_loop: bool) {
+    /// Returns true if the block ended in a `return`.
+    fn scoped_block(&mut self, depth: usize, in_loop: bool) -> bool {
         let nb = self.bufs.len();
         let nh = self.handles.len();
         let np = self.pkts.len();
@@ -1161,6 +1550,7 @@ impl FnGen<'_> {
         self.bufs.truncate(nb);
         self.handles.truncate(nh);
         self.pkts.truncate(np);
+        returned
     }
 
     /// Release this block's borrows and hand its buffers back to the CPU.
@@ -1258,6 +1648,53 @@ pub fn program(seed: u64, cfg: Config) -> String {
     let mut rng = Rng::new(seed);
     let mut src = String::from(EXTERNS);
 
+    // Interrupt handlers (in most programs): register writes, then a
+    // signal for each of their events, every time they run.
+    let mut hw = Hw::default();
+    let mut handlers = String::new();
+    if rng.chance(0.7) {
+        let empty = Hw::default();
+        let mut irqs: Vec<usize> = Vec::new();
+        for i in 0..1 + rng.below(2) {
+            let mut irq = rng.below(32);
+            while irqs.contains(&irq) {
+                irq = rng.below(32);
+            }
+            irqs.push(irq);
+            let mut g = FnGen::new(&mut rng, cfg, &[], &empty);
+            g.in_handler = true;
+            // A handler deviates as a whole, in one way at most, so that
+            // most programs with handlers can still be accepted.
+            let deviate = g.hw_chaos();
+            let wait_in_handler = deviate && g.rng.chance(0.4);
+            g.clean = !deviate || wait_in_handler;
+            for _ in 0..g.rng.below(3) {
+                g.op_reg_write(0);
+            }
+            if wait_in_handler {
+                // A handler waiting can never return.
+                let e = EVENTS[g.rng.below(EVENTS.len())];
+                g.line(0, &format!("wait {e};"));
+            }
+            for e in &EVENTS[..2] {
+                if g.rng.chance(0.6) {
+                    g.line(0, &format!("signal {e};"));
+                    if !hw.signalled.contains(e) {
+                        hw.signalled.push(e);
+                    }
+                }
+            }
+            for r in &g.written {
+                if !hw.handler_regs.contains(r) {
+                    hw.handler_regs.push(r);
+                }
+            }
+            let body = std::mem::take(&mut g.out);
+            let _ = writeln!(handlers, "\ninterrupt fn irq{i}() @ irq {irq} {{\n{body}}}");
+        }
+    }
+    src.push_str(&handlers);
+
     let helpers: Vec<Helper> = (0..rng.below(3))
         .map(|i| Helper {
             name: format!("helper{i}"),
@@ -1268,17 +1705,7 @@ pub fn program(seed: u64, cfg: Config) -> String {
         .collect();
 
     for h in &helpers {
-        let mut g = FnGen {
-            rng: &mut rng,
-            cfg,
-            helpers: &[],
-            out: String::new(),
-            counter: 0,
-            bufs: Vec::new(),
-            handles: Vec::new(),
-            pkts: Vec::new(),
-            pkt_floor: 0,
-        };
+        let mut g = FnGen::new(&mut rng, cfg, &[], &hw);
         let mut params = Vec::new();
         for (i, p) in h.params.iter().enumerate() {
             let name = format!("p{i}");
@@ -1307,18 +1734,9 @@ pub fn program(seed: u64, cfg: Config) -> String {
         );
     }
 
-    let mut g = FnGen {
-        rng: &mut rng,
-        cfg,
-        helpers: &helpers,
-        out: String::new(),
-        counter: 0,
-        bufs: Vec::new(),
-        handles: Vec::new(),
-        pkts: Vec::new(),
-        pkt_floor: 0,
-    };
+    let mut g = FnGen::new(&mut rng, cfg, &helpers, &hw);
     if !g.block(0, false) {
+        g.call_every_helper(0);
         g.repair_all(0);
     }
     let _ = writeln!(src, "\nfn main() {{\n{}}}", g.out);
