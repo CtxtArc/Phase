@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/phase-logo.png" alt="PHASE logo" width="200">
+</p>
+
 # PHASE: Physical Hardware Assurance & Safety Engine
 
 **A compiler that statically checks memory safety for hardware pipelines — DMA, MMIO, and zero-copy devices — before the code ever runs.**
