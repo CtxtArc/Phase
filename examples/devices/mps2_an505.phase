@@ -15,7 +15,7 @@ device type CmsdkUart {
     DATA:      read write u32 @ 0x00 { BYTE: bits 0..=7 }
     STATE:     read write u32 @ 0x04 { TXFULL: bit 0, RXFULL: bit 1, TXOVR: bit 2, RXOVR: bit 3 }
     CTRL:      read write u32 @ 0x08 = 0 { TX_EN: bit 0, RX_EN: bit 1, TX_IRQ_EN: bit 2, RX_IRQ_EN: bit 3 }
-    INTSTATUS: read write u32 @ 0x0C { TX: bit 0, RX: bit 1 }
+    INTSTATUS: read write u32 @ 0x0C { TX: bit 0 w1c, RX: bit 1 w1c }   // write 1 to clear
     BAUDDIV:   read write u32 @ 0x10 { DIV: bits 0..=19 }
 }
 
@@ -43,25 +43,15 @@ device type Pl081 {
     ENABLEDCHANNELS: read u32 @ 0x01C { CH0: bit 0, CH1: bit 1 }
     CONFIG:         read write u32 @ 0x030 = 0 { ENABLE: bit 0 }
 
-    C0SRC:     read write u32 @ 0x100;
-    C0DEST:    read write u32 @ 0x104;
-    C0LLI:     read write u32 @ 0x108;
-    C0CONTROL: read write u32 @ 0x10C {
+    // Channel n's registers are at 0x100 + 0x20 * n.
+    CSRC[2]:  read write u32 @ 0x100 step 0x20;
+    CDEST[2]: read write u32 @ 0x104 step 0x20;
+    CLLI[2]:  read write u32 @ 0x108 step 0x20;
+    CCONTROL[2]: read write u32 @ 0x10C step 0x20 {
         SIZE: bits 0..=11, SWIDTH: bits 18..=20, DWIDTH: bits 21..=23,
         SRC_INC: bit 26, DEST_INC: bit 27, TC_IRQ: bit 31
     }
-    C0CONFIG:  read write u32 @ 0x110 {
-        ENABLE: bit 0, FLOW: bits 11..=13, ERR_IRQ: bit 14, TC_IRQ: bit 15, HALT: bit 18
-    }
-
-    C1SRC:     read write u32 @ 0x120;
-    C1DEST:    read write u32 @ 0x124;
-    C1LLI:     read write u32 @ 0x128;
-    C1CONTROL: read write u32 @ 0x12C {
-        SIZE: bits 0..=11, SWIDTH: bits 18..=20, DWIDTH: bits 21..=23,
-        SRC_INC: bit 26, DEST_INC: bit 27, TC_IRQ: bit 31
-    }
-    C1CONFIG:  read write u32 @ 0x130 {
+    CCONFIG[2]: read write u32 @ 0x110 step 0x20 {
         ENABLE: bit 0, FLOW: bits 11..=13, ERR_IRQ: bit 14, TC_IRQ: bit 15, HALT: bit 18
     }
 }

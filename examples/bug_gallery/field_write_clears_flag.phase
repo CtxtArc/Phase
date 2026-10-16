@@ -1,0 +1,33 @@
+// Bug gallery #46: acknowledging one interrupt clears another. TX and RX
+// are write-1-to-clear flags in the same status register. Acknowledging TX
+// with a field write reads the register -- RX is set too, a byte arrived
+// -- and writes it back with TX set to 1... and RX still 1, which clears
+// RX. The received byte's interrupt is gone before anyone handled it; the
+// byte is silently dropped. The fix is a whole-register write of just the
+// TX bit.
+// Expected: "writing field 'Uart0.INTSTATUS.TX' writes back a 1 to every set bit of `w1c` field 'RX' of 'Uart0.INTSTATUS', clearing a pending flag nobody handled"
+
+device Uart0 @ 0x40004000 {
+    DATA:      read write u32 @ 0x00;
+    INTSTATUS: read write u32 @ 0x0C { TX: bit 0 w1c, RX: bit 1 w1c }
+}
+
+event tx_ready;
+event rx_ready;
+
+interrupt fn on_uart() @ irq 0 {
+    if volatile_read(Uart0.INTSTATUS.TX) == 1 {
+        // BUG: should be `volatile_write(Uart0.INTSTATUS, 1);`
+        volatile_write(Uart0.INTSTATUS.TX, 1);
+        signal tx_ready;
+    }
+    if volatile_read(Uart0.INTSTATUS.RX) == 1 {
+        volatile_write(Uart0.INTSTATUS, 2);
+        signal rx_ready;
+    }
+}
+
+fn main() {
+    wait tx_ready;
+    wait rx_ready;
+}

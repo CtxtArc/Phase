@@ -41,14 +41,14 @@ extern fn summarize(x: read buffer<u32, 32> @RAM);
 // when done.
 fn fill_lo(dest: write buffer<u32, 16> @RAM -> @DMA) {
     aim_ch0(dest);
-    volatile_write(Dma0.C0CONTROL, 0);
-    volatile_write(Dma0.C0CONTROL.SIZE, 16);
-    volatile_write(Dma0.C0CONTROL.SWIDTH, 2);    // 32-bit reads
-    volatile_write(Dma0.C0CONTROL.DWIDTH, 2);    // 32-bit writes
-    volatile_write(Dma0.C0CONTROL.SRC_INC, 1);
-    volatile_write(Dma0.C0CONTROL.DEST_INC, 1);
-    volatile_write(Dma0.C0CONTROL.TC_IRQ, 1);
-    volatile_write(Dma0.C0CONFIG, PL081_MEM_TO_MEM | PL081_TC_IRQ | PL081_ENABLE);
+    volatile_write(Dma0.CCONTROL[0], 0);
+    volatile_write(Dma0.CCONTROL[0].SIZE, 16);
+    volatile_write(Dma0.CCONTROL[0].SWIDTH, 2);    // 32-bit reads
+    volatile_write(Dma0.CCONTROL[0].DWIDTH, 2);    // 32-bit writes
+    volatile_write(Dma0.CCONTROL[0].SRC_INC, 1);
+    volatile_write(Dma0.CCONTROL[0].DEST_INC, 1);
+    volatile_write(Dma0.CCONTROL[0].TC_IRQ, 1);
+    volatile_write(Dma0.CCONFIG[0], PL081_MEM_TO_MEM | PL081_TC_IRQ | PL081_ENABLE);
     // Harmless on the chip; QEMU's PL081 only updates its interrupt line
     // on a write to a controller register.
     volatile_write(Dma0.CONFIG.ENABLE, 1);
@@ -56,14 +56,14 @@ fn fill_lo(dest: write buffer<u32, 16> @RAM -> @DMA) {
 
 fn fill_hi(dest: write buffer<u32, 16> @RAM -> @DMA) {
     aim_ch1(dest);
-    volatile_write(Dma0.C1CONTROL, 0);
-    volatile_write(Dma0.C1CONTROL.SIZE, 16);
-    volatile_write(Dma0.C1CONTROL.SWIDTH, 2);
-    volatile_write(Dma0.C1CONTROL.DWIDTH, 2);
-    volatile_write(Dma0.C1CONTROL.SRC_INC, 1);
-    volatile_write(Dma0.C1CONTROL.DEST_INC, 1);
-    volatile_write(Dma0.C1CONTROL.TC_IRQ, 1);
-    volatile_write(Dma0.C1CONFIG, PL081_MEM_TO_MEM | PL081_TC_IRQ | PL081_ENABLE);
+    volatile_write(Dma0.CCONTROL[1], 0);
+    volatile_write(Dma0.CCONTROL[1].SIZE, 16);
+    volatile_write(Dma0.CCONTROL[1].SWIDTH, 2);
+    volatile_write(Dma0.CCONTROL[1].DWIDTH, 2);
+    volatile_write(Dma0.CCONTROL[1].SRC_INC, 1);
+    volatile_write(Dma0.CCONTROL[1].DEST_INC, 1);
+    volatile_write(Dma0.CCONTROL[1].TC_IRQ, 1);
+    volatile_write(Dma0.CCONFIG[1], PL081_MEM_TO_MEM | PL081_TC_IRQ | PL081_ENABLE);
     volatile_write(Dma0.CONFIG.ENABLE, 1);
 }
 

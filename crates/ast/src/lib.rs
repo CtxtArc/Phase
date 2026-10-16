@@ -314,6 +314,35 @@ pub struct RegField {
     /// Lowest and highest bit, inclusive.
     pub lo: u32,
     pub hi: u32,
+    /// What reading and writing the field does (v2.4).
+    pub kind: FieldKind,
+}
+
+/// A field's read and write side effects (v2.4), as SVD files and
+/// datasheets name them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FieldKind {
+    /// Reads return it, writes set it.
+    #[default]
+    Plain,
+    /// `w1c`: writing 1 clears it, writing 0 does nothing (pending flags).
+    W1c,
+    /// `rc`: reading the register clears it.
+    Rc,
+    /// `rc_w0`: writing 0 clears it, writing 1 does nothing (STM32 status
+    /// flags).
+    RcW0,
+}
+
+impl FieldKind {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            FieldKind::Plain => "",
+            FieldKind::W1c => "w1c",
+            FieldKind::Rc => "rc",
+            FieldKind::RcW0 => "rc_w0",
+        }
+    }
 }
 
 /// A memory-mapped register of a `device` (v2.0):
@@ -331,6 +360,9 @@ pub struct RegDecl {
     /// Value after reset, if declared (initializes the simulated register).
     pub reset: Option<u64>,
     pub fields: Vec<RegField>,
+    /// `NAME[count]: .. @ offset step stride` (v2.4): `count` registers,
+    /// the `n`th at `offset + n * stride`.
+    pub array: Option<(u32, u64)>,
 }
 
 /// `device Uart0 @ 0x40004000 { .. }` (v2.0): a peripheral's register map;
@@ -394,6 +426,77 @@ impl RegDecl {
 
     pub fn field(&self, name: &str) -> Option<&RegField> {
         self.fields.iter().find(|f| f.name == name)
+    }
+
+    /// The registers this declares: itself, or (for an array) each
+    /// element, named `NAME_n`, at its own offset.
+    pub fn elements(&self) -> Vec<RegDecl> {
+        match self.array {
+            None => vec![self.clone()],
+            Some((count, step)) => (0..count)
+                .map(|n| RegDecl {
+                    name: format!("{}_{n}", self.name),
+                    offset: self.offset + u64::from(n) * step,
+                    array: None,
+                    ..self.clone()
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Every register of a map, arrays expanded (see [`RegDecl::elements`]).
+pub fn expand_regs(regs: &[RegDecl]) -> Vec<RegDecl> {
+    regs.iter().flat_map(RegDecl::elements).collect()
+}
+
+/// `Dev.REG`, `Dev.REG.FIELD`, `Dev.REG[i]` or `Dev.REG[i].FIELD`, taken
+/// apart (whether `Dev` is a device is for the caller to check).
+#[derive(Debug, Clone, Copy)]
+pub struct RegPath<'e> {
+    pub device: &'e str,
+    pub reg: &'e str,
+    pub index: Option<&'e Expr>,
+    pub field: Option<&'e str>,
+}
+
+pub fn reg_path(e: &Expr) -> Option<RegPath<'_>> {
+    // The register part: `Dev.REG` or `Dev.REG[i]`.
+    fn register(e: &Expr) -> Option<(&str, &str, Option<&Expr>)> {
+        match e {
+            Expr::FieldAccess { base, field } => match base.as_ref() {
+                Expr::Ident(d) => Some((d, field, None)),
+                _ => None,
+            },
+            Expr::Index { base, index } => match base.as_ref() {
+                Expr::FieldAccess { base, field } => match base.as_ref() {
+                    Expr::Ident(d) => Some((d, field, Some(index.as_ref()))),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    if let Some((device, reg, index)) = register(e) {
+        return Some(RegPath {
+            device,
+            reg,
+            index,
+            field: None,
+        });
+    }
+    match e {
+        Expr::FieldAccess { base, field } => {
+            let (device, reg, index) = register(base)?;
+            Some(RegPath {
+                device,
+                reg,
+                index,
+                field: Some(field),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -579,6 +682,11 @@ pub enum Expr {
     },
     /// `~x` (v2.4): every bit of `x` flipped.
     BitNot(Box<Expr>),
+    /// `REG[i]` (v2.4): one register of a register array.
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

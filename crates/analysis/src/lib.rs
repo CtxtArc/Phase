@@ -32,7 +32,7 @@
 
 use phase_ast::{
     eval_const, uint_max, BinOp, BorrowMode, BufferLen, ConstDecl, DeviceDecl, DeviceTypeDecl,
-    Domain, Expr, FnDecl, Item, Program, RegDecl, RegField, Span, Stmt, TypeExpr,
+    Domain, Expr, FieldKind, FnDecl, Item, Program, RegDecl, RegField, Span, Stmt, TypeExpr,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -496,6 +496,7 @@ impl<'p> DeviceView<'p> {
     fn extent(&self) -> u64 {
         self.regs
             .iter()
+            .flat_map(RegDecl::elements)
             .filter_map(|r| Some(r.offset + u64::from(r.bits()? / 8)))
             .max()
             .unwrap_or(0)
@@ -679,30 +680,56 @@ fn check_reg_map(what: &str, owner: &str, regs: &[RegDecl], errors: &mut Vec<Ana
             continue;
         };
         let bytes = u64::from(bits / 8);
-        if r.offset % bytes != 0 {
-            errors.push(
-                err(format!(
-                    "register '{full}' is at offset {:#x}, which is not aligned to its {bytes} bytes",
-                    r.offset
-                ))
-                .at(r.span),
-            );
+        // v2.4: an array's elements are placed one by one.
+        let elements: Vec<(String, u64)> = match r.array {
+            None => vec![(full.clone(), r.offset)],
+            Some((0, _)) => {
+                errors.push(err(format!("register array '{full}' has no registers")).at(r.span));
+                Vec::new()
+            }
+            Some((_, step)) if step < bytes => {
+                errors.push(
+                    err(format!(
+                        "register array '{full}' has a step of {step} bytes, less than its {bytes}-byte registers: they would overlap"
+                    ))
+                    .at(r.span),
+                );
+                Vec::new()
+            }
+            Some((n, step)) => (0..n)
+                .map(|i| (format!("{full}[{i}]"), r.offset + u64::from(i) * step))
+                .collect(),
+        };
+        let mut misaligned = false;
+        for (ename, offset) in &elements {
+            if offset % bytes != 0 && !misaligned {
+                misaligned = true;
+                errors.push(
+                    err(format!(
+                        "register '{ename}' is at offset {offset:#x}, which is not aligned to its {bytes} bytes"
+                    ))
+                    .at(r.span),
+                );
+            }
+            let (start, end) = (*offset, offset.saturating_add(bytes));
+            if let Some((other, _, _)) = placed.iter().find(|(_, s, e)| start < *e && *s < end) {
+                errors.push(
+                    err(format!(
+                        "register '{ename}' (bytes {start:#x}..{end:#x}) overlaps '{owner}.{}'",
+                        other.name
+                    ))
+                    .at(r.span)
+                    .note(
+                        other.span,
+                        format!("'{owner}.{}' is declared here", other.name),
+                    ),
+                );
+                break;
+            }
         }
-        let (start, end) = (r.offset, r.offset.saturating_add(bytes));
-        if let Some((other, _, _)) = placed.iter().find(|(_, s, e)| start < *e && *s < end) {
-            errors.push(
-                err(format!(
-                    "register '{full}' (bytes {:#x}..{:#x}) overlaps '{owner}.{}'",
-                    start, end, other.name
-                ))
-                .at(r.span)
-                .note(
-                    other.span,
-                    format!("'{owner}.{}' is declared here", other.name),
-                ),
-            );
+        for (_, offset) in &elements {
+            placed.push((r, *offset, offset.saturating_add(bytes)));
         }
-        placed.push((r, start, end));
         let max = if bits == 64 {
             u64::MAX
         } else {
@@ -769,10 +796,23 @@ fn check_reg_map(what: &str, owner: &str, regs: &[RegDecl], errors: &mut Vec<Ana
 struct DeviceRef<'e> {
     device: &'e str,
     reg: &'e str,
+    /// `REG[i]` (v2.4).
+    index: Option<&'e Expr>,
     field: Option<&'e str>,
 }
 
-/// A field's width in bits.
+impl DeviceRef<'_> {
+    /// `Dev.REG`, `Dev.REG[i]`, as written (without the field).
+    fn reg_text(&self) -> String {
+        match self.index {
+            None => format!("{}.{}", self.device, self.reg),
+            Some(Expr::IntLit(i)) => format!("{}.{}[{i}]", self.device, self.reg),
+            Some(Expr::Ident(n)) => format!("{}.{}[{n}]", self.device, self.reg),
+            Some(_) => format!("{}.{}[..]", self.device, self.reg),
+        }
+    }
+}
+
 /// v2.4: every `const`: a unique name, an unsigned integer type, a
 /// constant value that fits it. Returns the values of the valid ones.
 fn check_consts(
@@ -903,6 +943,7 @@ fn collect_idents<'e>(e: &'e Expr, out: &mut Vec<&'e str>) {
     }
 }
 
+/// A field's width in bits.
 fn field_bits(f: &RegField) -> u32 {
     f.hi - f.lo + 1
 }
@@ -2814,25 +2855,14 @@ impl<'a> FnChecker<'a> {
     /// device and the path after it. `None` if `e` doesn't start with a
     /// device name.
     fn device_ref<'e>(&self, e: &'e Expr) -> Option<DeviceRef<'e>> {
-        match e {
-            Expr::FieldAccess { base, field } => match base.as_ref() {
-                Expr::Ident(d) => self.devices.get(d.as_str()).map(|_| DeviceRef {
-                    device: d,
-                    reg: field,
-                    field: None,
-                }),
-                Expr::FieldAccess { base, field: reg } => match base.as_ref() {
-                    Expr::Ident(d) => self.devices.get(d.as_str()).map(|_| DeviceRef {
-                        device: d,
-                        reg,
-                        field: Some(field),
-                    }),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        }
+        let p = phase_ast::reg_path(e)?;
+        self.devices.get(p.device)?;
+        Some(DeviceRef {
+            device: p.device,
+            reg: p.reg,
+            index: p.index,
+            field: p.field,
+        })
     }
 
     /// Resolve a device reference to its register (and field), reporting
@@ -2856,6 +2886,74 @@ impl<'a> FnChecker<'a> {
             );
             return None;
         };
+        // v2.4: an array register needs a constant index in range; a
+        // single register takes none.
+        match (reg.array, r.index) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                errors.push(
+                    err(format!(
+                        "'{}.{}' is a single register, not an array; drop the `[..]`",
+                        r.device, r.reg
+                    ))
+                    .note(
+                        reg.span,
+                        format!("'{}.{}' is declared here", r.device, r.reg),
+                    ),
+                );
+                return None;
+            }
+            (Some((count, _)), None) => {
+                errors.push(
+                    err(format!(
+                        "'{}.{}' is an array of {count} registers; pick one: {}.{}[0] to {}.{}[{}]",
+                        r.device,
+                        r.reg,
+                        r.device,
+                        r.reg,
+                        r.device,
+                        r.reg,
+                        count.saturating_sub(1)
+                    ))
+                    .note(
+                        reg.span,
+                        format!("'{}.{}' is declared here", r.device, r.reg),
+                    ),
+                );
+                return None;
+            }
+            (Some((count, _)), Some(index)) => match self.const_value(index) {
+                Ok(Some(i)) if i < u64::from(count) => {}
+                Ok(Some(i)) => {
+                    errors.push(
+                        err(format!(
+                            "{}.{}[{i}] is out of range: '{}.{}' has {count} registers (0 to {})",
+                            r.device,
+                            r.reg,
+                            r.device,
+                            r.reg,
+                            count.saturating_sub(1)
+                        ))
+                        .note(
+                            reg.span,
+                            format!("'{}.{}' is declared here", r.device, r.reg),
+                        ),
+                    );
+                    return None;
+                }
+                Ok(None) => {
+                    errors.push(err(format!(
+                        "the index in {} must be a constant: an integer or a `const`",
+                        r.reg_text()
+                    )));
+                    return None;
+                }
+                Err(msg) => {
+                    errors.push(err(msg));
+                    return None;
+                }
+            },
+        }
         let Some(fname) = r.field else {
             return Some((reg, None));
         };
@@ -2898,17 +2996,32 @@ impl<'a> FnChecker<'a> {
         let Some((reg, field)) = self.resolve_device_ref(&r, errors) else {
             return;
         };
+        let reg_name = r.reg_text();
         let name = match field {
-            Some(f) => format!("{}.{}.{}", r.device, reg.name, f.name),
-            None => format!("{}.{}", r.device, reg.name),
+            Some(f) => format!("{reg_name}.{}", f.name),
+            None => reg_name.clone(),
         };
-        let reg_name = format!("{}.{}", r.device, reg.name);
-        let declared = format!("'{reg_name}' is declared here");
+        let declared = format!("'{}.{}' is declared here", r.device, reg.name);
+        // v2.4: fields whose bits change when the register is read or
+        // written back. `other` excludes the field being accessed.
+        let other = |kind: FieldKind| {
+            reg.fields
+                .iter()
+                .find(|f| f.kind == kind && Some(f.name.as_str()) != field.map(|x| x.name.as_str()))
+        };
         if callee == "volatile_read" {
             if !reg.readable {
                 errors.push(
                     err(format!("'{reg_name}' is write-only; it cannot be read"))
                         .note(reg.span, declared),
+                );
+            } else if let (Some(_), Some(rc)) = (field, other(FieldKind::Rc)) {
+                errors.push(
+                    err(format!(
+                        "reading field '{name}' reads all of '{reg_name}', which clears its `rc` field '{}'; read the register once into a local and take the fields from it",
+                        rc.name
+                    ))
+                    .note(rc.span, format!("'{}' is cleared by reading, declared here", rc.name)),
                 );
             }
             return;
@@ -2928,6 +3041,45 @@ impl<'a> FnChecker<'a> {
                 .note(reg.span, declared),
             );
             return;
+        }
+        // v2.4: a field write reads the register and writes the rest back.
+        if field.is_some() {
+            let w1c = other(FieldKind::W1c).map(|f| {
+                (
+                    f,
+                    "writes back a 1 to every set bit of `w1c` field",
+                    "clearing a pending flag nobody handled",
+                )
+            });
+            let rc_w0 = other(FieldKind::RcW0).map(|f| {
+                (
+                    f,
+                    "writes back the value it read to `rc_w0` field",
+                    "so a flag the hardware sets in between is cleared by the 0 written back",
+                )
+            });
+            let rc = reg
+                .fields
+                .iter()
+                .find(|f| f.kind == FieldKind::Rc)
+                .map(|f| {
+                    (
+                        f,
+                        "reads it first, which clears `rc` field",
+                        "losing what it held",
+                    )
+                });
+            let hazard = w1c.or(rc_w0).or(rc);
+            if let Some((f, what, why)) = hazard {
+                errors.push(
+                    err(format!(
+                        "writing field '{name}' {what} '{}' of '{reg_name}', {why}; write the whole register",
+                        f.name
+                    ))
+                    .note(f.span, format!("'{}' is `{}`, declared here", f.name, f.kind.keyword())),
+                );
+                return;
+            }
         }
         let bits = field.map(field_bits).or(reg.bits()).unwrap_or(32);
         let max = if bits >= 64 {
@@ -3114,11 +3266,11 @@ impl<'a> FnChecker<'a> {
         match expr {
             Expr::Call { callee, args } => self.check_call(callee, args, errors),
             Expr::Ident(name) => self.check_value_ident(name, errors),
-            Expr::FieldAccess { .. } if self.device_ref(expr).is_some() => {
+            Expr::FieldAccess { .. } | Expr::Index { .. } if self.device_ref(expr).is_some() => {
                 let r = self.device_ref(expr).unwrap();
                 let path = match r.field {
-                    Some(f) => format!("{}.{}.{f}", r.device, r.reg),
-                    None => format!("{}.{}", r.device, r.reg),
+                    Some(f) => format!("{}.{f}", r.reg_text()),
+                    None => r.reg_text(),
                 };
                 errors.push(err(format!(
                     "'{path}' is a device register; read it with volatile_read({path})"
@@ -3179,6 +3331,9 @@ impl<'a> FnChecker<'a> {
                 self.check_bit_operand(x, "~", errors);
                 self.check_const_expr(expr, errors);
             }
+            Expr::Index { .. } => errors.push(err(
+                "only register arrays can be indexed (`Dev.REG[n]`); PHASE has no other arrays yet",
+            )),
             Expr::StructLit { fields, .. } => {
                 for (_, e) in fields {
                     self.check_expr(e, errors);
@@ -3584,6 +3739,104 @@ mod tests {
             "fn main() { let x: u32 = 1; x = x << 64; }",
             "a shift must be less than 64",
         );
+    }
+
+    const DMA_DEV: &str = r#"
+        device Dma @ 0x40026000 {
+            LISR:  read u32 @ 0x00 { TCIF0: bit 5, TCIF1: bit 11 }
+            LIFCR: write u32 @ 0x08;
+            CR[8]:   read write u32 @ 0x10 step 0x18 { EN: bit 0, TCIE: bit 4, CHSEL: bits 25..=27 }
+            NDTR[8]: read write u32 @ 0x14 step 0x18 { N: bits 0..=15 }
+            INT:   read write u32 @ 0x100 { PENDING: bit 0 w1c, OVERRUN: bit 1 w1c, ENABLE: bit 4 }
+            SR:    read write u16 @ 0x104 { UIF: bit 0 rc_w0, CC1IF: bit 1 rc_w0 }
+            DR:    read u32 @ 0x108 { DATA: bits 0..=8, ERR: bit 9 rc, BREAK: bit 10 rc }
+        }
+        const STREAM: u32 = 3;
+    "#;
+
+    fn dma(body: &str) -> String {
+        format!("{DMA_DEV}\n{body}")
+    }
+
+    #[test]
+    fn register_arrays_are_indexed_by_constants() {
+        check_src(&dma("fn main() {
+                 volatile_write(Dma.CR[0].EN, 1);
+                 volatile_write(Dma.CR[STREAM].CHSEL, 7);
+                 volatile_write(Dma.NDTR[STREAM + 4], 16);
+                 let n: u32 = volatile_read(Dma.NDTR[7].N);
+             }"))
+        .unwrap();
+        assert_single_error_containing(
+            &dma("fn main() { volatile_write(Dma.CR[8].EN, 1); }"),
+            "Dma.CR[8] is out of range: 'Dma.CR' has 8 registers (0 to 7)",
+        );
+        assert_single_error_containing(
+            &dma("fn main() { volatile_write(Dma.CR.EN, 1); }"),
+            "'Dma.CR' is an array of 8 registers; pick one: Dma.CR[0] to Dma.CR[7]",
+        );
+        assert_single_error_containing(
+            &dma("fn main() { let i: u32 = 1; volatile_write(Dma.CR[i].EN, 1); }"),
+            "the index in Dma.CR[i] must be a constant",
+        );
+        assert_single_error_containing(
+            &dma("fn main() { volatile_write(Dma.LIFCR[0], 1); }"),
+            "'Dma.LIFCR' is a single register, not an array",
+        );
+        assert_single_error_containing(
+            "device D @ 0x40000000 { A[4]: read write u32 @ 0x0 step 2; } fn main() {}",
+            "has a step of 2 bytes, less than its 4-byte registers",
+        );
+        assert_single_error_containing(
+            "device D @ 0x40000000 { A[4]: read write u32 @ 0x0 step 8; B: read u32 @ 0x10; } fn main() {}",
+            "register 'D.B' (bytes 0x10..0x14) overlaps 'D.A'",
+        );
+    }
+
+    #[test]
+    fn a_field_write_must_not_clear_other_flags() {
+        assert_single_error_containing(
+            &dma("fn main() { volatile_write(Dma.INT.ENABLE, 1); }"),
+            "writing field 'Dma.INT.ENABLE' writes back a 1 to every set bit of `w1c` field 'PENDING' of 'Dma.INT', clearing a pending flag nobody handled; write the whole register",
+        );
+        // Clearing one flag by a field write still writes the other back.
+        assert_single_error_containing(
+            &dma("fn main() { volatile_write(Dma.INT.PENDING, 1); }"),
+            "`w1c` field 'OVERRUN'",
+        );
+        assert_single_error_containing(
+            &dma("fn main() { volatile_write(Dma.SR.UIF, 0); }"),
+            "writes back the value it read to `rc_w0` field 'CC1IF' of 'Dma.SR', so a flag the hardware sets in between is cleared",
+        );
+        assert_single_error_containing(
+            &dma("fn main() { let e: u32 = volatile_read(Dma.DR.ERR); }"),
+            "reading field 'Dma.DR.ERR' reads all of 'Dma.DR', which clears its `rc` field 'BREAK'",
+        );
+        // The right ways: whole-register writes and reads.
+        check_src(&dma("fn main() {
+                 volatile_write(Dma.INT, 1 << 0 | 1 << 4);
+                 volatile_write(Dma.SR, 0xFFFF & ~1);
+                 let dr: u32 = volatile_read(Dma.DR);
+                 let err: u32 = dr >> 9 & 1;
+                 let pending: u32 = volatile_read(Dma.INT.PENDING);
+             }"))
+        .unwrap();
+    }
+
+    #[test]
+    fn handler_races_are_per_array_element() {
+        let handler =
+            "event e; interrupt fn h() @ irq 3 { volatile_write(Dma.CR[1].TCIE, 0); signal e; }";
+        assert_single_error_containing(
+            &dma(&format!(
+                "{handler} fn main() {{ volatile_write(Dma.CR[1].EN, 1); }}"
+            )),
+            "also writes 'Dma.CR[1]'",
+        );
+        check_src(&dma(&format!(
+            "{handler} fn main() {{ volatile_write(Dma.CR[2].EN, 1); }}"
+        )))
+        .unwrap();
     }
 
     const HAPPY_PATH: &str = r#"

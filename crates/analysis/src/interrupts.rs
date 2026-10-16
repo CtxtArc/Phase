@@ -38,20 +38,29 @@ struct Facts {
     returns_in_critical: Vec<Span>,
 }
 
-/// `Dev.REG` / `Dev.REG.FIELD`, if `e` is one (devices are checked
-/// elsewhere; any `A.B` shape is collected, and only real devices match
-/// the handler writes they are compared with).
+/// `Dev.REG` / `Dev.REG.FIELD` (or an element of a register array,
+/// `Dev.REG[i]`, v2.4), if `e` is one (devices are checked elsewhere; any
+/// `A.B` shape is collected, and only real devices match the handler
+/// writes they are compared with). The register is named with its index
+/// when that is a literal, and `REG[?]` when it isn't known here.
 fn register_of(e: &Expr) -> Option<(String, String, Option<String>)> {
-    match e {
-        Expr::FieldAccess { base, field } => match base.as_ref() {
-            Expr::Ident(d) => Some((d.clone(), field.clone(), None)),
-            Expr::FieldAccess { base, field: reg } => match base.as_ref() {
-                Expr::Ident(d) => Some((d.clone(), reg.clone(), Some(field.clone()))),
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
+    let p = phase_ast::reg_path(e)?;
+    let reg = match p.index {
+        None => p.reg.to_string(),
+        Some(Expr::IntLit(i)) => format!("{}[{i}]", p.reg),
+        Some(_) => format!("{}[?]", p.reg),
+    };
+    Some((p.device.to_string(), reg, p.field.map(str::to_string)))
+}
+
+/// Could registers `a` and `b` (as named by [`register_of`]) be the same?
+fn same_register(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.split_once('['), b.split_once('[')) {
+        (Some((x, i)), Some((y, j))) => x == y && (i == "?]" || j == "?]"),
+        _ => false,
     }
 }
 
@@ -391,13 +400,15 @@ pub(crate) fn check(program: &Program, devices: &HashSet<&str>, errors: &mut Vec
 
     // Thread code: no unprotected read-modify-write of a register a handler
     // writes.
-    let mut handler_writes: HashMap<(&str, &str), (&str, Span)> = HashMap::new();
+    let mut handler_writes: Vec<(&str, &str, &str, Span)> = Vec::new();
     for (f, path) in sorted(&in_handlers) {
         for (d, r, _, span, _) in &facts[f].writes {
-            if devices.contains(d.as_str()) {
-                handler_writes
-                    .entry((d.as_str(), r.as_str()))
-                    .or_insert((path[0], *span));
+            if devices.contains(d.as_str())
+                && !handler_writes
+                    .iter()
+                    .any(|(hd, hr, _, _)| hd == d && hr == r)
+            {
+                handler_writes.push((d.as_str(), r.as_str(), path[0], *span));
             }
         }
     }
@@ -410,7 +421,10 @@ pub(crate) fn check(program: &Program, devices: &HashSet<&str>, errors: &mut Vec
             let (Some(field), false) = (field, *critical) else {
                 continue;
             };
-            let Some((h, hspan)) = handler_writes.get(&(d.as_str(), r.as_str())) else {
+            let Some((_, hr, h, hspan)) = handler_writes
+                .iter()
+                .find(|(hd, hr, _, _)| hd == d && same_register(hr, r))
+            else {
                 continue;
             };
             if !reported.insert((span.file, span.line, span.col)) {
@@ -419,10 +433,10 @@ pub(crate) fn check(program: &Program, devices: &HashSet<&str>, errors: &mut Vec
             let irq = fns.get(h).and_then(|x| x.irq).map_or(0, |(n, _)| n);
             errors.push(
                 err(format!(
-                    "writing field '{d}.{r}.{field}' reads '{d}.{r}', changes the field and writes it back -- and interrupt handler '{h}' (IRQ {irq}) also writes '{d}.{r}': if it runs in between, its write is lost; do this inside `critical {{ }}`"
+                    "writing field '{d}.{r}.{field}' reads '{d}.{r}', changes the field and writes it back -- and interrupt handler '{h}' (IRQ {irq}) also writes '{d}.{hr}': if it runs in between, its write is lost; do this inside `critical {{ }}`"
                 ))
                 .at(*span)
-                .note(*hspan, format!("'{h}' writes '{d}.{r}' here")),
+                .note(*hspan, format!("'{h}' writes '{d}.{hr}' here")),
             );
         }
     }

@@ -36,8 +36,8 @@
 //! entity is in right now) to pick the correct runtime call for `sync`.
 
 use phase_ast::{
-    device_regs, eval_const, find_reg, BinOp, BorrowMode, BufferLen, ConstDecl, Domain, Expr, Item,
-    Program, RegDecl, Stmt, TypeExpr,
+    device_regs, eval_const, find_reg, BinOp, BorrowMode, BufferLen, ConstDecl, Domain, Expr,
+    FieldKind, Item, Program, RegDecl, Stmt, TypeExpr,
 };
 use std::collections::HashMap;
 
@@ -144,6 +144,15 @@ pub struct RegRef {
     /// every access against it at run time).
     pub readable: bool,
     pub writable: bool,
+    /// v2.4, for a checked build's field writes and reads: the bits of the
+    /// register's *other* `w1c` and `rc_w0` fields, and whether it has an
+    /// `rc` field (other than the one accessed).
+    pub w1c_others: u64,
+    pub rcw0_others: u64,
+    pub rc_others: bool,
+    /// `Dev.REG[i]` as written, for messages (`reg` is the element's C
+    /// name, `REG_i`).
+    pub display: String,
 }
 
 /// A `device` (v2.0), for codegen to lay out: its registers are its own,
@@ -468,6 +477,7 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
 
     let lower_regs = |regs: &[RegDecl]| -> Vec<PirReg> {
         regs.iter()
+            .flat_map(RegDecl::elements)
             .map(|r| PirReg {
                 name: r.name.clone(),
                 offset: r.offset,
@@ -1146,32 +1156,50 @@ impl<'a> Lowerer<'a> {
     /// `Dev.REG` / `Dev.REG.FIELD` for a declared device (the analyzer has
     /// already checked the names and access).
     fn reg_ref(&self, e: &Expr) -> Option<RegRef> {
-        let (d, reg, field) = match e {
-            Expr::FieldAccess { base, field } => match base.as_ref() {
-                Expr::Ident(d) => (d, field, None),
-                Expr::FieldAccess { base, field: reg } => match base.as_ref() {
-                    Expr::Ident(d) => (d, reg, Some(field)),
-                    _ => return None,
-                },
-                _ => return None,
-            },
-            _ => return None,
-        };
-        let r = find_reg(self.devices.get(d.as_str())?, reg)?;
-        let field = match field {
-            Some(f) => {
-                let f = r.field(f)?;
-                Some((f.name.clone(), f.lo, f.hi))
+        let p = phase_ast::reg_path(e)?;
+        let r = find_reg(self.devices.get(p.device)?, p.reg)?;
+        // An array's element: `REG_i` (the analyzer checked the index).
+        let (reg, display) = match p.index {
+            Some(i) => {
+                let i = self.const_value(i)?;
+                (
+                    format!("{}_{i}", r.name),
+                    format!("{}.{}[{i}]", p.device, r.name),
+                )
             }
+            None => (r.name.clone(), format!("{}.{}", p.device, r.name)),
+        };
+        let fld = match p.field {
+            Some(f) => Some(r.field(f)?),
             None => None,
         };
+        let mask = |f: &phase_ast::RegField| -> u64 {
+            let width = f.hi - f.lo + 1;
+            let m = if width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << width) - 1
+            };
+            m << f.lo
+        };
+        let others = |kind: FieldKind| -> u64 {
+            r.fields
+                .iter()
+                .filter(|f| f.kind == kind && Some(f.name.as_str()) != p.field)
+                .map(mask)
+                .fold(0, |a, b| a | b)
+        };
         Some(RegRef {
-            device: d.clone(),
-            reg: r.name.clone(),
+            device: p.device.to_string(),
+            reg,
             bits: r.bits().unwrap_or(32),
-            field,
+            field: fld.map(|f| (f.name.clone(), f.lo, f.hi)),
             readable: r.readable,
             writable: r.writable,
+            w1c_others: others(FieldKind::W1c),
+            rcw0_others: others(FieldKind::RcW0),
+            rc_others: others(FieldKind::Rc) != 0,
+            display,
         })
     }
 
@@ -1200,7 +1228,9 @@ impl<'a> Lowerer<'a> {
                 // as the register argument to volatile_read/volatile_write,
                 // and that its domain is @MMIO.
                 Expr::DomainRef { name, .. } => CallArg::MmioRegister(name.clone()),
-                e @ Expr::FieldAccess { .. } if self.reg_ref(e).is_some() => {
+                e @ (Expr::FieldAccess { .. } | Expr::Index { .. })
+                    if self.reg_ref(e).is_some() =>
+                {
                     CallArg::DeviceRegister(self.reg_ref(e).unwrap())
                 }
                 other => {

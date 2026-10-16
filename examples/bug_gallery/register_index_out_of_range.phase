@@ -1,0 +1,18 @@
+// Bug gallery #47: one past the last DMA stream. The controller has eight
+// streams, 0 to 7, each with its own control register, 0x18 bytes apart.
+// "Stream 8" is off the end of the array: in C, `DMA2->S[8].CR` compiles
+// and writes past the controller's registers -- into a reserved hole, or
+// into the next peripheral -- and the ADC transfer never starts.
+// Expected: "Dma2.CR[8] is out of range: 'Dma2.CR' has 8 registers (0 to 7)"
+
+device Dma2 @ 0x40026400 {
+    CR[8]:   read write u32 @ 0x10 step 0x18 { EN: bit 0, TCIE: bit 4, CHSEL: bits 25..=27 }
+    NDTR[8]: read write u32 @ 0x14 step 0x18 { N: bits 0..=15 }
+}
+
+const ADC_STREAM: u32 = 8;   // BUG: the ADC is on stream 0 of channel 0
+
+fn main() {
+    volatile_write(Dma2.NDTR[0], 256);
+    volatile_write(Dma2.CR[ADC_STREAM].EN, 1);
+}

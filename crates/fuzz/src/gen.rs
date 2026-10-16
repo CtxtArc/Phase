@@ -373,6 +373,8 @@ device Fz @ 0x40000000 {
     STAT: read u8 @ 0x04;
     LOAD: write u16 @ 0x08;
     ACK: read write u8 @ 0x0C { DONE: bit 0, ERR: bit 1 }
+    FLAGS: read write u32 @ 0x10 { DONE: bit 0 w1c, ERR: bit 1 w1c, IE: bit 4 }
+    CH[4]: read write u32 @ 0x20 step 0x8 { ON: bit 0, LEN: bits 8..=15 }
 }
 
 event ev0;
@@ -389,6 +391,10 @@ struct Reg {
     writable: bool,
     bits: u32,
     fields: &'static [(&'static str, u32)],
+    /// An array of this many registers (0: a single one).
+    array: u32,
+    /// Has `w1c` fields: writing one field writes the others back (v2.4).
+    rmw_unsafe: bool,
 }
 
 const REGS: &[Reg] = &[
@@ -398,6 +404,8 @@ const REGS: &[Reg] = &[
         writable: true,
         bits: 32,
         fields: &[("EN", 1), ("MODE", 3), ("IE", 1)],
+        array: 0,
+        rmw_unsafe: false,
     },
     Reg {
         name: "STAT",
@@ -405,6 +413,8 @@ const REGS: &[Reg] = &[
         writable: false,
         bits: 8,
         fields: &[],
+        array: 0,
+        rmw_unsafe: false,
     },
     Reg {
         name: "LOAD",
@@ -412,6 +422,8 @@ const REGS: &[Reg] = &[
         writable: true,
         bits: 16,
         fields: &[],
+        array: 0,
+        rmw_unsafe: false,
     },
     Reg {
         name: "ACK",
@@ -419,6 +431,26 @@ const REGS: &[Reg] = &[
         writable: true,
         bits: 8,
         fields: &[("DONE", 1), ("ERR", 1)],
+        array: 0,
+        rmw_unsafe: false,
+    },
+    Reg {
+        name: "FLAGS",
+        readable: true,
+        writable: true,
+        bits: 32,
+        fields: &[("DONE", 1), ("ERR", 1), ("IE", 1)],
+        array: 0,
+        rmw_unsafe: true,
+    },
+    Reg {
+        name: "CH",
+        readable: true,
+        writable: true,
+        bits: 32,
+        fields: &[("ON", 1), ("LEN", 8)],
+        array: 4,
+        rmw_unsafe: false,
     },
 ];
 
@@ -430,7 +462,7 @@ struct Hw {
     /// Events some handler signals (every time it runs).
     signalled: Vec<&'static str>,
     /// Registers some handler writes.
-    handler_regs: Vec<&'static str>,
+    handler_regs: Vec<String>,
 }
 
 struct FnGen<'a> {
@@ -453,7 +485,7 @@ struct FnGen<'a> {
     /// `wait E for b` so far in this function: (E, b).
     handovers: Vec<(&'static str, String)>,
     /// Registers this function writes.
-    written: Vec<&'static str>,
+    written: Vec<String>,
     /// No register or interrupt deviations at all (a handler that isn't
     /// the one deviating).
     clean: bool,
@@ -779,11 +811,15 @@ impl FnGen<'_> {
             .filter(|&i| wrong_reg || REGS[i].writable)
             .collect();
         let r = &REGS[*self.rng.pick(&regs).unwrap()];
-        let field = if !r.fields.is_empty() && self.rng.chance(0.65) {
+        // A field write to a register with `w1c` fields clears the
+        // others: only as a deviation.
+        let field_ok = !r.rmw_unsafe || self.targeted();
+        let field = if !r.fields.is_empty() && field_ok && self.rng.chance(0.65) {
             Some(r.fields[self.rng.below(r.fields.len())])
         } else {
             None
         };
+        let reg = self.reg_name(r);
         let width = field.map_or(r.bits, |(_, w)| w);
         let max = if width >= 64 {
             u64::MAX
@@ -800,24 +836,39 @@ impl FnGen<'_> {
             }
         };
         let target = match field {
-            Some((f, _)) => format!("Fz.{}.{f}", r.name),
-            None => format!("Fz.{}", r.name),
+            Some((f, _)) => format!("Fz.{reg}.{f}"),
+            None => format!("Fz.{reg}"),
         };
         let value = self.value_expr(value);
         let write = format!("volatile_write({target}, {value});");
-        if !self.written.contains(&r.name) {
-            self.written.push(r.name);
+        if !self.written.contains(&reg) {
+            self.written.push(reg.clone());
         }
         // A field write is read-modify-write: if a handler writes the same
         // register, the code it interrupts must do it in `critical`.
         let racy = field.is_some()
             && !self.in_handler
             && !self.in_critical
-            && self.hw.handler_regs.contains(&r.name);
+            && self.hw.handler_regs.contains(&reg);
         if racy && !self.targeted() {
             self.line(depth, &format!("critical {{ {write} }}"));
         } else {
             self.line(depth, &write);
+        }
+    }
+
+    /// The register's name in an access: `CH[2]` for an array element.
+    fn reg_name(&mut self, r: &Reg) -> String {
+        if r.array == 0 {
+            r.name.to_string()
+        } else {
+            // Past the end, as a deviation.
+            let i = if self.hw_chaos() {
+                r.array as usize
+            } else {
+                self.rng.below(r.array as usize)
+            };
+            format!("{}[{i}]", r.name)
         }
     }
 
@@ -842,14 +893,11 @@ impl FnGen<'_> {
             .filter(|&i| wrong_reg || REGS[i].readable)
             .collect();
         let r = &REGS[*self.rng.pick(&regs).unwrap()];
+        let reg = self.reg_name(r);
         let target = if !r.fields.is_empty() && self.rng.chance(0.5) {
-            format!(
-                "Fz.{}.{}",
-                r.name,
-                r.fields[self.rng.below(r.fields.len())].0
-            )
+            format!("Fz.{reg}.{}", r.fields[self.rng.below(r.fields.len())].0)
         } else {
-            format!("Fz.{}", r.name)
+            format!("Fz.{reg}")
         };
         let v = self.fresh("v");
         self.line(depth, &format!("let {v}: u32 = volatile_read({target});"));
@@ -1700,7 +1748,7 @@ pub fn program(seed: u64, cfg: Config) -> String {
             }
             for r in &g.written {
                 if !hw.handler_regs.contains(r) {
-                    hw.handler_regs.push(r);
+                    hw.handler_regs.push(r.clone());
                 }
             }
             let body = std::mem::take(&mut g.out);

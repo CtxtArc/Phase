@@ -120,6 +120,14 @@ void phase_chk_reg_write(const volatile void *reg, const char *name, int access,
  * (the generated code then runs the handlers there); any handler write to
  * the same register before phase_chk_rmw_end() is a lost write. */
 int phase_chk_rmw_begin(const volatile void *reg, const char *name);
+/* v2.4: a field write about to write back `old` (`now` is the register
+ * after the handlers ran): no other `w1c` bit may be set (writing it back
+ * clears it), no other `rc_w0` bit may have been set in between (the 0
+ * written back clears it), and the register must have no `rc` field. */
+void phase_chk_reg_rmw(const char *name, unsigned long long old, unsigned long long now,
+                       unsigned long long w1c_others, unsigned long long rcw0_others, int rc);
+/* v2.4: a field read of a register with another `rc` field */
+void phase_chk_reg_rc_read(const char *name);
 void phase_chk_rmw_end(void);
 
 #endif /* PHASE_CHECK_H */

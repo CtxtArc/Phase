@@ -318,6 +318,15 @@ impl Parser {
     fn parse_reg_decl(&mut self) -> Result<RegDecl, ParseError> {
         let span = self.peek_span();
         let name = self.expect_ident()?;
+        // v2.4: `NAME[count]` -- an array of registers.
+        let count = if self.at(&TokenKind::LBracket) {
+            self.bump();
+            let n = self.expect_uint("a register count")?;
+            self.expect(TokenKind::RBracket)?;
+            Some(n)
+        } else {
+            None
+        };
         self.expect(TokenKind::Colon)?;
         let mut readable = false;
         let mut writable = false;
@@ -340,6 +349,30 @@ impl Parser {
         let ty = self.expect_ident()?;
         self.expect(TokenKind::At)?;
         let offset = self.expect_uint("a register offset")?;
+        // `step N`: the distance between elements of an array (default:
+        // the register's own size).
+        let step = if matches!(self.peek(), TokenKind::Ident(w) if w == "step") {
+            self.bump();
+            Some(self.expect_uint("a step in bytes")?)
+        } else {
+            None
+        };
+        if step.is_some() && count.is_none() {
+            return Err(ParseError {
+                message: format!(
+                    "`step` is for arrays of registers; declare '{name}[N]' to make one"
+                ),
+                span,
+            });
+        }
+        let array = count.map(|n| {
+            let size = match ty.as_str() {
+                "u8" => 1,
+                "u16" => 2,
+                _ => 4,
+            };
+            (n.min(u32::MAX as u64) as u32, step.unwrap_or(size))
+        });
         let reset = if self.at(&TokenKind::Eq) {
             self.bump();
             Some(self.expect_uint("a reset value")?)
@@ -375,11 +408,22 @@ impl Parser {
                         })
                     }
                 };
+                // v2.4: what reading and writing it does.
+                let kind = match self.peek() {
+                    TokenKind::Ident(w) if w == "w1c" => FieldKind::W1c,
+                    TokenKind::Ident(w) if w == "rc" => FieldKind::Rc,
+                    TokenKind::Ident(w) if w == "rc_w0" => FieldKind::RcW0,
+                    _ => FieldKind::Plain,
+                };
+                if kind != FieldKind::Plain {
+                    self.bump();
+                }
                 fields.push(RegField {
                     name: fname,
                     span: fspan,
                     lo: lo.min(u32::MAX as u64) as u32,
                     hi: hi.min(u32::MAX as u64) as u32,
+                    kind,
                 });
                 if self.at(&TokenKind::Comma) {
                     self.bump();
@@ -398,6 +442,7 @@ impl Parser {
             offset,
             reset,
             fields,
+            array,
         })
     }
 
@@ -1023,6 +1068,15 @@ impl Parser {
                 e = Expr::FieldAccess {
                     base: Box::new(e),
                     field,
+                };
+            } else if self.at(&TokenKind::LBracket) {
+                // v2.4: `REG[i]`.
+                self.bump();
+                let index = self.parse_expr()?;
+                self.expect(TokenKind::RBracket)?;
+                e = Expr::Index {
+                    base: Box::new(e),
+                    index: Box::new(index),
                 };
             } else {
                 break;
@@ -1754,6 +1808,41 @@ mod tests {
             panic!()
         };
         assert_eq!(odd.name, "type");
+    }
+
+    #[test]
+    fn register_arrays_field_kinds_and_indexes_are_parsed() {
+        let p = parse(
+            "device D @ 0x40000000 {
+                 CR[8]: read write u32 @ 0x10 step 0x18 { EN: bit 0, TCIF: bit 5 w1c, UIF: bit 6 rc_w0, ERR: bit 7 rc }
+                 B[2]: read u8 @ 0x0;
+             }
+             fn main() { volatile_write(D.CR[3].EN, 1); }",
+        )
+        .unwrap();
+        let Item::Device(d) = &p.items[0] else {
+            panic!()
+        };
+        assert_eq!(d.regs[0].array, Some((8, 0x18)));
+        assert_eq!(d.regs[1].array, Some((2, 1))); // default step: its size
+        let kinds: Vec<FieldKind> = d.regs[0].fields.iter().map(|f| f.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                FieldKind::Plain,
+                FieldKind::W1c,
+                FieldKind::RcW0,
+                FieldKind::Rc
+            ]
+        );
+        let Item::Fn(f) = &p.items[1] else { panic!() };
+        let Stmt::Expr(Expr::Call { args, .. }) = &f.body.stmts[0].node else {
+            panic!()
+        };
+        let path = reg_path(&args[0]).unwrap();
+        assert_eq!((path.device, path.reg, path.field), ("D", "CR", Some("EN")));
+        assert_eq!(path.index, Some(&Expr::IntLit(3)));
+        assert!(parse("device D @ 0 { A: read u32 @ 0 step 4; }").is_err());
     }
 
     #[test]

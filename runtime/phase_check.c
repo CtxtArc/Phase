@@ -597,3 +597,24 @@ void phase_chk_rmw_end(void) {
         rmw_active = 0;
     }
 }
+
+void phase_chk_reg_rmw(const char *name, unsigned long long old, unsigned long long now,
+                       unsigned long long w1c_others, unsigned long long rcw0_others, int rc) {
+    if (rc) {
+        fail("writing %s reads its register first, which clears its `rc` field", name);
+    }
+    if (old & w1c_others) {
+        fail("writing %s writes back %#llx, a 1 to `w1c` bits that are set: it clears a pending "
+             "flag",
+             name, old & w1c_others);
+    }
+    if (~old & now & rcw0_others) {
+        fail("writing %s writes back 0 to `rc_w0` bits (%#llx) the hardware set in between: it "
+             "clears a fresh flag",
+             name, ~old & now & rcw0_others);
+    }
+}
+
+void phase_chk_reg_rc_read(const char *name) {
+    fail("reading %s reads its whole register, which clears another `rc` field", name);
+}

@@ -382,8 +382,15 @@ fn format_reg_read(r: &RegRef, checked: bool) -> String {
         Some((_, lo, hi)) => format!("(({reg} >> {lo}u) & {:#x}u)", field_mask(*lo, *hi)),
     };
     if checked {
+        // v2.4: reading one field of a register with an `rc` field clears
+        // that field as a side effect.
+        let rc = if r.field.is_some() && r.rc_others {
+            format!("phase_chk_reg_rc_read(\"{}\"), ", reg_display(r))
+        } else {
+            String::new()
+        };
         format!(
-            "(phase_chk_reg_read(\"{}\", {}), {read})",
+            "({rc}phase_chk_reg_read(\"{}\", {}), {read})",
             reg_display(r),
             reg_access(r)
         )
@@ -395,8 +402,8 @@ fn format_reg_read(r: &RegRef, checked: bool) -> String {
 /// `Dev.REG` or `Dev.REG.FIELD`, as written in PHASE.
 fn reg_display(r: &RegRef) -> String {
     match &r.field {
-        None => format!("{}.{}", r.device, r.reg),
-        Some((f, _, _)) => format!("{}.{}.{f}", r.device, r.reg),
+        None => r.display.clone(),
+        Some((f, _, _)) => format!("{}.{f}", r.display),
     }
 }
 
@@ -443,6 +450,16 @@ fn format_checked_reg_write(r: &RegRef, value: &str, has_handlers: bool, pad: &s
             if has_handlers {
                 s.push_str(&format!(
                     "{pad}    if (phase_chk_rmw_begin(&{reg}, \"{name}\")) {{\n{pad}        phase_interrupt_now(); /* an interrupt between the read and the write */\n{pad}    }}\n{pad}    phase_chk_rmw_end();\n"
+                ));
+            }
+            // v2.4: what writing the rest back would do to the register's
+            // other `w1c`, `rc_w0` and `rc` fields.
+            if r.w1c_others != 0 || r.rcw0_others != 0 || r.rc_others {
+                s.push_str(&format!(
+                    "{pad}    phase_chk_reg_rmw(\"{name}\", phase_old, {reg}, {:#x}ull, {:#x}ull, {});\n",
+                    r.w1c_others,
+                    r.rcw0_others,
+                    u8::from(r.rc_others)
                 ));
             }
             s.push_str(&format!(
@@ -1663,6 +1680,35 @@ mod tests {
         phase_analysis::analyze(&program).expect("fixture must pass analysis");
         let pir = phase_pir::build(&program).expect("fixture must lower to PIR");
         generate(&pir, stem)
+    }
+
+    #[test]
+    fn register_arrays_are_laid_out_element_by_element() {
+        let g = generate_src(
+            "device Dma @ 0x40026000 {
+                 CR[4]: read write u32 @ 0x10 step 0x18 { EN: bit 0 }
+                 NDTR[4]: read write u32 @ 0x14 step 0x18;
+             }
+             fn main() { volatile_write(Dma.CR[3].EN, 1); volatile_write(Dma.NDTR[2], 9); }",
+            "arr",
+        );
+        for needle in [
+            "_Static_assert(offsetof(phase_dev_Dma_regs, CR_3) == 0x58, \"Dma.CR_3 offset\");",
+            "_Static_assert(offsetof(phase_dev_Dma_regs, NDTR_2) == 0x44, \"Dma.NDTR_2 offset\");",
+        ] {
+            assert!(
+                g.header.contains(needle),
+                "missing {needle:?} in\n{}",
+                g.header
+            );
+        }
+        for needle in ["Dma->CR_3 = ", "Dma->NDTR_2 = (uint32_t)(9);"] {
+            assert!(
+                g.source.contains(needle),
+                "missing {needle:?} in\n{}",
+                g.source
+            );
+        }
     }
 
     #[test]

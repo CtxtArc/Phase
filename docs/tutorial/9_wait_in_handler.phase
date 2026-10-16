@@ -10,7 +10,7 @@ interrupt fn on_timer0() @ irq 8 {
 }
 
 interrupt fn on_uart0_tx() @ irq 1 {
-    volatile_write(Uart0.INTSTATUS.TX, 1);
+    volatile_write(Uart0.INTSTATUS, 1);   // TX: write 1 to clear
     signal sent;
 }
 

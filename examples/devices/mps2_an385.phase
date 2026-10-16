@@ -14,7 +14,7 @@ device type CmsdkUart {
     DATA:      read write u32 @ 0x00 { BYTE: bits 0..=7 }
     STATE:     read write u32 @ 0x04 { TXFULL: bit 0, RXFULL: bit 1, TXOVR: bit 2, RXOVR: bit 3 }
     CTRL:      read write u32 @ 0x08 = 0 { TX_EN: bit 0, RX_EN: bit 1, TX_IRQ_EN: bit 2, RX_IRQ_EN: bit 3 }
-    INTSTATUS: read write u32 @ 0x0C { TX: bit 0, RX: bit 1 }
+    INTSTATUS: read write u32 @ 0x0C { TX: bit 0 w1c, RX: bit 1 w1c }   // write 1 to clear
     BAUDDIV:   read write u32 @ 0x10 { DIV: bits 0..=19 }
 }
 
@@ -29,7 +29,7 @@ device type CmsdkTimer {
     CTRL:   read write u32 @ 0x00 = 0 { ENABLE: bit 0, EXT_ENABLE: bit 1, EXT_CLOCK: bit 2, IRQ_ENABLE: bit 3 }
     VALUE:  read write u32 @ 0x04;
     RELOAD: read write u32 @ 0x08;
-    INT:    read write u32 @ 0x0C { PENDING: bit 0 }
+    INT:    read write u32 @ 0x0C { PENDING: bit 0 w1c }   // write 1 to clear
 }
 
 device Timer0: CmsdkTimer @ 0x40000000;

@@ -74,13 +74,13 @@ static void aim(int ch, uint32_t *dest) {
     halves[ch] = dest;
 #ifdef PHASE_TARGET_HW
     if (ch == 0) {
-        Dma0->C0SRC = (uint32_t)(uintptr_t)src;
-        Dma0->C0DEST = (uint32_t)(uintptr_t)dest;
-        Dma0->C0LLI = 0;
+        Dma0->CSRC_0 = (uint32_t)(uintptr_t)src;
+        Dma0->CDEST_0 = (uint32_t)(uintptr_t)dest;
+        Dma0->CLLI_0 = 0;
     } else {
-        Dma0->C1SRC = (uint32_t)(uintptr_t)src;
-        Dma0->C1DEST = (uint32_t)(uintptr_t)dest;
-        Dma0->C1LLI = 0;
+        Dma0->CSRC_1 = (uint32_t)(uintptr_t)src;
+        Dma0->CDEST_1 = (uint32_t)(uintptr_t)dest;
+        Dma0->CLLI_1 = 0;
     }
 #else
     sim_src[ch] = src;
@@ -110,8 +110,8 @@ void phase_sim_hardware(void) {
         return;
     }
     for (int ch = 0; ch < 2; ch++) {
-        volatile uint32_t *control = ch == 0 ? &Dma0->C0CONTROL : &Dma0->C1CONTROL;
-        volatile uint32_t *config = ch == 0 ? &Dma0->C0CONFIG : &Dma0->C1CONFIG;
+        volatile uint32_t *control = ch == 0 ? &Dma0->CCONTROL_0 : &Dma0->CCONTROL_1;
+        volatile uint32_t *config = ch == 0 ? &Dma0->CCONFIG_0 : &Dma0->CCONFIG_1;
         if (!(*config & 1u)) {
             continue;
         }

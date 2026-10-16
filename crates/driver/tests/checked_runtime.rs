@@ -22,6 +22,12 @@ fn workspace_root() -> PathBuf {
 /// Compile `src` as a checked build with stub externs, skipping the static
 /// analyzer, and run it. Returns (exit code, stderr).
 fn run_unanalyzed(name: &str, src: &str, seed: u32) -> (i32, String) {
+    run_unanalyzed_with(name, src, seed, "")
+}
+
+/// Like [`run_unanalyzed`], with `extra_c` added to the stubs (to play the
+/// hardware in `phase_sim_hardware`, say).
+fn run_unanalyzed_with(name: &str, src: &str, seed: u32, extra_c: &str) -> (i32, String) {
     let root = workspace_root();
     let dir = root.join("build").join("checked_runtime_tests").join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -32,7 +38,7 @@ fn run_unanalyzed(name: &str, src: &str, seed: u32) -> (i32, String) {
     std::fs::write(dir.join(format!("{name}.gen.c")), &generated.source).unwrap();
     std::fs::write(
         dir.join(format!("{name}.stubs.c")),
-        phase_codegen_c::generate_stubs(&pir, name),
+        phase_codegen_c::generate_stubs(&pir, name) + extra_c,
     )
     .unwrap();
     let binary = dir.join(name);
@@ -683,6 +689,80 @@ fn correct_interrupt_and_register_use_runs_clean() {
                   wait tick;
                   start(a); wait ht for a; look(a);
               }"),
+        1,
+    );
+    assert_eq!(code, 0, "{stderr}");
+}
+
+// ---- v2.4: register arrays and fields with side effects -------------------
+
+const FLAGS: &str = r#"
+    device Dma @ 0x40026000 {
+        CR[4]: read write u32 @ 0x10 step 0x18 { EN: bit 0, TCIE: bit 4 }
+        INT: read write u32 @ 0x100 { PENDING: bit 0 w1c, ENABLE: bit 4 }
+        SR:  read write u32 @ 0x104 { UIF: bit 0 rc_w0, CC1IF: bit 1 rc_w0, MODE: bit 4 }
+        DR:  read u32 @ 0x108 { DATA: bits 0..=8, ERR: bit 9 rc }
+    }
+    event e;
+"#;
+
+fn flags(body: &str) -> String {
+    format!("{SIGS}\n{FLAGS}\n{body}")
+}
+
+#[test]
+fn a_field_write_clearing_a_pending_flag_is_caught() {
+    caught(
+        "rt_w1c",
+        &flags("fn main() { volatile_write(Dma.INT, 1); volatile_write(Dma.INT.ENABLE, 1); }"),
+        "writing Dma.INT.ENABLE writes back 0x1, a 1 to `w1c` bits that are set",
+    );
+}
+
+#[test]
+fn a_flag_set_during_a_field_write_is_caught() {
+    // The hardware sets CC1IF (the C below plays it); the field write
+    // that read SR before then writes it back as 0.
+    let (code, stderr) = run_unanalyzed_with(
+        "rt_rcw0",
+        &flags(
+            "interrupt fn h() @ irq 3 { signal e; }
+             fn main() { volatile_write(Dma.SR.MODE, 1); wait e; }",
+        ),
+        1,
+        "\nvoid phase_sim_hardware(void) { Dma->SR |= 2u; }\n",
+    );
+    assert_eq!(code, 70, "{stderr}");
+    assert!(
+        stderr.contains(
+            "writing Dma.SR.MODE writes back 0 to `rc_w0` bits (0x2) the hardware set in between"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn reading_one_field_of_a_read_clear_register_is_caught() {
+    caught(
+        "rt_rc",
+        &flags("fn main() { let d: u32 = volatile_read(Dma.DR.DATA); }"),
+        "reading Dma.DR.DATA reads its whole register, which clears another `rc` field",
+    );
+}
+
+#[test]
+fn register_array_elements_are_separate_registers() {
+    let (code, stderr) = run_unanalyzed(
+        "rt_array_ok",
+        &flags(
+            "fn main() {
+                 volatile_write(Dma.CR[0].EN, 1);
+                 volatile_write(Dma.CR[3].TCIE, 1);
+                 volatile_write(Dma.INT, 1 << 4);
+                 volatile_write(Dma.SR, 0xFFFFFFFF ^ 1);
+                 let d: u32 = volatile_read(Dma.DR);
+             }",
+        ),
         1,
     );
     assert_eq!(code, 0, "{stderr}");

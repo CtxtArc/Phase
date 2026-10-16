@@ -55,7 +55,7 @@
           "include": "#comments"
         },
         {
-          "match": "\\b(bits?)\\b",
+          "match": "\\b(bits?|step|w1c|rc_w0|rc)\\b",
           "name": "keyword.other.bit.phase"
         },
         {
@@ -63,7 +63,7 @@
           "name": "storage.modifier.access.phase"
         },
         {
-          "match": "^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?=:)",
+          "match": "^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?=(\\[[0-9xXa-fA-F_]+\\])?\\s*:)",
           "captures": {
             "1": {
               "name": "variable.other.register.phase"
@@ -298,7 +298,7 @@
           "include": "#comments"
         },
         {
-          "match": "\\b(bits?)\\b",
+          "match": "\\b(bits?|step|w1c|rc_w0|rc)\\b",
           "name": "keyword.other.bit.phase"
         },
         {
@@ -306,7 +306,7 @@
           "name": "storage.modifier.access.phase"
         },
         {
-          "match": "^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?=:)",
+          "match": "^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?=(\\[[0-9xXa-fA-F_]+\\])?\\s*:)",
           "captures": {
             "1": {
               "name": "variable.other.register.phase"

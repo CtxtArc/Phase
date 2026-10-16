@@ -383,8 +383,18 @@ fn word_chain_at(text: &str, pos: (u32, u32)) -> Option<(Vec<String>, usize)> {
         }
     }
     let mut start = at;
-    while start > 0 && (is_word(line[start - 1]) || line[start - 1] == '.') {
-        start -= 1;
+    loop {
+        if start > 0 && (is_word(line[start - 1]) || line[start - 1] == '.') {
+            start -= 1;
+        } else if start > 0 && line[start - 1] == ']' {
+            // v2.4: skip a register array's index, `CR[3]`.
+            match line[..start].iter().rposition(|c| *c == '[') {
+                Some(open) => start = open,
+                None => break,
+            }
+        } else {
+            break;
+        }
     }
     let mut end = at;
     while end < line.len() && is_word(line[end]) {
@@ -392,7 +402,31 @@ fn word_chain_at(text: &str, pos: (u32, u32)) -> Option<(Vec<String>, usize)> {
     }
     let before: String = line[start..at].iter().collect();
     let chain_text: String = line[start..end].iter().collect();
-    let chain: Vec<String> = chain_text
+    // Drop the indexes: `Dma.CR[3].EN` -> Dma, CR, EN.
+    let mut plain = String::new();
+    let mut depth = 0;
+    for c in chain_text.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            _ if depth == 0 => plain.push(c),
+            _ => {}
+        }
+    }
+    let before: String = {
+        let mut out = String::new();
+        let mut depth = 0;
+        for c in before.chars() {
+            match c {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ if depth == 0 => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    };
+    let chain: Vec<String> = plain
         .split('.')
         .filter(|w| !w.is_empty())
         .map(str::to_string)
@@ -1069,6 +1103,18 @@ fn main() {
         let md = server.hover("file:///c.phase", (1, 6)).unwrap();
         assert!(md.contains("const B: u32 = A | 1;"), "{md}");
         assert!(md.contains("= 17 (0x11)"), "{md}");
+        // A field of a register array element.
+        server.docs.insert(
+            "file:///a.phase".into(),
+            "device D @ 0x40000000 {\n    CR[4]: read write u32 @ 0x0 step 8 { EN: bit 0 }\n}\nfn main() {\n    volatile_write(D.CR[2].EN, 1);\n}\n".into(),
+        );
+        let md = server.hover("file:///a.phase", (4, 22)).unwrap(); // CR
+        assert!(md.contains("CR[4]: read write u32"), "{md}");
+        let md = server.hover("file:///a.phase", (4, 27)).unwrap(); // EN
+        assert!(
+            md.contains("CR[4]: read write u32 @ 0x0 step 8 { EN: bit 0 }"),
+            "{md}"
+        );
     }
 
     #[test]

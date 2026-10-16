@@ -328,6 +328,25 @@ note: 'Timer.CTRL.PRESCALE' is declared here
 examples/bug_gallery/field_value_too_wide.phase: 1 error found
 ```
 
+### `examples/bug_gallery/field_write_clears_flag.phase`
+
+Bug gallery #46: acknowledging one interrupt clears another. TX and RX
+
+```
+error: writing field 'Uart0.INTSTATUS.TX' writes back a 1 to every set bit of `w1c` field 'RX' of 'Uart0.INTSTATUS', clearing a pending flag nobody handled; write the whole register
+  --> examples/bug_gallery/field_write_clears_flag.phase:21:9
+   |
+21 |         volatile_write(Uart0.INTSTATUS.TX, 1);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: 'RX' is `w1c`, declared here
+  --> examples/bug_gallery/field_write_clears_flag.phase:12:55
+   |
+12 |     INTSTATUS: read write u32 @ 0x0C { TX: bit 0 w1c, RX: bit 1 w1c }
+   |                                                       --
+
+examples/bug_gallery/field_write_clears_flag.phase: 1 error found
+```
+
 ### `examples/bug_gallery/field_write_on_write_only_register.phase`
 
 Bug gallery #36: setting one bit of a write-only register. Writing a
@@ -692,6 +711,25 @@ note: 'pong' is declared in @RAM here
    |     ---------------------------
 
 examples/bug_gallery/refill_while_processing.phase: 3 errors found
+```
+
+### `examples/bug_gallery/register_index_out_of_range.phase`
+
+Bug gallery #47: one past the last DMA stream. The controller has eight
+
+```
+error: Dma2.CR[8] is out of range: 'Dma2.CR' has 8 registers (0 to 7)
+  --> examples/bug_gallery/register_index_out_of_range.phase:17:5
+   |
+17 |     volatile_write(Dma2.CR[ADC_STREAM].EN, 1);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: 'Dma2.CR' is declared here
+  --> examples/bug_gallery/register_index_out_of_range.phase:9:5
+   |
+ 9 |     CR[8]:   read write u32 @ 0x10 step 0x18 { EN: bit 0, TCIE: bit 4, CHSEL: bits 25..=27 }
+   |     --
+
+examples/bug_gallery/register_index_out_of_range.phase: 1 error found
 ```
 
 ### `examples/bug_gallery/rotate_wrong_direction.phase`

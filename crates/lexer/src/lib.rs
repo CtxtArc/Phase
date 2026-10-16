@@ -45,6 +45,8 @@ pub enum TokenKind {
     RBrace,   // }
     LParen,   // (
     RParen,   // )
+    LBracket, // [ (v2.4)
+    RBracket, // ]
     LAngle,   // <
     RAngle,   // >
     Colon,    // :
@@ -419,6 +421,8 @@ impl<'a> Lexer<'a> {
             }
             '*' => Star,
             '/' => Slash,
+            '[' => LBracket,
+            ']' => RBracket,
             '&' => Amp,
             '|' => Pipe,
             '^' => Caret,
