@@ -222,6 +222,25 @@ note: 'probe' is declared here
 examples/bug_gallery/buffer_length_mismatch.phase: 1 error found
 ```
 
+### `examples/bug_gallery/constant_too_wide.phase`
+
+Bug gallery #45: a named value too wide for its field. The datasheet's
+
+```
+error: 16 (0x10) does not fit in 'Timer.CTRL.PRESCALE' (4 bits, at most 15)
+  --> examples/bug_gallery/constant_too_wide.phase:18:5
+   |
+18 |     volatile_write(Timer.CTRL.PRESCALE, PRESCALE_DIV16);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: 'Timer.CTRL.PRESCALE' is declared here
+  --> examples/bug_gallery/constant_too_wide.phase:10:54
+   |
+10 |     CTRL: read write u32 @ 0x00 = 0 { ENABLE: bit 0, PRESCALE: bits 4..=7, IRQ_EN: bit 8 }
+   |                                                      --------
+
+examples/bug_gallery/constant_too_wide.phase: 1 error found
+```
+
 ### `examples/bug_gallery/destroy_while_dma.phase`
 
 Bug gallery #10: freeing a buffer while the DMA engine still owns it.

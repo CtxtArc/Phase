@@ -73,6 +73,7 @@ fn walk_expr(e: &Expr, span: Span, critical: bool, f: &mut Facts) {
             walk_expr(lhs, span, critical, f);
             walk_expr(rhs, span, critical, f);
         }
+        Expr::BitNot(x) => walk_expr(x, span, critical, f),
         Expr::StructLit { fields, .. } => {
             for (_, v) in fields {
                 walk_expr(v, span, critical, f);

@@ -1,0 +1,20 @@
+// Bug gallery #45: a named value too wide for its field. The datasheet's
+// prescaler field takes the divider minus one (0..=15 for /1../16), but
+// the constant holds the divider itself. Written as a literal it would be
+// caught as one; as a constant computed from others, the compiler
+// computes it and checks it all the same. In C, `CTRL |= DIV << 4`
+// silently sets bit 8 -- here, the timer's interrupt enable.
+// Expected: "16 (0x10) does not fit in 'Timer.CTRL.PRESCALE' (4 bits, at most 15)"
+
+device Timer @ 0x40000000 {
+    CTRL: read write u32 @ 0x00 = 0 { ENABLE: bit 0, PRESCALE: bits 4..=7, IRQ_EN: bit 8 }
+}
+
+const BASE_DIV: u32 = 4;
+// BUG: the field takes the divider minus one.
+const PRESCALE_DIV16: u32 = BASE_DIV * 4;
+
+fn main() {
+    volatile_write(Timer.CTRL.PRESCALE, PRESCALE_DIV16);
+    volatile_write(Timer.CTRL.ENABLE, 1);
+}

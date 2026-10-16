@@ -48,7 +48,7 @@ fn fill_lo(dest: write buffer<u32, 16> @RAM -> @DMA) {
     volatile_write(Dma0.C0CONTROL.SRC_INC, 1);
     volatile_write(Dma0.C0CONTROL.DEST_INC, 1);
     volatile_write(Dma0.C0CONTROL.TC_IRQ, 1);
-    volatile_write(Dma0.C0CONFIG, 0x8001);       // TC_IRQ and ENABLE: go
+    volatile_write(Dma0.C0CONFIG, PL081_MEM_TO_MEM | PL081_TC_IRQ | PL081_ENABLE);
     // Harmless on the chip; QEMU's PL081 only updates its interrupt line
     // on a write to a controller register.
     volatile_write(Dma0.CONFIG.ENABLE, 1);
@@ -63,7 +63,7 @@ fn fill_hi(dest: write buffer<u32, 16> @RAM -> @DMA) {
     volatile_write(Dma0.C1CONTROL.SRC_INC, 1);
     volatile_write(Dma0.C1CONTROL.DEST_INC, 1);
     volatile_write(Dma0.C1CONTROL.TC_IRQ, 1);
-    volatile_write(Dma0.C1CONFIG, 0x8001);
+    volatile_write(Dma0.C1CONFIG, PL081_MEM_TO_MEM | PL081_TC_IRQ | PL081_ENABLE);
     volatile_write(Dma0.CONFIG.ENABLE, 1);
 }
 
@@ -71,7 +71,7 @@ fn main() {
     volatile_write(Uart0.BAUDDIV.DIV, 16);
     volatile_write(Uart0.CTRL.TX_EN, 1);
     volatile_write(Dma0.CONFIG.ENABLE, 1);        // the controller
-    volatile_write(Nvic.ISER1, 0x2000000);        // IRQ 57 (DMA0_TC)
+    volatile_write(Nvic.ISER1, 1 << (IRQ_DMA0_TC - 32));
 
     buffer<u32, 32> ring @RAM;
     let n: u32 = 0;

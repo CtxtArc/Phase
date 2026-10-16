@@ -64,6 +64,13 @@ pub enum TokenKind {
     Star,     // *
     Slash,    // /
     Bang,     // !
+    // v2.4: bit operations.
+    Amp,   // &
+    Pipe,  // |
+    Caret, // ^
+    Tilde, // ~
+    Shl,   // <<
+    Shr,   // >>
 
     Eof,
 }
@@ -351,14 +358,23 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some('=') {
                     self.bump();
                     LtEq
+                } else if self.peek() == Some('<') {
+                    self.bump();
+                    Shl
                 } else {
                     LAngle
                 }
             }
+            // `>>` is never a pair of closing angle brackets in PHASE: a
+            // type argument list can't end in a nested one (`buffer<T, N>`
+            // and `Machine<State>` don't nest at their end).
             '>' => {
                 if self.peek() == Some('=') {
                     self.bump();
                     GtEq
+                } else if self.peek() == Some('>') {
+                    self.bump();
+                    Shr
                 } else {
                     RAngle
                 }
@@ -403,6 +419,10 @@ impl<'a> Lexer<'a> {
             }
             '*' => Star,
             '/' => Slash,
+            '&' => Amp,
+            '|' => Pipe,
+            '^' => Caret,
+            '~' => Tilde,
             other => {
                 return Err(LexError {
                     message: format!("unexpected character '{other}'"),

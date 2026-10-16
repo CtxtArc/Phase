@@ -194,6 +194,99 @@ pub struct FnDecl {
     pub irq: Option<(u32, Span)>,
 }
 
+/// `const NAME: u32 = 1 << 4;` (v2.4): a named integer, computed when the
+/// program is compiled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstDecl {
+    pub name: String,
+    pub span: Span,
+    /// `u8`, `u16`, `u32` or `u64`.
+    pub ty: String,
+    pub value: Expr,
+}
+
+/// The largest value of an unsigned integer type, by name.
+pub fn uint_max(ty: &str) -> Option<u64> {
+    match ty {
+        "u8" => Some(u8::MAX as u64),
+        "u16" => Some(u16::MAX as u64),
+        "u32" => Some(u32::MAX as u64),
+        "u64" => Some(u64::MAX),
+        _ => None,
+    }
+}
+
+/// Evaluate a constant expression: integer literals, constants (looked up
+/// with `lookup`, which returns `None` for a name that isn't one) and
+/// arithmetic and bit operations on them. Values are 64-bit unsigned: an
+/// expression that leaves that range (a negative literal, a subtraction
+/// below zero, an overflowing sum or product, a shift by 64 or more, a
+/// division by zero) is an error, never a wrapped value. `Ok(None)` means
+/// the expression isn't constant (it names a variable, or reads a
+/// register).
+pub fn eval_const(
+    e: &Expr,
+    lookup: &dyn Fn(&str) -> Option<Result<u64, String>>,
+) -> Result<Option<u64>, String> {
+    Ok(Some(match e {
+        Expr::IntLit(v) => {
+            if *v < 0 {
+                return Err(format!("{v} is negative; constants are unsigned"));
+            }
+            *v as u64
+        }
+        Expr::Ident(n) => match lookup(n) {
+            Some(r) => r?,
+            None => return Ok(None),
+        },
+        Expr::BitNot(x) => match eval_const(x, lookup)? {
+            Some(v) => !v,
+            None => return Ok(None),
+        },
+        Expr::Binary { op, lhs, rhs } => {
+            let (Some(a), Some(b)) = (eval_const(lhs, lookup)?, eval_const(rhs, lookup)?) else {
+                return Ok(None);
+            };
+            let what = || format!("{a} {} {b}", op.symbol());
+            match op {
+                BinOp::Add => a
+                    .checked_add(b)
+                    .ok_or_else(|| format!("{} overflows 64 bits", what()))?,
+                BinOp::Sub => a
+                    .checked_sub(b)
+                    .ok_or_else(|| format!("{} is negative", what()))?,
+                BinOp::Mul => a
+                    .checked_mul(b)
+                    .ok_or_else(|| format!("{} overflows 64 bits", what()))?,
+                BinOp::Div => a
+                    .checked_div(b)
+                    .ok_or_else(|| format!("{} divides by zero", what()))?,
+                BinOp::BitAnd => a & b,
+                BinOp::BitOr => a | b,
+                BinOp::BitXor => a ^ b,
+                BinOp::Shl | BinOp::Shr if b >= 64 => {
+                    return Err(format!(
+                        "{} shifts by {b}; a shift must be less than 64",
+                        what()
+                    ))
+                }
+                BinOp::Shl => {
+                    let v = a << b;
+                    if v >> b != a {
+                        return Err(format!("{} overflows 64 bits", what()));
+                    }
+                    v
+                }
+                BinOp::Shr => a >> b,
+                BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
+                    return Ok(None)
+                }
+            }
+        }
+        _ => return Ok(None),
+    }))
+}
+
 /// `event tick;` (v2.2): a flag an interrupt handler raises with `signal`
 /// and other code waits for with `wait`.
 #[derive(Debug, Clone, PartialEq)]
@@ -322,6 +415,7 @@ pub enum Item {
     Device(DeviceDecl),
     DeviceType(DeviceTypeDecl),
     Event(EventDecl),
+    Const(ConstDecl),
     /// Resolved (and removed) when a program is loaded from files; left in
     /// place by `parse` on a single source string.
     Import(ImportDecl),
@@ -407,6 +501,41 @@ pub enum BinOp {
     Gt,
     LtEq,
     GtEq,
+    /// v2.4: bit operations, on the value's unsigned bit pattern.
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+}
+
+impl BinOp {
+    pub fn is_bitwise(self) -> bool {
+        matches!(
+            self,
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+        )
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Eq => "==",
+            BinOp::NotEq => "!=",
+            BinOp::Lt => "<",
+            BinOp::Gt => ">",
+            BinOp::LtEq => "<=",
+            BinOp::GtEq => ">=",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -448,6 +577,8 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    /// `~x` (v2.4): every bit of `x` flipped.
+    BitNot(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

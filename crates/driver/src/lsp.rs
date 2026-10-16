@@ -426,6 +426,7 @@ enum DeclKind {
     Register,
     Field,
     Event,
+    Const,
     Other,
 }
 
@@ -442,6 +443,9 @@ fn find_decl(program: &Program, chain: &[String]) -> Option<(Span, DeclKind)> {
             }
             Item::Event(e) if chain.len() == 1 && e.name == first => {
                 return Some((e.span, DeclKind::Event))
+            }
+            Item::Const(c) if chain.len() == 1 && c.name == first => {
+                return Some((c.span, DeclKind::Const))
             }
             Item::DeviceType(t) if chain.len() == 1 && t.name == first => {
                 return Some((t.span, DeclKind::Other))
@@ -529,8 +533,28 @@ fn kind_note(program: &Program, kind: &DeclKind, name: &str) -> Option<String> {
             let names: Vec<String> = regs.iter().map(|r| format!("`{}`", r.name)).collect();
             Some(format!("Registers: {}.", names.join(", ")))
         }
+        DeclKind::Const => {
+            let v = const_value(program, name)?;
+            Some(format!("= {v} ({v:#x})"))
+        }
         DeclKind::Fn | DeclKind::Register | DeclKind::Field | DeclKind::Other => None,
     }
+}
+
+/// A constant's value, following the constants it is computed from.
+fn const_value(program: &Program, name: &str) -> Option<u64> {
+    fn eval(program: &Program, name: &str, depth: usize) -> Option<u64> {
+        if depth > 64 {
+            return None; // a cycle (reported by the analyzer)
+        }
+        let c = program.items.iter().find_map(|i| match i {
+            Item::Const(c) if c.name == name => Some(c),
+            _ => None,
+        })?;
+        let lookup = |n: &str| eval(program, n, depth + 1).map(Ok);
+        phase_ast::eval_const(&c.value, &lookup).ok().flatten()
+    }
+    eval(program, name, 0)
 }
 
 /// Whether `block` signals / waits for `event`.
@@ -1036,6 +1060,15 @@ fn main() {
             "{md}"
         );
         assert_eq!(hover_at(9, 0), None); // `fn`
+                                          // A constant: its declaration and its value.
+        let mut server = Server::default();
+        server.docs.insert(
+            "file:///c.phase".into(),
+            "const A: u32 = 1 << 4;\nconst B: u32 = A | 1;\nfn main() {\n}\n".into(),
+        );
+        let md = server.hover("file:///c.phase", (1, 6)).unwrap();
+        assert!(md.contains("const B: u32 = A | 1;"), "{md}");
+        assert!(md.contains("= 17 (0x11)"), "{md}");
     }
 
     #[test]

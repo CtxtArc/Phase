@@ -182,6 +182,9 @@ CASES = [
     ("fn main() {\n    wait ht for lo;\n}", 2, "wait", "keyword.control.event.phase"),
     ("fn main() {\n    wait ht for lo;\n}", 2, "ht", "variable.other.event.phase"),
     ("fn main() {\n    wait ht for lo;\n}", 2, "for", "keyword.control.event.phase"),
+    ("const EN: u32 = 1 << 0;", 1, "const", "keyword.declaration.const.phase"),
+    ("const EN: u32 = 1 << 0;", 1, "EN", "variable.other.constant.phase"),
+    ("const EN: u32 = 1 << 0;", 1, "<<", "keyword.operator.phase"),
     # An instance line has no block: the next line is ordinary code again.
     ("device Uart0: Uart @ 0x40004000;\nfn main() { move x -> @DMA; }", 2, "main", "entity.name.function.phase"),
 ]

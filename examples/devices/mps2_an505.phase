@@ -66,6 +66,11 @@ device type Pl081 {
     }
 }
 
+// Values for a channel's CONFIG register.
+const PL081_ENABLE: u32 = 1 << 0;
+const PL081_TC_IRQ: u32 = 1 << 15;      // raise INTTCSTATUS when done
+const PL081_MEM_TO_MEM: u32 = 0 << 11;  // FLOW
+
 device Dma0: Pl081 @ 0x50110000;
 device Dma1: Pl081 @ 0x50111000;
 device Dma2: Pl081 @ 0x50112000;
@@ -86,3 +91,9 @@ device type CortexM33Nvic {
 }
 
 device Nvic: CortexM33Nvic @ 0xE000E100;
+
+const IRQ_UART0_TX: u32 = 33;
+const IRQ_DMA0_TC: u32 = 57;
+const IRQ_DMA1_TC: u32 = 60;
+const IRQ_DMA2_TC: u32 = 63;
+const IRQ_DMA3_TC: u32 = 66;

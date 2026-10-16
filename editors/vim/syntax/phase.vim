@@ -15,6 +15,7 @@ syn keyword phaseBuiltin    volatile_read volatile_write
 syn match   phaseInterrupt  "\<interrupt\ze\s\+fn\>"
 syn match   phaseInterrupt  "@\s*\zsirq\>"
 syn match   phaseInterrupt  "^\s*\zsevent\ze\s\+\h\w*\s*;"
+syn match   phaseConst      "^\s*\zsconst\ze\s\+\h\w*\s*:"
 syn match   phaseInterrupt  "^\s*\zs\(signal\|wait\)\ze\s\+\h\w*\s*;"
 syn match   phaseInterrupt  "^\s*\zswait\ze\s\+\h\w*\s\+for\s\+\h\w*\s*;"
 syn match   phaseInterrupt  "^\s*wait\s\+\h\w*\s\+\zsfor\ze\s\+\h\w*\s*;"
@@ -46,6 +47,7 @@ hi def link phaseBit        Keyword
 hi def link phaseDomain     Constant
 hi def link phaseNumber     Number
 hi def link phaseOperator   Operator
+hi def link phaseConst      StorageClass
 hi def link phaseString     String
 hi def link phaseComment    Comment
 

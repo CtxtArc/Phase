@@ -105,6 +105,17 @@
           }
         },
         {
+          "match": "^\\s*(const)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=:)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.const.phase"
+            },
+            "2": {
+              "name": "variable.other.constant.phase"
+            }
+          }
+        },
+        {
           "match": "^\\s*(event)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*;",
           "captures": {
             "1": {
@@ -230,7 +241,7 @@
         },
         {
           "name": "keyword.operator.phase",
-          "match": "->|\\.\\.=|==|!=|<=|>=|[+\\-*/<>=]"
+          "match": "->|\\.\\.=|==|!=|<=|>=|<<|>>|[+\\-*/<>=&|^~]"
         },
         {
           "name": "entity.name.function.call.phase",

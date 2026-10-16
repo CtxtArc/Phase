@@ -168,6 +168,27 @@ impl Parser {
             // existing programs may keep using it as a name.
             TokenKind::Ident(w) if w == "device" => self.parse_device_item(),
             TokenKind::Ident(w) if w == "interrupt" => self.parse_interrupt_fn().map(Item::Fn),
+            // v2.4: `const NAME: u32 = expr;` -- a keyword only here.
+            TokenKind::Ident(w)
+                if w == "const"
+                    && matches!(self.peek_at(1), TokenKind::Ident(_))
+                    && matches!(self.peek_at(2), TokenKind::Colon) =>
+            {
+                self.bump();
+                let span = self.peek_span();
+                let name = self.expect_ident()?;
+                self.expect(TokenKind::Colon)?;
+                let ty = self.expect_ident()?;
+                self.expect(TokenKind::Eq)?;
+                let value = self.parse_expr()?;
+                self.expect(TokenKind::Semi)?;
+                Ok(Item::Const(ConstDecl {
+                    name,
+                    span,
+                    ty,
+                    value,
+                }))
+            }
             TokenKind::Ident(w) if w == "event" => {
                 self.bump();
                 let span = self.peek_span();
@@ -865,7 +886,9 @@ impl Parser {
     }
 
     // ---- expressions ---------------------------------------------------
-    // Precedence climbing: comparisons bind loosest, then + -, then * /.
+    // Precedence climbing, loosest first (as in Rust, so `x & 1 == 1` is
+    // `(x & 1) == 1`): comparisons, `|`, `^`, `&`, `<< >>`, `+ -`, `* /`,
+    // then unary `~`.
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.parse_comparison()
@@ -883,7 +906,7 @@ impl Parser {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_additive()?;
+        let mut lhs = self.parse_bit_or()?;
         loop {
             let op = match self.peek() {
                 TokenKind::EqEq => BinOp::Eq,
@@ -895,7 +918,7 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let rhs = self.parse_additive()?;
+            let rhs = self.parse_bit_or()?;
             lhs = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
@@ -903,6 +926,45 @@ impl Parser {
             };
         }
         Ok(lhs)
+    }
+
+    /// One left-associative level of binary operators: `ops` maps a token
+    /// to its operator, `next` parses the operands (the next tighter level).
+    fn parse_level(
+        &mut self,
+        ops: &[(TokenKind, BinOp)],
+        next: fn(&mut Self) -> Result<Expr, ParseError>,
+    ) -> Result<Expr, ParseError> {
+        let mut lhs = next(self)?;
+        while let Some(op) = ops.iter().find(|(t, _)| self.at(t)).map(|(_, op)| *op) {
+            self.bump();
+            let rhs = next(self)?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bit_or(&mut self) -> Result<Expr, ParseError> {
+        self.parse_level(&[(TokenKind::Pipe, BinOp::BitOr)], Self::parse_bit_xor)
+    }
+
+    fn parse_bit_xor(&mut self) -> Result<Expr, ParseError> {
+        self.parse_level(&[(TokenKind::Caret, BinOp::BitXor)], Self::parse_bit_and)
+    }
+
+    fn parse_bit_and(&mut self) -> Result<Expr, ParseError> {
+        self.parse_level(&[(TokenKind::Amp, BinOp::BitAnd)], Self::parse_shift)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr, ParseError> {
+        self.parse_level(
+            &[(TokenKind::Shl, BinOp::Shl), (TokenKind::Shr, BinOp::Shr)],
+            Self::parse_additive,
+        )
     }
 
     fn parse_additive(&mut self) -> Result<Expr, ParseError> {
@@ -944,8 +1006,11 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
-        // PHASE has no unary operators in the AST yet beyond literals/primary;
-        // reserved for future work (e.g. unary `-`). Fall straight through.
+        // v2.4: `~x`. (No unary `-`: values that matter here are unsigned.)
+        if self.at(&TokenKind::Tilde) {
+            self.bump();
+            return Ok(Expr::BitNot(Box::new(self.parse_unary()?)));
+        }
         self.parse_postfix()
     }
 
@@ -1689,6 +1754,37 @@ mod tests {
             panic!()
         };
         assert_eq!(odd.name, "type");
+    }
+
+    #[test]
+    fn bit_operations_bind_like_rust_and_consts_are_items() {
+        let p = parse(
+            "const M: u32 = 1 << 4;
+             fn main() { x = a | b ^ c & d << 1 + 2 == ~e; }",
+        )
+        .unwrap();
+        let Item::Const(c) = &p.items[0] else {
+            panic!()
+        };
+        assert_eq!((c.name.as_str(), c.ty.as_str()), ("M", "u32"));
+        let Item::Fn(f) = &p.items[1] else { panic!() };
+        let Stmt::Assign { value, .. } = &f.body.stmts[0].node else {
+            panic!()
+        };
+        fn show(e: &Expr) -> String {
+            match e {
+                Expr::Ident(n) => n.clone(),
+                Expr::IntLit(v) => v.to_string(),
+                Expr::BitNot(x) => format!("~{}", show(x)),
+                Expr::Binary { op, lhs, rhs } => {
+                    format!("({} {} {})", show(lhs), op.symbol(), show(rhs))
+                }
+                _ => "?".into(),
+            }
+        }
+        assert_eq!(show(value), "((a | (b ^ (c & (d << (1 + 2))))) == ~e)");
+        // `const` is still an ordinary name elsewhere.
+        parse("fn const() {} fn main() { const(); }").unwrap();
     }
 
     #[test]

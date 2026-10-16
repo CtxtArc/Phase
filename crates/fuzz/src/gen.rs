@@ -378,6 +378,8 @@ device Fz @ 0x40000000 {
 event ev0;
 event ev1;
 event ev2;
+
+const FZ_ONE: u32 = 1 << 0;
 ";
 
 /// A register of `Fz`: name, readable, writable, width, fields.
@@ -801,6 +803,7 @@ impl FnGen<'_> {
             Some((f, _)) => format!("Fz.{}.{f}", r.name),
             None => format!("Fz.{}", r.name),
         };
+        let value = self.value_expr(value);
         let write = format!("volatile_write({target}, {value});");
         if !self.written.contains(&r.name) {
             self.written.push(r.name);
@@ -815,6 +818,17 @@ impl FnGen<'_> {
             self.line(depth, &format!("critical {{ {write} }}"));
         } else {
             self.line(depth, &write);
+        }
+    }
+
+    /// `v` written as a constant expression (v2.4), so the analyzer must
+    /// compute it to check it fits.
+    fn value_expr(&mut self, v: u64) -> String {
+        match self.rng.below(4) {
+            1 if v >= 2 => format!("{} << 1 | {}", v >> 1, v & 1),
+            2 => format!("{:#x} | {:#x}", v & !0xf, v & 0xf),
+            3 => format!("{} ^ FZ_ONE", v ^ 1),
+            _ => v.to_string(),
         }
     }
 

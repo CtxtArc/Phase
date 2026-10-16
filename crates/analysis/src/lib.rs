@@ -31,8 +31,8 @@
 //!   reference as their first argument.
 
 use phase_ast::{
-    BorrowMode, BufferLen, DeviceDecl, DeviceTypeDecl, Domain, Expr, FnDecl, Item, Program,
-    RegDecl, RegField, Span, Stmt, TypeExpr,
+    eval_const, uint_max, BinOp, BorrowMode, BufferLen, ConstDecl, DeviceDecl, DeviceTypeDecl,
+    Domain, Expr, FnDecl, Item, Program, RegDecl, RegField, Span, Stmt, TypeExpr,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -404,6 +404,7 @@ fn analyze_impl(program: &Program, mut steps: Option<&mut Vec<TraceStep>>) -> Re
     }
 
     let devices = check_devices(program, &mut errors);
+    let consts = check_consts(program, &devices, &mut errors);
     interrupts::check(program, &devices.keys().copied().collect(), &mut errors);
 
     for item in &program.items {
@@ -450,6 +451,7 @@ fn analyze_impl(program: &Program, mut steps: Option<&mut Vec<TraceStep>>) -> Re
             let mut checker = FnChecker::new(
                 &f.name,
                 &devices,
+                &consts,
                 &entity_domains,
                 &fn_sigs,
                 &state_machines,
@@ -519,7 +521,11 @@ fn check_devices<'p>(
             Item::ExternFn(f) => other_names.insert(f.name.as_str()),
             Item::Entity(e) => other_names.insert(e.name.as_str()),
             Item::State(s) => other_names.insert(s.name.as_str()),
-            Item::Device(_) | Item::DeviceType(_) | Item::Event(_) | Item::Import(_) => false,
+            Item::Device(_)
+            | Item::DeviceType(_)
+            | Item::Event(_)
+            | Item::Const(_)
+            | Item::Import(_) => false,
         };
     }
     let mut types: HashMap<&str, &DeviceTypeDecl> = HashMap::new();
@@ -767,6 +773,136 @@ struct DeviceRef<'e> {
 }
 
 /// A field's width in bits.
+/// v2.4: every `const`: a unique name, an unsigned integer type, a
+/// constant value that fits it. Returns the values of the valid ones.
+fn check_consts(
+    program: &Program,
+    devices: &HashMap<&str, DeviceView>,
+    errors: &mut Vec<AnalysisError>,
+) -> HashMap<String, u64> {
+    let mut decls: HashMap<&str, &ConstDecl> = HashMap::new();
+    let mut other_names: HashSet<&str> = devices.keys().copied().collect();
+    for item in &program.items {
+        match item {
+            Item::Fn(f) => {
+                other_names.insert(&f.name);
+            }
+            Item::ExternFn(f) => {
+                other_names.insert(&f.name);
+            }
+            Item::Event(e) => {
+                other_names.insert(&e.name);
+            }
+            Item::Entity(e) => {
+                other_names.insert(&e.name);
+            }
+            _ => {}
+        }
+    }
+    for item in &program.items {
+        let Item::Const(c) = item else { continue };
+        if let Some(first) = decls.get(c.name.as_str()) {
+            errors.push(
+                err(format!("constant '{}' is declared more than once", c.name))
+                    .at(c.span)
+                    .note(first.span, format!("'{}' is first declared here", c.name)),
+            );
+        } else if other_names.contains(c.name.as_str()) {
+            errors.push(
+                err(format!(
+                    "'{}' is declared as a constant and as something else",
+                    c.name
+                ))
+                .at(c.span),
+            );
+        } else {
+            decls.insert(&c.name, c);
+        }
+    }
+
+    // Evaluate each, following references (in any order) and stopping at
+    // a cycle.
+    fn eval<'p>(
+        name: &'p str,
+        decls: &HashMap<&'p str, &'p ConstDecl>,
+        done: &mut HashMap<&'p str, Result<u64, String>>,
+        visiting: &mut Vec<&'p str>,
+    ) -> Result<u64, String> {
+        if let Some(r) = done.get(name) {
+            return r.clone();
+        }
+        if visiting.contains(&name) {
+            return Err(format!("constant '{name}' is defined in terms of itself"));
+        }
+        let c = decls[name];
+        visiting.push(name);
+        // Resolve the constants this one uses first.
+        let mut refs = Vec::new();
+        collect_idents(&c.value, &mut refs);
+        let mut resolved: HashMap<&str, Result<u64, String>> = HashMap::new();
+        for r in refs {
+            if let Some((key, _)) = decls.get_key_value(r) {
+                let v = eval(key, decls, done, visiting);
+                resolved.insert(key, v);
+            }
+        }
+        visiting.pop();
+        let lookup = |n: &str| resolved.get(n).cloned();
+        let r = match eval_const(&c.value, &lookup) {
+            Ok(Some(v)) => match uint_max(&c.ty) {
+                Some(max) if v > max => Err(format!(
+                    "constant '{name}' is {v} ({v:#x}), which does not fit in {} (at most {max:#x})",
+                    c.ty
+                )),
+                Some(_) => Ok(v),
+                None => Err(format!(
+                    "constant '{name}' has type '{}'; constants are u8, u16, u32 or u64",
+                    c.ty
+                )),
+            },
+            Ok(None) => Err(format!(
+                "constant '{name}' must be computed from literals and other constants"
+            )),
+            Err(e) => Err(format!("constant '{name}': {e}")),
+        };
+        done.insert(name, r.clone());
+        r
+    }
+
+    let mut done: HashMap<&str, Result<u64, String>> = HashMap::new();
+    let mut names: Vec<&str> = decls.keys().copied().collect();
+    names.sort();
+    let mut values = HashMap::new();
+    let mut reported: HashSet<String> = HashSet::new();
+    for name in names {
+        match eval(name, &decls, &mut done, &mut Vec::new()) {
+            Ok(v) => {
+                values.insert(name.to_string(), v);
+            }
+            Err(msg) => {
+                // A constant that fails because another one does is
+                // reported once, at the one that is wrong.
+                if msg.starts_with(&format!("constant '{name}'")) && reported.insert(msg.clone()) {
+                    errors.push(err(msg).at(decls[name].span));
+                }
+            }
+        }
+    }
+    values
+}
+
+fn collect_idents<'e>(e: &'e Expr, out: &mut Vec<&'e str>) {
+    match e {
+        Expr::Ident(n) => out.push(n),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_idents(lhs, out);
+            collect_idents(rhs, out);
+        }
+        Expr::BitNot(x) => collect_idents(x, out),
+        _ => {}
+    }
+}
+
 fn field_bits(f: &RegField) -> u32 {
     f.hi - f.lo + 1
 }
@@ -889,6 +1025,8 @@ struct FnChecker<'a> {
     fn_name: String,
     /// `device` register maps (v2.0), by device name.
     devices: &'a HashMap<&'a str, DeviceView<'a>>,
+    /// `const` values (v2.4), by name.
+    consts: &'a HashMap<String, u64>,
     fn_sigs: &'a HashMap<&'a str, FnSig>,
     state_machines: &'a HashMap<&'a str, HashSet<&'a str>>,
     initial_states: &'a HashMap<&'a str, &'a str>,
@@ -998,6 +1136,7 @@ impl<'a> FnChecker<'a> {
     fn new(
         fn_name: &str,
         devices: &'a HashMap<&'a str, DeviceView<'a>>,
+        consts: &'a HashMap<String, u64>,
         entity_domains: &'a HashMap<&'a str, Option<Domain>>,
         fn_sigs: &'a HashMap<&'a str, FnSig>,
         state_machines: &'a HashMap<&'a str, HashSet<&'a str>>,
@@ -1006,6 +1145,7 @@ impl<'a> FnChecker<'a> {
         FnChecker {
             fn_name: fn_name.to_string(),
             devices,
+            consts,
             entity_domains,
             fn_sigs,
             state_machines,
@@ -2311,6 +2451,15 @@ impl<'a> FnChecker<'a> {
     }
 
     fn check_no_shadowing(&self, name: &str, errors: &mut Vec<AnalysisError>) -> bool {
+        if self.consts.contains_key(name) {
+            errors.push(
+                err(format!(
+                    "'{name}' is a constant; choose another name for this local"
+                ))
+                .about(name),
+            );
+            return false;
+        }
         if let Some(d) = self.devices.get(name) {
             errors.push(
                 err(format!(
@@ -2786,30 +2935,94 @@ impl<'a> FnChecker<'a> {
         } else {
             (1u64 << bits) - 1
         };
-        match value {
-            Some(Expr::IntLit(v)) if *v < 0 || *v as u64 > max => {
-                errors.push(
-                    err(format!(
-                        "{v} does not fit in '{name}' ({bits} bit{}, at most {max})",
-                        if bits == 1 { "" } else { "s" }
-                    ))
-                    .note(
-                        field.map_or(reg.span, |f| f.span),
-                        format!("'{name}' is declared here"),
-                    ),
-                );
+        let Some(value) = value else { return };
+        // A literal, or (v2.4) any constant expression: its value is known
+        // now, so it must fit now.
+        let known = match value {
+            Expr::IntLit(v) if *v < 0 => Some(Err(*v)),
+            Expr::IntLit(v) => Some(Ok(*v as u64)),
+            other => {
+                self.check_expr(other, errors);
+                self.const_value(other).ok().flatten().map(Ok)
             }
-            Some(Expr::IntLit(_)) => {}
-            Some(v) => self.check_expr(v, errors),
-            None => {}
+        };
+        let shown = |v: u64| match value {
+            Expr::IntLit(_) => v.to_string(),
+            _ => format!("{v} ({v:#x})"),
+        };
+        let bad = match known {
+            Some(Err(v)) => Some(v.to_string()),
+            Some(Ok(v)) if v > max => Some(shown(v)),
+            _ => None,
+        };
+        if let Some(v) = bad {
+            errors.push(
+                err(format!(
+                    "{v} does not fit in '{name}' ({bits} bit{}, at most {max})",
+                    if bits == 1 { "" } else { "s" }
+                ))
+                .note(
+                    field.map_or(reg.span, |f| f.span),
+                    format!("'{name}' is declared here"),
+                ),
+            );
         }
     }
 
     /// A bare name used as a *value* (a condition, an assignment right-hand
     /// side, a `volatile_write` value): it must exist, and it must be a
     /// plain scalar -- an entity has no scalar value to read.
+    /// v2.4: the value of `e` if it is constant, reporting what makes a
+    /// constant expression invalid (a shift by 64, a division by zero...).
+    fn const_value(&self, e: &Expr) -> Result<Option<u64>, String> {
+        let lookup = |n: &str| {
+            if self.locals.contains_key(n) {
+                None
+            } else {
+                self.consts.get(n).map(|v| Ok(*v))
+            }
+        };
+        eval_const(e, &lookup)
+    }
+
+    fn check_const_expr(&self, e: &Expr, errors: &mut Vec<AnalysisError>) {
+        if let Err(msg) = self.const_value(e) {
+            errors.push(err(msg));
+        }
+    }
+
+    /// Bit operations work on integers: not on a float, a bool, or a
+    /// comparison.
+    fn check_bit_operand(&self, e: &Expr, op: &str, errors: &mut Vec<AnalysisError>) {
+        let what = match e {
+            Expr::FloatLit(_) => Some("a float".to_string()),
+            Expr::BoolLit(_) => Some("a bool".to_string()),
+            Expr::Binary { op: inner, .. }
+                if matches!(
+                    inner,
+                    BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq
+                ) =>
+            {
+                Some(format!("a comparison (`{}`)", inner.symbol()))
+            }
+            Expr::Ident(n) => match self.locals.get(n).and_then(|v| v.ty.as_ref()) {
+                Some(TypeExpr::Named(t)) if matches!(t.as_str(), "f32" | "f64" | "bool") => {
+                    Some(format!("'{n}', a {t}"))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(what) = what {
+            errors.push(err(format!(
+                "`{op}` works on integers, but its operand is {what}"
+            )));
+        }
+    }
+
     fn check_value_ident(&self, name: &str, errors: &mut Vec<AnalysisError>) {
         match self.locals.get(name) {
+            None if self.consts.contains_key(name) => {}
             None if self.devices.contains_key(name) => errors.push(err(format!(
                 "'{name}' is a device, not a value; access its registers with volatile_read/volatile_write"
             ))),
@@ -2938,9 +3151,33 @@ impl<'a> FnChecker<'a> {
             // bare `Call` -- without recursing here, the M6 domain/arity
             // checks in check_call would silently never run on a
             // volatile_read wrapped in a comparison.
-            Expr::Binary { lhs, rhs, .. } => {
+            Expr::Binary { op, lhs, rhs } => {
                 self.check_expr(lhs, errors);
                 self.check_expr(rhs, errors);
+                if op.is_bitwise() {
+                    self.check_bit_operand(lhs, op.symbol(), errors);
+                    self.check_bit_operand(rhs, op.symbol(), errors);
+                }
+                // A shift by a known amount of 64 or more always gives 0
+                // (or, of a constant, is an error below): surely a mistake.
+                if matches!(op, BinOp::Shl | BinOp::Shr)
+                    && self.const_value(lhs).ok().flatten().is_none()
+                {
+                    if let Ok(Some(n)) = self.const_value(rhs) {
+                        if n >= 64 {
+                            errors.push(err(format!(
+                                "`{}` by {n}: a shift must be less than 64",
+                                op.symbol()
+                            )));
+                        }
+                    }
+                }
+                self.check_const_expr(expr, errors);
+            }
+            Expr::BitNot(x) => {
+                self.check_expr(x, errors);
+                self.check_bit_operand(x, "~", errors);
+                self.check_const_expr(expr, errors);
             }
             Expr::StructLit { fields, .. } => {
                 for (_, e) in fields {
@@ -3241,6 +3478,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    const BITS_DEV: &str = r#"
+        device Fz @ 0x40000000 {
+            CTRL: read write u32 @ 0x00 = 0 { EN: bit 0, MODE: bits 1..=3 }
+            LOAD: write u8 @ 0x04;
+        }
+        extern fn report(n: u32);
+    "#;
+
+    fn bits(body: &str) -> String {
+        format!("{BITS_DEV}\n{body}")
+    }
+
+    #[test]
+    fn constants_and_bit_operations_are_accepted() {
+        check_src(&bits(
+            "const EN: u32 = 1 << 0;
+             const ON: u32 = EN | 5 << 1;
+             const ALL: u8 = 0xFF;
+             fn main() {
+                 volatile_write(Fz.CTRL, ON);
+                 volatile_write(Fz.LOAD, ALL & ~0x0F);
+                 volatile_write(Fz.CTRL.MODE, ON >> 1);
+                 let c: u32 = volatile_read(Fz.CTRL);
+                 let m: u32 = c >> 1 & 7;
+                 if c & EN == 1 { report(m ^ 1); }
+             }",
+        ))
+        .unwrap();
+        // Constants may refer to ones declared later.
+        check_src("const A: u32 = B + 1; const B: u32 = 2; fn main() {}").unwrap();
+    }
+
+    #[test]
+    fn constant_values_must_fit_and_be_computable() {
+        assert_single_error_containing(
+            "const BIG: u8 = 1 << 8; fn main() {}",
+            "constant 'BIG' is 256 (0x100), which does not fit in u8 (at most 0xff)",
+        );
+        assert_single_error_containing(
+            "const S: u64 = 1 << 64; fn main() {}",
+            "a shift must be less than 64",
+        );
+        assert_single_error_containing(
+            "const D: u32 = 4 / (2 - 2); fn main() {}",
+            "divides by zero",
+        );
+        assert_single_error_containing("const N: u32 = 1 - 2; fn main() {}", "1 - 2 is negative");
+        assert_single_error_containing(
+            "const A: u32 = B; const B: u32 = A; fn main() {}",
+            "is defined in terms of itself",
+        );
+        assert_single_error_containing(
+            "const F: f32 = 1; fn main() {}",
+            "constants are u8, u16, u32 or u64",
+        );
+        assert_single_error_containing(
+            "fn main() { let x: u32 = 1; } const C: u32 = x;",
+            "constant 'C' must be computed from literals and other constants",
+        );
+        assert_single_error_containing(
+            "const C: u32 = 1; const C: u32 = 2; fn main() {}",
+            "constant 'C' is declared more than once",
+        );
+        assert_single_error_containing(
+            "const main: u32 = 1; fn main() {}",
+            "'main' is declared as a constant and as something else",
+        );
+        assert_single_error_containing(
+            "const N: u32 = 1; fn main() { let N: u32 = 2; }",
+            "'N' is a constant; choose another name for this local",
+        );
+    }
+
+    #[test]
+    fn a_computed_constant_must_fit_its_register() {
+        assert_single_error_containing(
+            &bits("const HI: u32 = 0xF0; fn main() { volatile_write(Fz.LOAD, HI << 4); }"),
+            "3840 (0xf00) does not fit in 'Fz.LOAD' (8 bits, at most 255)",
+        );
+        assert_single_error_containing(
+            &bits("fn main() { volatile_write(Fz.CTRL.MODE, 1 << 3); }"),
+            "8 (0x8) does not fit in 'Fz.CTRL.MODE' (3 bits, at most 7)",
+        );
+        // ~ flips all 64 bits: mask it.
+        assert_single_error_containing(
+            &bits("fn main() { volatile_write(Fz.CTRL, ~1); }"),
+            "does not fit in 'Fz.CTRL' (32 bits",
+        );
+    }
+
+    #[test]
+    fn bit_operations_need_integers() {
+        assert_single_error_containing(
+            "fn main() { let f: f32 = 1.5; let x: u32 = 1; x = x | f; }",
+            "`|` works on integers, but its operand is 'f', a f32",
+        );
+        assert_single_error_containing(
+            "fn main() { let x: u32 = 1; x = ~(x == 1); }",
+            "`~` works on integers, but its operand is a comparison (`==`)",
+        );
+        assert_single_error_containing(
+            "fn main() { let x: u32 = 1; x = x << 64; }",
+            "a shift must be less than 64",
+        );
     }
 
     const HAPPY_PATH: &str = r#"

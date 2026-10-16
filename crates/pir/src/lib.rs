@@ -36,8 +36,8 @@
 //! entity is in right now) to pick the correct runtime call for `sync`.
 
 use phase_ast::{
-    device_regs, find_reg, BinOp, BorrowMode, BufferLen, Domain, Expr, Item, Program, RegDecl,
-    Stmt, TypeExpr,
+    device_regs, eval_const, find_reg, BinOp, BorrowMode, BufferLen, ConstDecl, Domain, Expr, Item,
+    Program, RegDecl, Stmt, TypeExpr,
 };
 use std::collections::HashMap;
 
@@ -103,6 +103,11 @@ pub enum PirLiteral {
 pub enum PirExpr {
     Ident(String),
     IntLit(i64),
+    /// A constant computed at compile time (v2.4): a `const`, or an
+    /// expression of literals and constants.
+    UInt(u64),
+    /// `~x` (v2.4).
+    BitNot(Box<PirExpr>),
     FloatLit(f64),
     BoolLit(bool),
     Binary {
@@ -183,6 +188,9 @@ pub enum CallArg {
     /// `Dev.REG[.FIELD]` -- a device register argument to `volatile_read`/
     /// `volatile_write` (v2.0).
     DeviceRegister(RegRef),
+    /// Any other scalar value (v2.4): a constant, or an expression such
+    /// as `MODE << 2 | flags`.
+    Value(PirExpr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -500,6 +508,8 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
         })
         .collect();
 
+    let consts = const_values(program);
+
     for item in &program.items {
         match item {
             Item::Entity(e) => {
@@ -524,6 +534,7 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
                 let sig = lower_fn_sig(&f.name, &f.params, &f.return_type, &known_entities)?;
                 let mut lowerer = Lowerer {
                     devices: &devices,
+                    consts: &consts,
                     known_entities: &known_entities,
                     initial_states: &initial_states,
                     domain_changes: &domain_changes,
@@ -545,6 +556,7 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
             Item::Device(_) | Item::DeviceType(_) => {} // lowered above
             Item::Event(e) => out.events.push(e.name.clone()),
             Item::Import(_) => {} // resolved when the program was loaded
+            Item::Const(_) => {}  // values are substituted where they are used
         }
     }
 
@@ -592,7 +604,9 @@ fn collect_mmio_registers(fns: &[PirFn]) -> Vec<String> {
                 note_expr(lhs, seen, out);
                 note_expr(rhs, seen, out);
             }
+            PirExpr::BitNot(x) => note_expr(x, seen, out),
             PirExpr::Ident(_)
+            | PirExpr::UInt(_)
             | PirExpr::IntLit(_)
             | PirExpr::FloatLit(_)
             | PirExpr::BoolLit(_)
@@ -662,8 +676,42 @@ fn lower_fn_sig(
     })
 }
 
+/// Every `const`'s value (the analyzer has checked they are valid).
+fn const_values(program: &Program) -> HashMap<String, u64> {
+    let decls: Vec<&ConstDecl> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Const(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    let mut values: HashMap<String, u64> = HashMap::new();
+    // Each pass evaluates the constants whose references are known; a
+    // valid program's constants are all known after at most one pass each.
+    for _ in 0..=decls.len() {
+        let mut progress = false;
+        for c in &decls {
+            if values.contains_key(&c.name) {
+                continue;
+            }
+            let lookup = |n: &str| values.get(n).map(|v| Ok(*v));
+            if let Ok(Some(v)) = eval_const(&c.value, &lookup) {
+                values.insert(c.name.clone(), v);
+                progress = true;
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    values
+}
+
 struct Lowerer<'a> {
     devices: &'a HashMap<&'a str, &'a [RegDecl]>,
+    /// `const` values (v2.4).
+    consts: &'a HashMap<String, u64>,
     known_entities: &'a HashMap<&'a str, ()>,
     /// machine name -> its initial state
     initial_states: &'a HashMap<String, String>,
@@ -975,6 +1023,25 @@ impl<'a> Lowerer<'a> {
                 });
                 Ok(())
             }
+            // v2.4: any other scalar value -- a constant, another local,
+            // an expression: declare, then assign.
+            Some(e @ (Expr::Ident(_) | Expr::Binary { .. } | Expr::BitNot(_))) => {
+                let ty = ty.ok_or_else(|| PirError::MissingType {
+                    context: format!("'{name}'"),
+                })?;
+                let resolved_ty = self.resolve(ty)?;
+                let value = self.lower_pir_expr(e, &format!("initializer for '{name}'"))?;
+                out.push(PirInst::EntityCreate {
+                    name: name.to_string(),
+                    ty: resolved_ty,
+                    domain,
+                });
+                out.push(PirInst::Assign {
+                    name: name.to_string(),
+                    value,
+                });
+                Ok(())
+            }
             Some(other) => Err(PirError::UnsupportedExpr {
                 context: format!("initializer for '{name}': {other:?}"),
             }),
@@ -1037,8 +1104,15 @@ impl<'a> Lowerer<'a> {
     /// arithmetic, and (M11) `volatile_read(REG @MMIO)` -- see the module doc
     /// comment for why anything else is a clear error rather than a guess.
     fn lower_pir_expr(&self, e: &Expr, context: &str) -> Result<PirExpr, PirError> {
+        // v2.4: anything constant is computed now.
+        if !matches!(e, Expr::IntLit(_)) {
+            if let Some(v) = self.const_value(e) {
+                return Ok(PirExpr::UInt(v));
+            }
+        }
         match e {
             Expr::Ident(n) => Ok(PirExpr::Ident(n.clone())),
+            Expr::BitNot(x) => Ok(PirExpr::BitNot(Box::new(self.lower_pir_expr(x, context)?))),
             Expr::IntLit(n) => Ok(PirExpr::IntLit(*n)),
             Expr::FloatLit(n) => Ok(PirExpr::FloatLit(*n)),
             Expr::BoolLit(b) => Ok(PirExpr::BoolLit(*b)),
@@ -1101,11 +1175,23 @@ impl<'a> Lowerer<'a> {
         })
     }
 
+    /// The value of `e` if it is constant (v2.4).
+    fn const_value(&self, e: &Expr) -> Option<u64> {
+        let lookup = |n: &str| self.consts.get(n).map(|v| Ok(*v));
+        eval_const(e, &lookup).ok().flatten()
+    }
+
     fn lower_call_args(&self, args: &[Expr], context: &str) -> Result<Vec<CallArg>, PirError> {
         let mut out = Vec::new();
         for a in args {
             out.push(match a {
+                Expr::Ident(n) if self.consts.contains_key(n) => {
+                    CallArg::Value(PirExpr::UInt(self.consts[n]))
+                }
                 Expr::Ident(n) => CallArg::Entity(n.clone()),
+                e @ (Expr::Binary { .. } | Expr::BitNot(_)) => {
+                    CallArg::Value(self.lower_pir_expr(e, context)?)
+                }
                 Expr::IntLit(n) => CallArg::Literal(PirLiteral::Int(*n)),
                 Expr::FloatLit(n) => CallArg::Literal(PirLiteral::Float(*n)),
                 Expr::StringLit(s) => CallArg::Literal(PirLiteral::Str(s.clone())),
