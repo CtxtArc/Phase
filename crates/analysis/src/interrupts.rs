@@ -32,8 +32,8 @@ struct Facts {
     calls: Vec<(String, Span)>,
     /// (device, register, field, span, inside `critical`)
     writes: Vec<(String, String, Option<String>, Span, bool)>,
-    /// (event, span, inside `critical`, the buffer it hands over)
-    waits: Vec<(String, Span, bool, Option<String>)>,
+    /// (event, span, inside `critical`, the buffers it hands over)
+    waits: Vec<(String, Span, bool, Vec<String>)>,
     signals: Vec<(String, Span)>,
     returns_in_critical: Vec<Span>,
 }
@@ -121,7 +121,7 @@ fn walk_block(b: &Block, critical: bool, f: &mut Facts) {
             }
             Stmt::Critical { body } => walk_block(body, true, f),
             Stmt::Signal { name } => f.signals.push((name.clone(), span)),
-            Stmt::Wait { name, buf } => f.waits.push((name.clone(), span, critical, buf.clone())),
+            Stmt::Wait { name, bufs } => f.waits.push((name.clone(), span, critical, bufs.clone())),
             _ => {}
         }
     }
@@ -305,23 +305,39 @@ pub(crate) fn check(program: &Program, devices: &HashSet<&str>, errors: &mut Vec
                 );
             }
         }
-        // v2.3: an event hands over one buffer. Within a function, every
-        // `wait E for b` names the same `b` -- `wait ht for hi` after
-        // `wait ht for lo` is processing the wrong half.
-        let mut hands_over: HashMap<&str, (&str, Span)> = HashMap::new();
-        for (ev, span, _, buf) in &x.waits {
-            let Some(b) = buf else { continue };
+        // v2.3: an event hands over one buffer (v2.4: one set of them).
+        // Within a function, every `wait E for ..` names the same ones --
+        // `wait ht for hi` after `wait ht for lo` is processing the wrong
+        // half.
+        let mut hands_over: HashMap<&str, (String, Span)> = HashMap::new();
+        for (ev, span, _, bufs) in &x.waits {
+            if bufs.is_empty() {
+                continue;
+            }
+            let mut set: Vec<&str> = bufs.iter().map(String::as_str).collect();
+            set.sort();
+            set.dedup();
+            let these = set.join(", ");
+            let shown = |s: &str| {
+                if s.contains(',') {
+                    s.to_string()
+                } else {
+                    format!("'{s}'")
+                }
+            };
             match hands_over.get(ev.as_str()) {
-                Some((first, first_span)) if first != b => errors.push(
+                Some((first, first_span)) if *first != these => errors.push(
                     err(format!(
-                        "`wait {ev} for {b}`, but `{ev}` hands over '{first}' earlier in this function: an event means one transfer is done, so it can only give back one buffer"
+                        "`wait {ev} for {}`, but `{ev}` hands over {} earlier in this function: an event means one transfer is done, so it can only give back what that transfer had",
+                        bufs.join(", "),
+                        shown(first)
                     ))
                     .at(*span)
-                    .note(*first_span, format!("`{ev}` hands over '{first}' here")),
+                    .note(*first_span, format!("`{ev}` hands over {} here", shown(first))),
                 ),
                 Some(_) => {}
                 None => {
-                    hands_over.insert(ev, (b, *span));
+                    hands_over.insert(ev, (these, *span));
                 }
             }
         }

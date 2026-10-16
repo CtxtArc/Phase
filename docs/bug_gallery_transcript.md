@@ -309,6 +309,25 @@ note: 'scratch' is moved to @DMA by 'start_capture' here
 examples/bug_gallery/dma_into_dead_block.phase: 1 error found
 ```
 
+### `examples/bug_gallery/dma_source_rewritten.phase`
+
+Bug gallery #48: refilling a DMA source while it is being read. The
+
+```
+error: entity 'src' is in domain @DMA but 'produce' expects @RAM for this argument
+  --> examples/bug_gallery/dma_source_rewritten.phase:33:13
+   |
+33 |     produce(src);
+   |             ^^^
+note: 'src' is handed to the hardware at 'Copier.SRC' here
+  --> examples/bug_gallery/dma_source_rewritten.phase:29:5
+   |
+29 |     volatile_write(Copier.SRC, address_of(src));
+   |     --------------------------------------------
+
+examples/bug_gallery/dma_source_rewritten.phase: 1 error found
+```
+
 ### `examples/bug_gallery/field_value_too_wide.phase`
 
 Bug gallery #37: a value too wide for its field. In C,
@@ -1101,7 +1120,7 @@ examples/bug_gallery/write_through_read_borrow.phase: 1 error found
 Bug gallery #43: the wrong half for an interrupt. The engine raises
 
 ```
-error: `wait half_done for hi`, but `half_done` hands over 'lo' earlier in this function: an event means one transfer is done, so it can only give back one buffer
+error: `wait half_done for hi`, but `half_done` hands over 'lo' earlier in this function: an event means one transfer is done, so it can only give back what that transfer had
   --> examples/bug_gallery/wrong_half_event.phase:38:5
    |
 38 |     wait half_done for hi;
@@ -1112,7 +1131,7 @@ note: `half_done` hands over 'lo' here
 29 |         wait half_done for lo;
    |         ----------------------
 
-error: `wait full_done for lo`, but `full_done` hands over 'hi' earlier in this function: an event means one transfer is done, so it can only give back one buffer
+error: `wait full_done for lo`, but `full_done` hands over 'hi' earlier in this function: an event means one transfer is done, so it can only give back what that transfer had
   --> examples/bug_gallery/wrong_half_event.phase:40:5
    |
 40 |     wait full_done for lo;

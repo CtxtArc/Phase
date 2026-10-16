@@ -767,3 +767,68 @@ fn register_array_elements_are_separate_registers() {
     );
     assert_eq!(code, 0, "{stderr}");
 }
+
+// ---- v2.4: handing a buffer over by writing its address ---------------------
+
+const COPIER: &str = r#"
+    device Dma @ 0x40000000 {
+        SRC:  read write u32 @ 0x00 address;
+        DEST: read write u32 @ 0x04 address;
+    }
+    event done;
+    interrupt fn h() @ irq 3 { signal done; }
+"#;
+
+fn copier(body: &str) -> String {
+    format!("{SIGS}\n{COPIER}\n{body}")
+}
+
+#[test]
+fn using_a_buffer_after_writing_its_address_is_caught() {
+    caught(
+        "rt_addr_use",
+        &copier(
+            "fn main() {
+                 buffer<u8, 8> a @RAM;
+                 volatile_write(Dma.SRC, address_of(a));
+                 poke(a);
+                 wait done for a;
+             }",
+        ),
+        "'a' is in @DMA but 'poke' expects @RAM",
+    );
+    caught(
+        "rt_addr_borrowed",
+        &copier(
+            "fn main() {
+                 buffer<u8, 8> a @RAM;
+                 let v = borrow a read;
+                 volatile_write(Dma.SRC, address_of(a));
+                 release v;
+                 wait done for a;
+             }",
+        ),
+        "'a'",
+    );
+}
+
+#[test]
+fn an_address_hand_off_runs_clean_and_the_hardware_sees_the_buffer() {
+    // The simulated hardware finds the buffer through its register.
+    let (code, stderr) = run_unanalyzed_with(
+        "rt_addr_ok",
+        &copier(
+            "fn main() {
+                 buffer<u8, 8> a @RAM;
+                 poke(a);
+                 volatile_write(Dma.DEST, address_of(a));
+                 wait done for a;
+                 look(a);
+             }",
+        ),
+        1,
+        "\n#include \"phase_runtime.h\"\n#include <stdio.h>\nvoid phase_sim_hardware(void) {\n    unsigned char *p = phase_addr_get(&Dma->DEST);\n    if (p) { p[0] = 42; fprintf(stderr, \"hw wrote %d\\n\", p[0]); }\n}\n",
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains("hw wrote 42"), "{stderr}");
+}

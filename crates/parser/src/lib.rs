@@ -379,6 +379,11 @@ impl Parser {
         } else {
             None
         };
+        // v2.4: `address` -- it holds a DMA address.
+        let address = matches!(self.peek(), TokenKind::Ident(w) if w == "address");
+        if address {
+            self.bump();
+        }
         let mut fields = Vec::new();
         if self.at(&TokenKind::LBrace) {
             self.bump();
@@ -443,6 +448,7 @@ impl Parser {
             reset,
             fields,
             array,
+            address,
         })
     }
 
@@ -702,7 +708,10 @@ impl Parser {
                 Ok(if is_signal {
                     Stmt::Signal { name }
                 } else {
-                    Stmt::Wait { name, buf: None }
+                    Stmt::Wait {
+                        name,
+                        bufs: Vec::new(),
+                    }
                 })
             }
             // v2.3: `wait E for b;` -- the event hands `b` back to the CPU.
@@ -714,12 +723,13 @@ impl Parser {
                 self.bump();
                 let name = self.expect_ident()?;
                 self.bump(); // `for`
-                let buf = self.expect_ident()?;
+                let mut bufs = vec![self.expect_ident()?];
+                while self.at(&TokenKind::Comma) {
+                    self.bump();
+                    bufs.push(self.expect_ident()?);
+                }
                 self.expect(TokenKind::Semi)?;
-                Ok(Stmt::Wait {
-                    name,
-                    buf: Some(buf),
-                })
+                Ok(Stmt::Wait { name, bufs })
             }
             TokenKind::Ident(w)
                 if w == "critical" && matches!(self.peek_at(1), TokenKind::LBrace) =>
@@ -1881,10 +1891,10 @@ mod tests {
         let p = parse("event ht; fn main() { wait ht for lo; wait ht; }").unwrap();
         let Item::Fn(m) = &p.items[1] else { panic!() };
         assert!(matches!(&m.body.stmts[0].node,
-            Stmt::Wait { name, buf: Some(b) } if name == "ht" && b == "lo"));
+            Stmt::Wait { name, bufs } if name == "ht" && bufs == &["lo"]));
         assert!(matches!(
             &m.body.stmts[1].node,
-            Stmt::Wait { buf: None, .. }
+            Stmt::Wait { bufs, .. } if bufs.is_empty()
         ));
     }
 
@@ -1905,7 +1915,9 @@ mod tests {
         assert_eq!(h.irq.map(|(n, _)| n), Some(8));
         assert!(matches!(&h.body.stmts[0].node, Stmt::Signal { name } if name == "tick"));
         let Item::Fn(m) = &p.items[3] else { panic!() };
-        assert!(matches!(&m.body.stmts[0].node, Stmt::Wait { name, buf: None } if name == "tick"));
+        assert!(
+            matches!(&m.body.stmts[0].node, Stmt::Wait { name, bufs } if name == "tick" && bufs.is_empty())
+        );
         let Stmt::Critical { body } = &m.body.stmts[1].node else {
             panic!()
         };

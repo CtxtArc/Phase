@@ -55,7 +55,7 @@
           "include": "#comments"
         },
         {
-          "match": "\\b(bits?|step|w1c|rc_w0|rc)\\b",
+          "match": "\\b(bits?|step|w1c|rc_w0|rc|address)\\b",
           "name": "keyword.other.bit.phase"
         },
         {
@@ -217,7 +217,7 @@
         },
         {
           "name": "support.function.builtin.phase",
-          "match": "\\b(volatile_read|volatile_write)\\b"
+          "match": "\\b(volatile_read|volatile_write|address_of)\\b"
         },
         {
           "name": "storage.type.buffer.phase",
@@ -298,7 +298,7 @@
           "include": "#comments"
         },
         {
-          "match": "\\b(bits?|step|w1c|rc_w0|rc)\\b",
+          "match": "\\b(bits?|step|w1c|rc_w0|rc|address)\\b",
           "name": "keyword.other.bit.phase"
         },
         {

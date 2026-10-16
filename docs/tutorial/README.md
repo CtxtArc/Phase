@@ -949,7 +949,7 @@ engine is still filling:
 
 ```console
 $ phase check 9_wrong_half.phase
-error: `wait half_done for hi`, but `half_done` hands over 'lo' earlier in this function: an event means one transfer is done, so it can only give back one buffer
+error: `wait half_done for hi`, but `half_done` hands over 'lo' earlier in this function: an event means one transfer is done, so it can only give back what that transfer had
   --> 9_wrong_half.phase:20:5
    |
 20 |     wait half_done for hi;   // should be full_done

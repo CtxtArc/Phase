@@ -363,6 +363,10 @@ pub struct RegDecl {
     /// `NAME[count]: .. @ offset step stride` (v2.4): `count` registers,
     /// the `n`th at `offset + n * stride`.
     pub array: Option<(u32, u64)>,
+    /// `address` (v2.4): the register holds the address of memory the
+    /// device reads or writes (a DMA source or destination). Writing
+    /// `address_of(buf)` to it hands `buf` to the hardware.
+    pub address: bool,
 }
 
 /// `device Uart0 @ 0x40004000 { .. }` (v2.0): a peripheral's register map;
@@ -586,8 +590,10 @@ pub enum Stmt {
     Signal { name: String },
     /// `wait tick;` (v2.2) -- sleep until the event is raised, then clear it.
     /// `wait ht for lo;` (v2.3) -- and the event hands buffer `lo` back to
-    /// the CPU, like `sync(lo)` completed by an interrupt.
-    Wait { name: String, buf: Option<String> },
+    /// the CPU, like `sync(lo)` completed by an interrupt. `wait tc for
+    /// src, dst;` (v2.4) hands back each (a copy reads one, writes the
+    /// other). Empty for a plain `wait`.
+    Wait { name: String, bufs: Vec<String> },
     /// `critical { .. }` (v2.2) -- the block runs with interrupts disabled.
     Critical { body: Block },
 }

@@ -679,6 +679,14 @@ fn check_reg_map(what: &str, owner: &str, regs: &[RegDecl], errors: &mut Vec<Ana
             );
             continue;
         };
+        if r.address && (bits != 32 || !r.fields.is_empty() || !r.writable) {
+            errors.push(
+                err(format!(
+                    "address register '{full}' must be a writable u32 with no fields: it holds a whole address"
+                ))
+                .at(r.span),
+            );
+        }
         let bytes = u64::from(bits / 8);
         // v2.4: an array's elements are placed one by one.
         let elements: Vec<(String, u64)> = match r.array {
@@ -1756,6 +1764,50 @@ impl<'a> FnChecker<'a> {
         None
     }
 
+    /// v2.4: `volatile_write(REG, address_of(name))` -- `name` goes to the
+    /// hardware (@DMA) at the device that now holds its address.
+    fn hand_to_hardware(&mut self, reg: &str, args: &[Expr], errors: &mut Vec<AnalysisError>) {
+        let [Expr::Ident(name)] = args else {
+            errors.push(err("`address_of` takes one buffer: `address_of(buf)`"));
+            return;
+        };
+        let what = format!("hand it to '{reg}'");
+        let Some(var) = self.owned_target(name, &what, errors) else {
+            return;
+        };
+        if !matches!(var.ty, Some(TypeExpr::Buffer { .. })) {
+            errors.push(
+                err(format!(
+                    "'{name}' is not a buffer; only a buffer's address goes to the hardware"
+                ))
+                .about(name),
+            );
+            return;
+        }
+        match var.domain {
+            Some(Domain::Ram) => {}
+            Some(d) => {
+                errors.push(
+                    err(format!(
+                        "'{name}' is in @{}, not the CPU's: it can't be handed to '{reg}' (it must be in @RAM)",
+                        d.name()
+                    ))
+                    .about(name)
+                    .note_opt(var.domain_since.as_ref()),
+                );
+                return;
+            }
+            None => return,
+        }
+        let span = self.cur_span;
+        let v = self.locals.get_mut(name).unwrap();
+        v.domain = Some(Domain::Dma);
+        v.domain_since = Some((
+            span,
+            format!("'{name}' is handed to the hardware at '{reg}' here"),
+        ));
+    }
+
     /// `sync(name)`, or `wait event for name`: the hardware gives `name`
     /// back to the CPU.
     fn hand_back(&mut self, name: &str, event: Option<&str>, errors: &mut Vec<AnalysisError>) {
@@ -1898,10 +1950,16 @@ impl<'a> FnChecker<'a> {
             // v2.3: `wait E for b` -- the interrupt that signals E says the
             // hardware is done with `b`: a hand-back, like `sync`. (The
             // event rules are checked with the other interrupt rules.)
-            Stmt::Wait {
-                name: event,
-                buf: Some(name),
-            } => self.hand_back(name, Some(event), errors),
+            Stmt::Wait { name: event, bufs } if !bufs.is_empty() => {
+                for (i, b) in bufs.iter().enumerate() {
+                    if bufs[..i].contains(b) {
+                        errors
+                            .push(err(format!("`wait {event} for ..` names '{b}' twice")).about(b));
+                    } else {
+                        self.hand_back(b, Some(event), errors);
+                    }
+                }
+            }
 
             Stmt::Release { name } => {
                 let Some(var) = self.locals.get(name) else {
@@ -2028,7 +2086,7 @@ impl<'a> FnChecker<'a> {
             // and reassigning through them would bypass those checks, so
             // it's a clear error rather than a silent domain reset.
             // v2.2: events are checked with the other interrupt rules.
-            Stmt::Signal { .. } | Stmt::Wait { buf: None, .. } => {}
+            Stmt::Signal { .. } | Stmt::Wait { .. } => {}
             // Runs straight through (a `return` inside is an error).
             Stmt::Critical { body } => {
                 let base_locals = self.locals.clone();
@@ -3088,6 +3146,34 @@ impl<'a> FnChecker<'a> {
             (1u64 << bits) - 1
         };
         let Some(value) = value else { return };
+        // v2.4: an `address` register takes `address_of(buffer)` -- the
+        // hand-off of that buffer to the hardware -- or 0.
+        let address_of = match value {
+            Expr::Call { callee, args } if callee == "address_of" => Some(args.as_slice()),
+            _ => None,
+        };
+        if reg.address {
+            match address_of {
+                Some(args) => self.hand_to_hardware(&reg_name, args, errors),
+                None if matches!(self.const_value(value), Ok(Some(0))) => {}
+                None => errors.push(
+                    err(format!(
+                        "'{reg_name}' holds an address: write `address_of(buffer)` to it (or 0), so PHASE knows the hardware has that buffer"
+                    ))
+                    .note(reg.span, declared),
+                ),
+            }
+            return;
+        }
+        if address_of.is_some() {
+            errors.push(
+                err(format!(
+                    "'{reg_name}' is not declared `address`: an address only goes to a register that holds one"
+                ))
+                .note(reg.span, declared),
+            );
+            return;
+        }
         // A literal, or (v2.4) any constant expression: its value is known
         // now, so it must fit now.
         let known = match value {
@@ -3362,9 +3448,18 @@ impl<'a> FnChecker<'a> {
         }
         if callee == "volatile_write" {
             self.check_volatile_register_arg(callee, args, 2, errors);
-            if let Some(value) = args.get(1) {
-                self.check_expr(value, errors);
+            match args.get(1) {
+                // Checked (and handed over) with the register it goes to.
+                Some(Expr::Call { callee, .. }) if callee == "address_of" => {}
+                Some(value) => self.check_expr(value, errors),
+                None => {}
             }
+            return;
+        }
+        if callee == "address_of" {
+            errors.push(err(
+                "`address_of(..)` is only for writing a buffer's address to a register declared `address` (`volatile_write(Dma.DEST, address_of(buf))`)",
+            ));
             return;
         }
 
@@ -3837,6 +3932,117 @@ mod tests {
             "{handler} fn main() {{ volatile_write(Dma.CR[2].EN, 1); }}"
         )))
         .unwrap();
+    }
+
+    const COPIER: &str = r#"
+        device Dma @ 0x40000000 {
+            SRC:  read write u32 @ 0x00 address;
+            DEST: read write u32 @ 0x04 address;
+            CTRL: read write u32 @ 0x08 { GO: bit 0 }
+        }
+        event done;
+        interrupt fn h() @ irq 3 { signal done; }
+        extern fn produce(b: write buffer<u8, 8> @RAM);
+        extern fn look(b: read buffer<u8, 8> @RAM);
+    "#;
+
+    fn copier(body: &str) -> String {
+        format!("{COPIER}\n{body}")
+    }
+
+    #[test]
+    fn writing_a_buffers_address_hands_it_to_the_hardware() {
+        check_src(&copier(
+            "fn main() {
+                 buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM;
+                 produce(a);
+                 volatile_write(Dma.SRC, address_of(a));
+                 volatile_write(Dma.DEST, address_of(b));
+                 volatile_write(Dma.CTRL.GO, 1);
+                 wait done for a, b;
+                 look(b);
+                 volatile_write(Dma.SRC, 0);
+             }",
+        ))
+        .unwrap();
+        // The source is the controller's until the transfer is done.
+        assert_single_error_containing(
+            &copier(
+                "fn main() {
+                     buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM;
+                     volatile_write(Dma.SRC, address_of(a));
+                     volatile_write(Dma.DEST, address_of(b));
+                     produce(a);
+                     wait done for a, b;
+                 }",
+            ),
+            "entity 'a' is in domain @DMA but 'produce' expects @RAM",
+        );
+        // Handing over a buffer the hardware already has.
+        assert_single_error_containing(
+            &copier(
+                "fn main() {
+                     buffer<u8, 8> a @RAM;
+                     volatile_write(Dma.SRC, address_of(a));
+                     volatile_write(Dma.DEST, address_of(a));
+                     wait done for a;
+                 }",
+            ),
+            "'a' is in @DMA, not the CPU's: it can't be handed to 'Dma.DEST'",
+        );
+        // Forgetting one of the two at the end.
+        assert_single_error_containing(
+            &copier(
+                "fn main() {
+                     buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM;
+                     volatile_write(Dma.SRC, address_of(a));
+                     volatile_write(Dma.DEST, address_of(b));
+                     wait done for b;
+                 }",
+            ),
+            "'a' is still owned by @DMA",
+        );
+    }
+
+    #[test]
+    fn addresses_only_go_to_address_registers() {
+        assert_single_error_containing(
+            &copier("fn main() { buffer<u8, 8> a @RAM; volatile_write(Dma.CTRL, address_of(a)); }"),
+            "'Dma.CTRL' is not declared `address`",
+        );
+        assert_single_error_containing(
+            &copier("fn main() { volatile_write(Dma.SRC, 0x20000000); }"),
+            "'Dma.SRC' holds an address: write `address_of(buffer)` to it (or 0)",
+        );
+        assert_single_error_containing(
+            &copier("fn main() { buffer<u8, 8> a @RAM; produce(address_of(a)); }"),
+            "`address_of(..)` is only for writing a buffer's address to a register declared `address`",
+        );
+        assert_single_error_containing(
+            &copier("fn main() { let x: u32 = 1; volatile_write(Dma.SRC, address_of(x)); }"),
+            "'x' is not a buffer",
+        );
+        assert_single_error_containing(
+            "device D @ 0x40000000 { A: read write u16 @ 0 address; } fn main() {}",
+            "address register 'D.A' must be a writable u32 with no fields",
+        );
+    }
+
+    #[test]
+    fn an_event_hands_back_the_same_set_of_buffers() {
+        assert_single_error_containing(
+            &copier(
+                "fn main() {
+                     buffer<u8, 8> a @RAM; buffer<u8, 8> b @RAM;
+                     volatile_write(Dma.SRC, address_of(a)); volatile_write(Dma.DEST, address_of(b));
+                     wait done for b, a;
+                     volatile_write(Dma.SRC, address_of(a)); volatile_write(Dma.DEST, address_of(b));
+                     wait done for b;
+                     wait done for a;
+                 }",
+            ),
+            "`wait done for b`, but `done` hands over a, b earlier in this function",
+        );
     }
 
     const HAPPY_PATH: &str = r#"

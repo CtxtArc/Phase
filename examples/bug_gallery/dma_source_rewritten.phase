@@ -1,0 +1,36 @@
+// Bug gallery #48: refilling a DMA source while it is being read. The
+// copy engine was given the source buffer's address and started; the
+// code then produces the next block into the same buffer before the
+// transfer-complete interrupt. The engine copies a mix of two blocks --
+// the destination looks fine and holds data that never existed. Writing
+// the address to SRC handed `src` to the engine; it is the engine's
+// until the interrupt hands it back.
+// Expected: "entity 'src' is in domain @DMA but 'produce' expects @RAM"
+
+device Copier @ 0x40010000 {
+    SRC:  read write u32 @ 0x00 address;
+    DEST: read write u32 @ 0x04 address;
+    CTRL: read write u32 @ 0x08 = 0 { GO: bit 0, IRQ_EN: bit 1 }
+}
+
+event copied;
+
+interrupt fn copier_done() @ irq 20 {
+    signal copied;
+}
+
+extern fn produce(block: write buffer<u32, 64> @RAM);
+extern fn consume(block: read buffer<u32, 64> @RAM);
+
+fn main() {
+    buffer<u32, 64> src @RAM;
+    buffer<u32, 64> dest @RAM;
+    produce(src);
+    volatile_write(Copier.SRC, address_of(src));
+    volatile_write(Copier.DEST, address_of(dest));
+    volatile_write(Copier.CTRL, 3);
+    // BUG: the engine is still reading src.
+    produce(src);
+    wait copied for src, dest;
+    consume(dest);
+}

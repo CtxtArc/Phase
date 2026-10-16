@@ -29,8 +29,6 @@ device Uart4: CmsdkUart @ 0x50204000;
 // TransferSize elements from SRC to DEST, and with CONTROL.TC_IRQ set,
 // raises its bit of INTTCSTATUS when done. (The PL081 TRM, ARM DDI 0218.)
 //
-// Channel registers: SRC and DEST are addresses, which is the C side's
-// job (PHASE has no buffer addresses); the rest can be written here.
 device type Pl081 {
     INTSTATUS:      read u32 @ 0x000 { CH0: bit 0, CH1: bit 1 }
     // Terminal count (transfer done), per channel; write 1 to INTTCCLEAR
@@ -43,10 +41,13 @@ device type Pl081 {
     ENABLEDCHANNELS: read u32 @ 0x01C { CH0: bit 0, CH1: bit 1 }
     CONFIG:         read write u32 @ 0x030 = 0 { ENABLE: bit 0 }
 
-    // Channel n's registers are at 0x100 + 0x20 * n.
-    CSRC[2]:  read write u32 @ 0x100 step 0x20;
-    CDEST[2]: read write u32 @ 0x104 step 0x20;
-    CLLI[2]:  read write u32 @ 0x108 step 0x20;
+    // Channel n's registers are at 0x100 + 0x20 * n. SRC and DEST hold
+    // the addresses a transfer copies from and to: writing
+    // `address_of(buf)` to one hands `buf` to the controller. LLI is the
+    // next transfer in a chain (0: none).
+    CSRC[2]:  read write u32 @ 0x100 step 0x20 address;
+    CDEST[2]: read write u32 @ 0x104 step 0x20 address;
+    CLLI[2]:  read write u32 @ 0x108 step 0x20 address;
     CCONTROL[2]: read write u32 @ 0x10C step 0x20 {
         SIZE: bits 0..=11, SWIDTH: bits 18..=20, DWIDTH: bits 21..=23,
         SRC_INC: bit 26, DEST_INC: bit 27, TC_IRQ: bit 31

@@ -486,6 +486,34 @@ fn format_reg_write(r: &RegRef, value: &str) -> String {
     }
 }
 
+/// v2.4: `volatile_write(REG, address_of(b))`. On the target, the
+/// register gets `b`'s address; in a host build, whose pointers are wider
+/// than the register, `phase_addr_set` also keeps the real pointer for the
+/// simulated hardware to find (`phase_addr_get`, runtime/phase_runtime.h).
+fn format_address_write(r: &RegRef, b: &str, cx: &FnCx, pad: &str) -> String {
+    let reg = format!("{}->{}", r.device, r.reg);
+    let mut s = format!(
+        "{pad}/* {b} is handed to the hardware at {} */\n",
+        reg_display(r)
+    );
+    if cx.checked {
+        s.push_str(&format!(
+            "{pad}phase_chk_reg_write(&{reg}, \"{}\", {}, 0, 0, 0);\n",
+            reg_display(r),
+            reg_access(r)
+        ));
+        if cx.is_buffer(b) {
+            s.push_str(&format!(
+                "{pad}phase_chk_move({b}, PHASE_DOM_DMA, \"{b}\");\n"
+            ));
+        }
+    }
+    s.push_str(&format!(
+        "#ifdef PHASE_TARGET_HW\n{pad}{reg} = (uint32_t)(uintptr_t)({b});\n#else\n{pad}phase_addr_set(&{reg}, {b});\n#endif\n"
+    ));
+    s
+}
+
 fn format_struct(e: &PirEntityDef) -> String {
     let mut s = "typedef struct {\n".to_string();
     for (fname, fty) in &e.fields {
@@ -1031,7 +1059,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
     let pad = "    ".repeat(indent);
     match inst {
         PirInst::Signal { event } => format!("{pad}phase_event_{event} = true;\n"),
-        PirInst::Wait { event, buf } => {
+        PirInst::Wait { event, bufs } => {
             let mut s = String::new();
             if cx.checked {
                 s.push_str(&format!("{pad}phase_chk_wait(\"{event}\");\n"));
@@ -1039,16 +1067,23 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
             s.push_str(&format!(
                 "{pad}phase_wait(&phase_event_{event}, \"{event}\");\n"
             ));
-            if let Some(b) = buf {
+            if !bufs.is_empty() {
                 s.push_str(&format!(
-                    "{pad}/* the interrupt that signalled {event} hands {b} back to the CPU */\n"
+                    "{pad}/* the interrupt that signalled {event} hands {} back to the CPU */\n",
+                    bufs.join(", ")
                 ));
                 if cx.checked {
+                    let mut set = bufs.clone();
+                    set.sort();
+                    set.dedup();
                     s.push_str(&format!(
-                        "{pad}phase_chk_wait_for(\"{}\", \"{event}\", \"{b}\");\n",
-                        cx.sig.name
+                        "{pad}phase_chk_wait_for(\"{}\", \"{event}\", \"{}\");\n",
+                        cx.sig.name,
+                        set.join(", ")
                     ));
                 }
+            }
+            for b in bufs {
                 if cx.checked && cx.is_buffer(b) {
                     s.push_str(&format!("{pad}phase_chk_sync({b}, \"{b}\");\n"));
                 }
@@ -1385,6 +1420,12 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
             if callee == "volatile_write" {
                 // M6: not a function call -- a direct assignment to the
                 // `volatile` global. Same reasoning as volatile_read above.
+                // v2.4: a buffer's address, handed to the hardware.
+                if let (Some(CallArg::DeviceRegister(r)), Some(CallArg::Address(b))) =
+                    (args.first(), args.get(1))
+                {
+                    return format_address_write(r, b, cx, &pad);
+                }
                 let reg = match args.first() {
                     Some(CallArg::MmioRegister(r)) => r.clone(),
                     _ => {
@@ -1397,6 +1438,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
                     Some(CallArg::MmioRegister(r)) => r.clone(),
                     Some(CallArg::DeviceRegister(r)) => format_reg_read(r, cx.checked),
                     Some(CallArg::Value(e)) => format_pir_expr(e, cx.checked),
+                    Some(CallArg::Address(b)) => b.clone(),
                     None => "/* internal error: volatile_write missing value arg */".to_string(),
                 };
                 if let Some(CallArg::DeviceRegister(r)) = args.first() {
@@ -1564,6 +1606,7 @@ fn format_args(
             CallArg::MmioRegister(name) => parts.push(name.clone()),
             CallArg::DeviceRegister(r) => parts.push(format_reg_read(r, checked)),
             CallArg::Value(e) => parts.push(format_pir_expr(e, checked)),
+            CallArg::Address(b) => parts.push(b.clone()),
         }
     }
     parts.join(", ")

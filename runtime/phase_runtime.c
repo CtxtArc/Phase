@@ -47,3 +47,40 @@ void sim_device_wait(const char *entity_name, const void *buf, size_t nbytes) {
     simulated_transfer_delay();
     printf("[sim] sim_device_wait(\"%s\"): device transfer complete\n", entity_name);
 }
+
+/* v2.4: the real pointers behind `address` registers (see phase_runtime.h). */
+#define PHASE_ADDR_SLOTS 256
+static struct {
+    const volatile uint32_t *reg;
+    void *p;
+} phase_addr_slots[PHASE_ADDR_SLOTS];
+
+void phase_addr_set(volatile uint32_t *reg, void *p) {
+    *reg = (uint32_t)(uintptr_t)p;
+    int free_slot = -1;
+    for (int i = 0; i < PHASE_ADDR_SLOTS; i++) {
+        if (phase_addr_slots[i].reg == reg) {
+            phase_addr_slots[i].p = p;
+            return;
+        }
+        if (free_slot < 0 && phase_addr_slots[i].reg == NULL) {
+            free_slot = i;
+        }
+    }
+    if (free_slot >= 0) {
+        phase_addr_slots[free_slot].reg = reg;
+        phase_addr_slots[free_slot].p = p;
+    }
+}
+
+void *phase_addr_get(const volatile uint32_t *reg) {
+    for (int i = 0; i < PHASE_ADDR_SLOTS; i++) {
+        if (phase_addr_slots[i].reg == reg) {
+            /* Unless the register was overwritten since (with 0, say). */
+            if (*reg == (uint32_t)(uintptr_t)phase_addr_slots[i].p) {
+                return phase_addr_slots[i].p;
+            }
+        }
+    }
+    return (void *)(uintptr_t)*reg;
+}

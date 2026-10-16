@@ -375,6 +375,8 @@ device Fz @ 0x40000000 {
     ACK: read write u8 @ 0x0C { DONE: bit 0, ERR: bit 1 }
     FLAGS: read write u32 @ 0x10 { DONE: bit 0 w1c, ERR: bit 1 w1c, IE: bit 4 }
     CH[4]: read write u32 @ 0x20 step 0x8 { ON: bit 0, LEN: bits 8..=15 }
+    SRC: read write u32 @ 0x40 address;
+    DST: read write u32 @ 0x44 address;
 }
 
 event ev0;
@@ -629,7 +631,7 @@ impl FnGen<'_> {
 
     /// Emit one statement. Returns true if it was a `return`.
     fn stmt(&mut self, depth: usize, in_loop: bool) -> bool {
-        match self.rng.below(200) {
+        match self.rng.below(212) {
             0..=11 => self.declare(depth),
             12..=19 => self.op_move(depth),
             20..=27 => self.op_sync(depth),
@@ -661,6 +663,7 @@ impl FnGen<'_> {
             170..=175 if depth < self.cfg.max_depth => return self.op_critical(depth, in_loop),
             176..=177 => self.op_signal(depth),
             178..=199 => self.op_wait_for(depth),
+            200..=211 => self.op_address(depth),
             _ => self.op_call(depth),
         }
         false
@@ -973,7 +976,13 @@ impl FnGen<'_> {
                     else {
                         return;
                     };
-                    (e, b.clone())
+                    // v2.4: sometimes a pair (a copy's source and
+                    // destination).
+                    let other: Vec<&String> = in_flight.iter().filter(|x| *x != b).collect();
+                    match self.rng.pick(&other) {
+                        Some(c) if self.rng.chance(0.3) => (e, format!("{b}, {c}")),
+                        _ => (e, b.clone()),
+                    }
                 }
             }
         };
@@ -981,7 +990,28 @@ impl FnGen<'_> {
         if !self.handovers.iter().any(|(e, _)| *e == event) {
             self.handovers.push((event, buf.clone()));
         }
-        self.set_dom(&buf, Dom::Ram);
+        for b in buf.split(", ") {
+            self.set_dom(b, Dom::Ram);
+        }
+    }
+
+    /// `volatile_write(Fz.DST, address_of(b))` (v2.4): hand a CPU buffer
+    /// to the device by writing its address -- usually one the CPU owns
+    /// outright; as a deviation, any buffer.
+    fn op_address(&mut self, depth: usize) {
+        let b = if self.hw_chaos() {
+            self.any_buf()
+        } else {
+            let c = self.candidates(Some(Dom::Ram), true, true);
+            self.rng.pick(&c).cloned()
+        };
+        let Some(b) = b else { return };
+        let reg = if self.rng.chance(0.5) { "SRC" } else { "DST" };
+        self.line(
+            depth,
+            &format!("volatile_write(Fz.{reg}, address_of({b}));"),
+        );
+        self.set_dom(&b, Dom::Dma);
     }
 
     /// Hand a CPU buffer to the DMA engine, to have one to wait for.

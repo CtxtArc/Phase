@@ -188,6 +188,8 @@ CASES = [
     ("device D @ 0x40000000 {\n    CR[8]: read write u32 @ 0x10 step 0x18 { F: bit 0 w1c }\n}", 2, "CR", "variable.other.register.phase"),
     ("device D @ 0x40000000 {\n    CR[8]: read write u32 @ 0x10 step 0x18 { F: bit 0 w1c }\n}", 2, "step", "keyword.other.bit.phase"),
     ("device D @ 0x40000000 {\n    CR[8]: read write u32 @ 0x10 step 0x18 { F: bit 0 w1c }\n}", 2, "w1c", "keyword.other.bit.phase"),
+    ("device D @ 0x40000000 {\n    SRC: read write u32 @ 0x0 address;\n}", 2, "address", "keyword.other.bit.phase"),
+    ("fn main() {\n    volatile_write(D.SRC, address_of(b));\n}", 2, "address_of", "support.function.builtin.phase"),
     # An instance line has no block: the next line is ordinary code again.
     ("device Uart0: Uart @ 0x40004000;\nfn main() { move x -> @DMA; }", 2, "main", "entity.name.function.phase"),
 ]

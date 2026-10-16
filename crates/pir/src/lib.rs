@@ -181,6 +181,8 @@ pub struct PirReg {
     pub reset: Option<u64>,
     pub readable: bool,
     pub writable: bool,
+    /// Holds an address (v2.4).
+    pub address: bool,
     /// `(name, lowest bit, highest bit)`.
     pub fields: Vec<(String, u32, u32)>,
 }
@@ -200,6 +202,9 @@ pub enum CallArg {
     /// Any other scalar value (v2.4): a constant, or an expression such
     /// as `MODE << 2 | flags`.
     Value(PirExpr),
+    /// `address_of(buf)` (v2.4), written to an `address` register: the
+    /// buffer's address, and its hand-off to the hardware.
+    Address(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -318,10 +323,10 @@ pub enum PirInst {
     Signal {
         event: String,
     },
-    /// `wait E;` (v2.2), `wait E for buf;` (v2.3).
+    /// `wait E;` (v2.2), `wait E for a, b;` (v2.3, v2.4).
     Wait {
         event: String,
-        buf: Option<String>,
+        bufs: Vec<String>,
     },
     /// `critical { .. }` (v2.2): `body` with interrupts disabled.
     Critical {
@@ -485,6 +490,7 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
                 reset: r.reset,
                 readable: r.readable,
                 writable: r.writable,
+                address: r.address,
                 fields: r
                     .fields
                     .iter()
@@ -931,13 +937,13 @@ impl<'a> Lowerer<'a> {
                 });
                 Ok(())
             }
-            Stmt::Wait { name, buf } => {
-                if let Some(b) = buf {
+            Stmt::Wait { name, bufs } => {
+                for b in bufs {
                     self.domains.insert(b.clone(), Domain::Ram);
                 }
                 out.push(PirInst::Wait {
                     event: name.clone(),
-                    buf: buf.clone(),
+                    bufs: bufs.clone(),
                 });
                 Ok(())
             }
@@ -1097,6 +1103,11 @@ impl<'a> Lowerer<'a> {
             Expr::Call { callee, args } => {
                 let lowered_args = self.lower_call_args(args, callee)?;
                 self.apply_domain_changes(callee, args);
+                for a in &lowered_args {
+                    if let CallArg::Address(b) = a {
+                        self.domains.insert(b.clone(), Domain::Dma);
+                    }
+                }
                 out.push(PirInst::Call {
                     callee: callee.clone(),
                     args: lowered_args,
@@ -1217,6 +1228,14 @@ impl<'a> Lowerer<'a> {
                     CallArg::Value(PirExpr::UInt(self.consts[n]))
                 }
                 Expr::Ident(n) => CallArg::Entity(n.clone()),
+                Expr::Call { callee, args } if callee == "address_of" => match args.as_slice() {
+                    [Expr::Ident(b)] => CallArg::Address(b.clone()),
+                    _ => {
+                        return Err(PirError::UnsupportedExpr {
+                            context: format!("address_of in '{context}'"),
+                        })
+                    }
+                },
                 e @ (Expr::Binary { .. } | Expr::BitNot(_)) => {
                     CallArg::Value(self.lower_pir_expr(e, context)?)
                 }

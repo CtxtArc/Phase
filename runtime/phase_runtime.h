@@ -21,4 +21,23 @@
 void sim_dma_wait(const char *entity_name, const void *buf, size_t nbytes);
 void sim_device_wait(const char *entity_name, const void *buf, size_t nbytes);
 
+/* v2.4: `address` registers. `volatile_write(Dma.DEST, address_of(buf))`
+ * writes buf's address to the register. On the target that is the whole
+ * story, and phase_addr_get reads it back. A host build's pointers are
+ * wider than a 32-bit register, so phase_addr_set also keeps the real
+ * pointer, and phase_addr_get -- what a simulated device calls to find the
+ * memory it should read or write -- returns it. */
+#include <stdint.h>
+#ifdef PHASE_TARGET_HW
+static inline void phase_addr_set(volatile uint32_t *reg, void *p) {
+    *reg = (uint32_t)(uintptr_t)p;
+}
+static inline void *phase_addr_get(const volatile uint32_t *reg) {
+    return (void *)(uintptr_t)*reg;
+}
+#else
+void phase_addr_set(volatile uint32_t *reg, void *p);
+void *phase_addr_get(const volatile uint32_t *reg);
+#endif
+
 #endif /* PHASE_RUNTIME_H */
