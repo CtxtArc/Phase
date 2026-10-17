@@ -243,7 +243,9 @@ fn generate_header(program: &PirProgram, stem: &str) -> String {
         out.push_str("/* --- PHASE functions, callable from C ---\n");
         out.push_str(" * PHASE checked every call to these inside the program; a call from C\n");
         out.push_str(" * must keep the same promises (docs/boundary.md): a buffer passed in\n");
-        out.push_str(" * is the CPU's, and one a function hands to the hardware (`@RAM -> @DMA`)\n");
+        out.push_str(
+            " * is the CPU's, and one a function hands to the hardware (`@RAM -> @DMA`)\n",
+        );
         out.push_str(" * is not touched until the program hands it back.\n */\n\n");
         for f in callable {
             out.push_str(&format_fn_prototype(&f.sig));
@@ -545,6 +547,38 @@ fn format_address_write(r: &RegRef, b: &str, cx: &FnCx, pad: &str) -> String {
     s.push_str(&format!(
         "#ifdef PHASE_TARGET_HW\n{pad}{reg} = (uint32_t)(uintptr_t)({b});\n#else\n{pad}phase_addr_set(&{reg}, {b});\n#endif\n"
     ));
+    if let Some(u) = &r.until {
+        s.push_str(&format!(
+            "{pad}{} = {b}; /* `sync({b})` waits until {} */\n",
+            until_slot(r),
+            u.display
+        ));
+    }
+    s
+}
+
+/// v3.0: `volatile_write(REG, address_of(Dev.SRC))` -- a peripheral
+/// register's address, for a transfer to or from that register. On the
+/// target, its bus address; in a host build, a pointer into the simulated
+/// register block, kept like a buffer's.
+fn format_reg_address_write(r: &RegRef, src: &RegRef, cx: &FnCx, pad: &str) -> String {
+    let reg = format!("PHASE_DEV_{}->{}", r.device, r.reg);
+    let from = format!("&PHASE_DEV_{}->{}", src.device, src.reg);
+    let mut s = format!(
+        "{pad}/* {} gets the address of {} */\n",
+        reg_display(r),
+        src.display
+    );
+    if cx.checked {
+        s.push_str(&format!(
+            "{pad}phase_chk_reg_write(&{reg}, \"{}\", {}, 0, 0, 0);\n",
+            reg_display(r),
+            reg_access(r)
+        ));
+    }
+    s.push_str(&format!(
+        "#ifdef PHASE_TARGET_HW\n{pad}{reg} = (uint32_t)(uintptr_t)({from});\n#else\n{pad}phase_addr_set(&{reg}, (void *)({from}));\n#endif\n"
+    ));
     s
 }
 
@@ -667,8 +701,19 @@ fn generate_source(program: &PirProgram, stem: &str, checked: bool) -> String {
         out.push_str(&format_interrupt_support(program, checked));
     }
 
+    let untils = until_slots(program);
+    if !untils.is_empty() {
+        out.push_str(&format_until_support(&untils));
+    }
     for f in &program.fns {
-        out.push_str(&format_fn(f, &sigs, &externs, checked, has_handlers));
+        out.push_str(&format_fn(
+            f,
+            &sigs,
+            &externs,
+            checked,
+            has_handlers,
+            !untils.is_empty(),
+        ));
         out.push('\n');
     }
 
@@ -692,6 +737,102 @@ fn generate_source(program: &PirProgram, stem: &str, checked: bool) -> String {
     }
 
     out
+}
+
+/// v3.0: the C name of the slot remembering which buffer an `address ..
+/// until` register element was last handed.
+fn until_slot(r: &RegRef) -> String {
+    format!("phase_until_{}_{}", r.device, r.reg)
+}
+
+/// Every `address .. until` register element the program hands a buffer
+/// to, once each, in the order they first appear.
+fn until_slots(program: &PirProgram) -> Vec<RegRef> {
+    fn walk(body: &[PirInst], out: &mut Vec<RegRef>) {
+        for i in body {
+            match i {
+                PirInst::Call { callee, args } if callee == "volatile_write" => {
+                    if let (Some(CallArg::DeviceRegister(r)), Some(CallArg::Address(_))) =
+                        (args.first(), args.get(1))
+                    {
+                        if r.until.is_some() && !out.iter().any(|o| until_slot(o) == until_slot(r))
+                        {
+                            out.push(r.clone());
+                        }
+                    }
+                }
+                PirInst::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    walk(then_body, out);
+                    walk(else_body, out);
+                }
+                PirInst::While { body, .. } | PirInst::Critical { body } => walk(body, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for f in &program.fns {
+        walk(&f.body, &mut out);
+    }
+    out
+}
+
+/// v3.0: `sync` for buffers handed over through `address .. until`
+/// registers. Each register element remembers the buffer it was last
+/// given; `sync(b)` finds b there and waits until the register's condition
+/// holds -- the device itself saying it is done -- and only a buffer handed
+/// over some other way (an extern) falls back to the runtime's wait.
+fn format_until_support(untils: &[RegRef]) -> String {
+    let unused = "#if defined(__GNUC__)\n__attribute__((unused))\n#endif\n";
+    let mut s = String::from(
+        "/* --- `sync` through `address .. until` registers (v3.0) ---\n * The buffer each register was last handed, until it comes back. */\n",
+    );
+    for r in untils {
+        s.push_str(&format!(
+            "static const void *{}; /* {} */\n",
+            until_slot(r),
+            r.display
+        ));
+    }
+    s.push_str("#ifndef PHASE_TARGET_HW\n#include <stdio.h>\n#include <stdlib.h>\n#if defined(__GNUC__)\nextern void phase_sim_hardware(void) __attribute__((weak));\n#endif\n#endif\n");
+    s.push_str("/* Between two reads of the condition: on a board, nothing (the device\n * runs on its own); in a host build, the simulated hardware takes a step,\n * and a condition that never holds stops the program instead of hanging. */\n");
+    s.push_str(&format!(
+        "{unused}static void phase_until_poll(const char *name, const char *cond, int *rounds) {{\n#ifndef PHASE_TARGET_HW\n#if defined(__GNUC__)\n    if (phase_sim_hardware) {{\n        phase_sim_hardware();\n    }}\n#endif\n    if (++*rounds == 1000) {{\n        fprintf(stderr, \"PHASE: `sync(%s)` never returns: %s never holds (this host build ran the simulated hardware 1000 times)\\n\", name, cond);\n        exit(1);\n    }}\n#else\n    (void)name;\n    (void)cond;\n    (void)rounds;\n#endif\n}}\n"
+    ));
+    s.push_str("/* `sync(b)`: 1 once the device b was handed to is done with it; 0 if b\n * was not handed over through such a register. */\n");
+    s.push_str(&format!(
+        "{unused}static int phase_until_wait(const void *b, const char *name) {{\n    int found = 0;\n    int rounds = 0;\n"
+    ));
+    for r in untils {
+        let u = r.until.as_ref().expect("until slots have a condition");
+        let mask = field_mask(u.lo, u.hi);
+        s.push_str(&format!(
+            "    if ({slot} == b) {{\n        while (((PHASE_DEV_{dev}->{reg} >> {lo}u) & {mask:#x}u) != {value:#x}u) {{\n            phase_until_poll(name, \"{cond}\", &rounds);\n        }}\n        {slot} = 0;\n        found = 1;\n    }}\n",
+            slot = until_slot(r),
+            dev = r.device,
+            reg = u.reg,
+            lo = u.lo,
+            value = u.value,
+            cond = u.display,
+        ));
+    }
+    s.push_str("    return found;\n}\n");
+    s.push_str("/* `wait E for b`: an interrupt handed b back. */\n");
+    s.push_str(&format!(
+        "{unused}static void phase_until_forget(const void *b) {{\n"
+    ));
+    for r in untils {
+        s.push_str(&format!(
+            "    if ({slot} == b) {{\n        {slot} = 0;\n    }}\n",
+            slot = until_slot(r)
+        ));
+    }
+    s.push_str("}\n\n");
+    s
 }
 
 fn has_critical(body: &[PirInst]) -> bool {
@@ -803,6 +944,9 @@ struct FnCx<'a> {
     /// The program has interrupt handlers (a checked build runs them in
     /// the middle of a field write).
     has_handlers: bool,
+    /// v3.0: buffers go to `address .. until` registers, so `sync` and
+    /// `wait E for` consult phase_until_wait / phase_until_forget.
+    has_untils: bool,
     /// Buffer borrow handles in scope, with their mode.
     handles: HashMap<String, BorrowMode>,
     /// Borrow handles of non-buffer entities (C pointers to the value).
@@ -995,6 +1139,7 @@ fn format_fn(
     externs: &HashSet<&str>,
     checked: bool,
     has_handlers: bool,
+    has_untils: bool,
 ) -> String {
     let is_main = f.sig.name == "main";
     let (ret, name, params) = if is_main {
@@ -1021,6 +1166,7 @@ fn format_fn(
         swapped: swapped_buffers(&f.body),
         checked,
         has_handlers,
+        has_untils,
         handles: HashMap::new(),
         struct_handles: HashSet::new(),
         scopes: vec![Vec::new()],
@@ -1130,6 +1276,9 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
             for b in bufs {
                 if cx.checked && cx.is_buffer(b) {
                     s.push_str(&format!("{pad}phase_chk_sync({b}, \"{b}\");\n"));
+                }
+                if cx.has_untils {
+                    s.push_str(&format!("{pad}phase_until_forget({b});\n"));
                 }
             }
             s
@@ -1397,7 +1546,15 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
             if cx.checked && cx.is_buffer(name) {
                 s.push_str(&format!("{pad}phase_chk_sync({name}, \"{name}\");\n"));
             }
-            s.push_str(&format!("{pad}{wait_fn}(\"{name}\", {name}, {nbytes});\n"));
+            if cx.has_untils {
+                // v3.0: the device's own condition, if it was handed over
+                // through an `address .. until` register.
+                s.push_str(&format!(
+                    "{pad}if (!phase_until_wait({name}, \"{name}\")) {{\n{pad}    {wait_fn}(\"{name}\", {name}, {nbytes});\n{pad}}}\n"
+                ));
+            } else {
+                s.push_str(&format!("{pad}{wait_fn}(\"{name}\", {name}, {nbytes});\n"));
+            }
             s
         }
 
@@ -1470,6 +1627,11 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
                 {
                     return format_address_write(r, b, cx, &pad);
                 }
+                if let (Some(CallArg::DeviceRegister(r)), Some(CallArg::RegAddress(src))) =
+                    (args.first(), args.get(1))
+                {
+                    return format_reg_address_write(r, src, cx, &pad);
+                }
                 let reg = match args.first() {
                     Some(CallArg::MmioRegister(r)) => r.clone(),
                     _ => {
@@ -1483,6 +1645,7 @@ fn format_inst(inst: &PirInst, cx: &mut FnCx, indent: usize) -> String {
                     Some(CallArg::DeviceRegister(r)) => format_reg_read(r, cx.checked),
                     Some(CallArg::Value(e)) => format_pir_expr(e, cx.checked),
                     Some(CallArg::Address(b)) => b.clone(),
+                    Some(CallArg::RegAddress(r)) => format!("&PHASE_DEV_{}->{}", r.device, r.reg),
                     None => "/* internal error: volatile_write missing value arg */".to_string(),
                 };
                 if let Some(CallArg::DeviceRegister(r)) = args.first() {
@@ -1651,6 +1814,7 @@ fn format_args(
             CallArg::DeviceRegister(r) => parts.push(format_reg_read(r, checked)),
             CallArg::Value(e) => parts.push(format_pir_expr(e, checked)),
             CallArg::Address(b) => parts.push(b.clone()),
+            CallArg::RegAddress(r) => parts.push(format!("&PHASE_DEV_{}->{}", r.device, r.reg)),
         }
     }
     parts.join(", ")
@@ -2342,6 +2506,54 @@ mod tests {
     }
 
     #[test]
+    fn sync_waits_on_the_register_a_buffer_was_handed_to() {
+        let g = generate_src(
+            "device type Dma {
+                 CR[2]: read write u32 @ 0x10 step 0x18 { EN: bit 0 }
+                 M0AR[2]: read write u32 @ 0x1C step 0x18 address until CR.EN == 0;
+             }
+             device Dma2: Dma @ 0x40026400;
+             event done;
+             interrupt fn h() @ irq 56 { signal done; }
+             fn main() {
+                 buffer<u32, 4> a @RAM;
+                 buffer<u32, 4> b @RAM;
+                 volatile_write(Dma2.M0AR[1], address_of(a));
+                 sync(a);
+                 volatile_write(Dma2.M0AR[0], address_of(b));
+                 wait done for b;
+             }",
+            "t",
+        );
+        for needle in [
+            "static const void *phase_until_Dma2_M0AR_1; /* Dma2.M0AR[1] */",
+            "phase_until_Dma2_M0AR_1 = a; /* `sync(a)` waits until Dma2.CR[1].EN == 0 */",
+            "    if (phase_until_Dma2_M0AR_1 == b) {\n        while (((PHASE_DEV_Dma2->CR_1 >> 0u) & 0x1u) != 0x0u) {\n            phase_until_poll(name, \"Dma2.CR[1].EN == 0\", &rounds);",
+            "if (!phase_until_wait(a, \"a\")) {\n        sim_dma_wait(\"a\", a, 4 * sizeof(a[0]));\n    }",
+            "phase_until_forget(b);",
+        ] {
+            assert!(g.source.contains(needle), "missing {needle:?} in\n{}", g.source);
+        }
+        // v3.0: a register's address, for a transfer from a peripheral.
+        let adc = generate_src(
+            "device Adc @ 0x40012000 { DR: read u32 @ 0x4C; }
+             device Dma @ 0x40026400 { PAR: read write u32 @ 0x18 address; }
+             fn main() { volatile_write(Dma.PAR, address_of(Adc.DR)); }",
+            "t",
+        );
+        assert!(adc.source.contains(
+            "#ifdef PHASE_TARGET_HW\n    PHASE_DEV_Dma->PAR = (uint32_t)(uintptr_t)(&PHASE_DEV_Adc->DR);\n#else\n    phase_addr_set(&PHASE_DEV_Dma->PAR, (void *)(&PHASE_DEV_Adc->DR));\n#endif"
+        ), "{}", adc.source);
+        // A program with no such register keeps the plain wait.
+        let plain = generate_src(
+            "extern fn start(x: write buffer<u8, 4> @RAM -> @DMA);
+             fn main() { buffer<u8, 4> x @RAM; start(x); sync(x); }",
+            "t",
+        );
+        assert!(!plain.source.contains("phase_until"));
+    }
+
+    #[test]
     fn an_irq_named_like_cmsis_gets_the_vendors_handler_name_too() {
         let g = generate_src(
             "const DMA2_Stream0_IRQn: u32 = 56;
@@ -2360,7 +2572,9 @@ mod tests {
             g.source
         );
         // A constant not named `<Name>_IRQn` gives just the number.
-        assert!(g.source.contains("void IRQ8_Handler(void) {\n    on_timer();\n}\n#endif"));
+        assert!(g
+            .source
+            .contains("void IRQ8_Handler(void) {\n    on_timer();\n}\n#endif"));
         assert_eq!(g.source.matches("_IRQHandler(void)").count(), 1);
     }
 

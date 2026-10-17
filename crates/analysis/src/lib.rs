@@ -653,8 +653,72 @@ fn check_devices<'p>(
     devices
 }
 
+/// v3.0: each `address until REG.FIELD == N` names a readable field of the
+/// same map that can hold N; if REG is an array, so is the address
+/// register, with as many elements (element n waits on element n).
+fn check_untils(owner: &str, regs: &[RegDecl], errors: &mut Vec<AnalysisError>) {
+    for r in regs {
+        let Some(u) = &r.until else { continue };
+        let full = format!("{owner}.{}", r.name);
+        let Some(target) = regs.iter().find(|t| t.name == u.reg) else {
+            errors.push(
+                err(format!(
+                    "'{full}' waits until '{owner}.{}', which is not a register of '{owner}'",
+                    u.reg
+                ))
+                .at(u.span),
+            );
+            continue;
+        };
+        if !target.readable {
+            errors.push(
+                err(format!(
+                    "'{full}' waits until '{owner}.{}.{}', but '{owner}.{}' is write-only: nothing can read whether the device is done",
+                    u.reg, u.field, u.reg
+                ))
+                .at(u.span),
+            );
+        }
+        let Some(f) = target.fields.iter().find(|f| f.name == u.field) else {
+            errors.push(err(format!("'{owner}.{}' has no field '{}'", u.reg, u.field)).at(u.span));
+            continue;
+        };
+        let width = f.hi.saturating_sub(f.lo) + 1;
+        if width < 64 && u.value >> width != 0 {
+            errors.push(
+                err(format!(
+                    "{} does not fit in '{owner}.{}.{}' ({width} bit{})",
+                    u.value,
+                    u.reg,
+                    u.field,
+                    if width == 1 { "" } else { "s" }
+                ))
+                .at(u.span),
+            );
+        }
+        match (r.array, target.array) {
+            (None, Some(_)) => errors.push(
+                err(format!(
+                    "'{owner}.{}' is an array, so '{full}' waits on one of its elements: make '{}' an array of as many registers, so element n waits on element n",
+                    u.reg, r.name
+                ))
+                .at(u.span),
+            ),
+            (Some((a, _)), Some((b, _))) if a != b => errors.push(
+                err(format!(
+                    "'{full}' has {a} registers but '{owner}.{}' has {b}: element n waits on element n, so they need as many",
+                    u.reg
+                ))
+                .at(u.span),
+            ),
+            _ => {}
+        }
+    }
+}
+
 /// Validate one register map: the registers of a device or device type.
 fn check_reg_map(what: &str, owner: &str, regs: &[RegDecl], errors: &mut Vec<AnalysisError>) {
+    check_untils(owner, regs, errors);
     let mut placed: Vec<(&RegDecl, u64, u64)> = Vec::new();
     for r in regs {
         let full = format!("{owner}.{}", r.name);
@@ -1767,8 +1831,29 @@ impl<'a> FnChecker<'a> {
     /// v2.4: `volatile_write(REG, address_of(name))` -- `name` goes to the
     /// hardware (@DMA) at the device that now holds its address.
     fn hand_to_hardware(&mut self, reg: &str, args: &[Expr], errors: &mut Vec<AnalysisError>) {
+        // v3.0: `address_of(Dev.REG)` -- a peripheral's register, for a
+        // transfer to or from it (an ADC's data register). Nothing changes
+        // hands: the register is the device's already.
+        if let [e] = args {
+            if !matches!(e, Expr::Ident(_)) {
+                if let Some(r) = self.device_ref(e) {
+                    if let Some(f) = r.field {
+                        errors.push(err(format!(
+                            "`address_of({}.{f})`: a field has no address of its own; write `address_of({})`",
+                            r.reg_text(),
+                            r.reg_text()
+                        )));
+                        return;
+                    }
+                    self.resolve_device_ref(&r, errors);
+                    return;
+                }
+            }
+        }
         let [Expr::Ident(name)] = args else {
-            errors.push(err("`address_of` takes one buffer: `address_of(buf)`"));
+            errors.push(err(
+                "`address_of` takes one buffer, `address_of(buf)`, or one device register, `address_of(Dev.REG)`",
+            ));
             return;
         };
         let what = format!("hand it to '{reg}'");
@@ -4002,6 +4087,65 @@ mod tests {
             ),
             "'a' is still owned by @DMA",
         );
+    }
+
+    #[test]
+    fn a_device_registers_address_goes_to_an_address_register_without_a_hand_off() {
+        // A transfer from a peripheral register (an ADC's data register)
+        // into a buffer: only the buffer changes hands.
+        check_src(&copier(
+            "device Adc @ 0x40012000 { DR: read u32 @ 0x4C { DATA: bits 0..=15 } CH[2]: read u32 @ 0x50; }
+             fn main() {
+                 buffer<u8, 8> a @RAM;
+                 volatile_write(Dma.SRC, address_of(Adc.DR));
+                 volatile_write(Dma.SRC, address_of(Adc.CH[1]));
+                 volatile_write(Dma.DEST, address_of(a));
+                 wait done for a;
+                 look(a);
+             }",
+        ))
+        .unwrap();
+        for (arg, msg) in [
+            ("Adc.DR.DATA", "`address_of(Adc.DR.DATA)`: a field has no address of its own; write `address_of(Adc.DR)`"),
+            ("Adc.NOPE", "device 'Adc' has no register 'NOPE'"),
+            ("Adc.CH[2]", "Adc.CH[2] is out of range"),
+            ("Adc.CH", "'Adc.CH' is an array of 2 registers; pick one"),
+        ] {
+            assert_single_error_containing(
+                &copier(&format!(
+                    "device Adc @ 0x40012000 {{ DR: read u32 @ 0x4C {{ DATA: bits 0..=15 }} CH[2]: read u32 @ 0x50; }}
+                     fn main() {{ volatile_write(Dma.SRC, address_of({arg})); }}"
+                )),
+                msg,
+            );
+        }
+    }
+
+    #[test]
+    fn an_address_register_says_when_the_device_is_done() {
+        check_src(
+            "device type Dma {
+                 CR[2]: read write u32 @ 0x10 step 0x18 { EN: bit 0 }
+                 M0AR[2]: read write u32 @ 0x1C step 0x18 address until CR.EN == 0;
+             }
+             device D @ 0x40000000 { DEST: read write u32 @ 0 address until ST.BUSY == 0; ST: read u32 @ 4 { BUSY: bit 0 } }
+             fn main() {}",
+        )
+        .unwrap();
+        for (map, msg) in [
+            ("A: read write u32 @ 0 address until NOPE.X == 0;", "'D.A' waits until 'D.NOPE', which is not a register of 'D'"),
+            ("A: read write u32 @ 0 address until S.X == 0; S: write u32 @ 4 { X: bit 0 }", "'D.S' is write-only: nothing can read whether the device is done"),
+            ("A: read write u32 @ 0 address until S.Y == 0; S: read u32 @ 4 { X: bit 0 }", "'D.S' has no field 'Y'"),
+            ("A: read write u32 @ 0 address until S.X == 2; S: read u32 @ 4 { X: bit 0 }", "2 does not fit in 'D.S.X' (1 bit)"),
+            ("A: read write u32 @ 0 address until S.X == 0; S[2]: read u32 @ 4 { X: bit 0 }", "'D.S' is an array, so 'D.A' waits on one of its elements"),
+            ("A[3]: read write u32 @ 0 address until S.X == 0; S[2]: read u32 @ 0x10 { X: bit 0 }", "'D.A' has 3 registers but 'D.S' has 2"),
+        ] {
+            let errs = check_src(&format!("device D @ 0x40000000 {{ {map} }} fn main() {{}}")).unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.message.contains(msg)),
+                "{map}: expected {msg:?}, got {errs:?}"
+            );
+        }
     }
 
     #[test]

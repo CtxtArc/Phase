@@ -335,6 +335,12 @@ fn hardware_examples_run_on_the_mps2_boards_under_qemu() {
         // Ten real PL081 DMA transfers, each half handed to `main` by the
         // controller's transfer-complete interrupt.
         ("mps2-an505", "dma_stream", STREAM),
+        // v3.0: `sync` waits until the channel's own ENABLE bit drops.
+        (
+            "mps2-an505",
+            "dma_sync",
+            "copy 1: all 64 words\ncopy 2: all 64 words\ncopy 3: all 64 words\ncopy 4: all 64 words\n",
+        ),
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_phase"))
             .current_dir(std::env::temp_dir())

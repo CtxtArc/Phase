@@ -88,9 +88,11 @@ static void wait_for_console_drain(void) {
 
 void phase_hw_puts(const char *s) {
     for (; *s; s++) {
+#if defined(PHASE_BOARD_NUCLEO_F401RE)
         if (*s == '\n') {
-            phase_hw_putc('\r');
+            phase_hw_putc('\r'); /* a serial terminal wants CR LF */
         }
+#endif
         phase_hw_putc(*s);
     }
 }

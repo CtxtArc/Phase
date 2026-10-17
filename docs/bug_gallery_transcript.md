@@ -34,6 +34,12 @@ OK: examples/counting_loop.phase parsed and passed domain/ownership analysis (0 
 OK: examples/dma_stream.phase parsed and passed domain/ownership analysis (0 entities, 4 fns, 2 files)
 ```
 
+### `examples/dma_sync.phase`
+
+```
+OK: examples/dma_sync.phase parsed and passed domain/ownership analysis (0 entities, 1 fn, 2 files)
+```
+
 ### `examples/hw_uart_echo.phase`
 
 ```
@@ -56,6 +62,24 @@ OK: examples/mmio_registers.phase parsed and passed domain/ownership analysis (0
 
 ```
 OK: examples/multi_rate.phase parsed and passed domain/ownership analysis (1 entity, 3 fns)
+```
+
+### `examples/nucleo_adc_dma.phase`
+
+```
+OK: examples/nucleo_adc_dma.phase parsed and passed domain/ownership analysis (0 entities, 3 fns, 2 files)
+```
+
+### `examples/nucleo_blink.phase`
+
+```
+OK: examples/nucleo_blink.phase parsed and passed domain/ownership analysis (0 entities, 2 fns, 2 files)
+```
+
+### `examples/nucleo_dma_copy.phase`
+
+```
+OK: examples/nucleo_dma_copy.phase parsed and passed domain/ownership analysis (0 entities, 5 fns, 2 files)
 ```
 
 ### `examples/overlapped_capture.phase`

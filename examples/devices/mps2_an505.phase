@@ -43,11 +43,12 @@ device type Pl081 {
 
     // Channel n's registers are at 0x100 + 0x20 * n. SRC and DEST hold
     // the addresses a transfer copies from and to: writing
-    // `address_of(buf)` to one hands `buf` to the controller. LLI is the
-    // next transfer in a chain (0: none).
-    CSRC[2]:  read write u32 @ 0x100 step 0x20 address;
-    CDEST[2]: read write u32 @ 0x104 step 0x20 address;
-    CLLI[2]:  read write u32 @ 0x108 step 0x20 address;
+    // `address_of(buf)` to one hands `buf` to the controller, until the
+    // channel turns itself off at the end of the transfer -- what
+    // `sync(buf)` waits for. LLI is the next transfer in a chain (0: none).
+    CSRC[2]:  read write u32 @ 0x100 step 0x20 address until CCONFIG.ENABLE == 0;
+    CDEST[2]: read write u32 @ 0x104 step 0x20 address until CCONFIG.ENABLE == 0;
+    CLLI[2]:  read write u32 @ 0x108 step 0x20 address until CCONFIG.ENABLE == 0;
     CCONTROL[2]: read write u32 @ 0x10C step 0x20 {
         SIZE: bits 0..=11, SWIDTH: bits 18..=20, DWIDTH: bits 21..=23,
         SRC_INC: bit 26, DEST_INC: bit 27, TC_IRQ: bit 31

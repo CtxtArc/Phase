@@ -98,7 +98,9 @@ const BRR_115200_AT_16MHZ: u32 = 8 << 4 | 11;
 // the source and M0AR the destination. CHSEL picks which peripheral
 // request drives the stream (RM0368 table 28: ADC1 is DMA2 stream 0 or 4,
 // channel 0). Writing `address_of(buf)` to PAR or M0AR hands `buf` to the
-// controller; writing `address_of(Dev.REG)` names a peripheral register.
+// controller, until the stream clears its EN bit at the end of the
+// transfer: `sync(buf)` waits for that. (A circular stream never clears
+// it; stop one by writing CR first.)
 //
 // Flags: LISR has streams 0-3, HISR streams 4-7, each at bit 0, 6, 16 and
 // 22 of its register (FEIF +0, DMEIF +2, TEIF +3, HTIF +4, TCIF +5).
@@ -127,9 +129,9 @@ device type Stm32Dma {
         PBURST: bits 21..=22, MBURST: bits 23..=24, CHSEL: bits 25..=27
     }
     NDTR[8]: read write u32 @ 0x14 step 0x18 { NDT: bits 0..=15 }
-    PAR[8]:  read write u32 @ 0x18 step 0x18 address;
-    M0AR[8]: read write u32 @ 0x1C step 0x18 address;
-    M1AR[8]: read write u32 @ 0x20 step 0x18 address;
+    PAR[8]:  read write u32 @ 0x18 step 0x18 address until CR.EN == 0;
+    M0AR[8]: read write u32 @ 0x1C step 0x18 address until CR.EN == 0;
+    M1AR[8]: read write u32 @ 0x20 step 0x18 address until CR.EN == 0;
     FCR[8]:  read write u32 @ 0x24 step 0x18 { FTH: bits 0..=1, DMDIS: bit 2, FS: bits 3..=5, FEIE: bit 7 }
 }
 

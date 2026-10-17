@@ -37,6 +37,21 @@ Toward 3.0: PHASE on a real board, and inside other people's projects.
 - `docs/boundary.md`: what the C side must promise for PHASE's checks to
   hold — behind an `extern fn`, and calling into PHASE.
 - `runtime/hw/phase_hw.h`: console output for C externs on every board.
+- **`sync` waits on the device itself**: an `address` register can say
+  when the device is done with the memory it was given —
+  `M0AR[8]: .. address until CR.EN == 0`. `sync(buf)` on a buffer handed
+  over through it polls that register (the stream's own EN bit, the PL081
+  channel's ENABLE) instead of a stand-in; a buffer handed over by an
+  extern still uses the runtime's wait. Both board files declare it, and
+  `examples/dma_sync.phase` shows it on QEMU's PL081. A host build whose
+  simulated device never finishes stops with a message instead of hanging.
+- **`address_of(Dev.REG)`**: a peripheral register's address, for a
+  transfer to or from it (a DMA stream reading an ADC's data register).
+  Nothing changes hands.
+- `examples/nucleo_adc_dma.phase`: ADC1 sampling the chip's internal
+  reference into a buffer through DMA2, written entirely in PHASE and
+  `sync`ed on the stream; the C side checks the readings against ST's
+  factory calibration and prints the supply voltage.
 
 ### Changed
 

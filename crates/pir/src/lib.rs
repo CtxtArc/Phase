@@ -153,6 +153,21 @@ pub struct RegRef {
     /// `Dev.REG[i]` as written, for messages (`reg` is the element's C
     /// name, `REG_i`).
     pub display: String,
+    /// v3.0: for an `address .. until` register, when the device is done
+    /// with the memory it was given -- what `sync` waits for.
+    pub until: Option<PirUntil>,
+}
+
+/// `until REG.FIELD == VALUE`, resolved to the register element it reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PirUntil {
+    /// The C name of the register it reads (`CR_0`).
+    pub reg: String,
+    pub lo: u32,
+    pub hi: u32,
+    pub value: u64,
+    /// `Dma2.CR[0].EN == 0`, for messages.
+    pub display: String,
 }
 
 /// A `device` (v2.0), for codegen to lay out: its registers are its own,
@@ -205,6 +220,9 @@ pub enum CallArg {
     /// `address_of(buf)` (v2.4), written to an `address` register: the
     /// buffer's address, and its hand-off to the hardware.
     Address(String),
+    /// `address_of(Dev.REG)` (v3.0): a peripheral register's address, for
+    /// a transfer to or from it. Nothing changes hands.
+    RegAddress(RegRef),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1203,6 +1221,22 @@ impl<'a> Lowerer<'a> {
                 .map(mask)
                 .fold(0, |a, b| a | b)
         };
+        let index = p.index.and_then(|i| self.const_value(i));
+        let until = r.until.as_ref().and_then(|u| {
+            let target = find_reg(self.devices.get(p.device)?, &u.reg)?;
+            let f = target.field(&u.field)?;
+            let (creg, shown) = match (target.array, index) {
+                (Some(_), Some(i)) => (format!("{}_{i}", u.reg), format!("{}[{i}]", u.reg)),
+                _ => (u.reg.clone(), u.reg.clone()),
+            };
+            Some(PirUntil {
+                reg: creg,
+                lo: f.lo,
+                hi: f.hi,
+                value: u.value,
+                display: format!("{}.{shown}.{} == {}", p.device, u.field, u.value),
+            })
+        });
         Some(RegRef {
             device: p.device.to_string(),
             reg,
@@ -1214,6 +1248,7 @@ impl<'a> Lowerer<'a> {
             rcw0_others: others(FieldKind::RcW0),
             rc_others: others(FieldKind::Rc) != 0,
             display,
+            until,
         })
     }
 
@@ -1233,6 +1268,9 @@ impl<'a> Lowerer<'a> {
                 Expr::Ident(n) => CallArg::Entity(n.clone()),
                 Expr::Call { callee, args } if callee == "address_of" => match args.as_slice() {
                     [Expr::Ident(b)] => CallArg::Address(b.clone()),
+                    [e] if self.reg_ref(e).is_some() => {
+                        CallArg::RegAddress(self.reg_ref(e).expect("checked"))
+                    }
                     _ => {
                         return Err(PirError::UnsupportedExpr {
                             context: format!("address_of in '{context}'"),

@@ -1,0 +1,67 @@
+// An ADC-to-memory DMA driver for the NUCLEO-F401RE, in PHASE: the bar
+// for 3.0. ADC1 measures the chip's internal reference voltage (VREFINT,
+// channel 17) over and over; DMA2 stream 0 moves each conversion from the
+// ADC's data register into a buffer, 64 samples a round. No wiring: the
+// signal is inside the chip.
+//
+// The hand-off is all PHASE: writing `address_of(samples)` to the
+// stream's M0AR gives the buffer to the controller, and `sync(samples)`
+// takes it back once the stream says it is done -- the board file declares
+// M0AR `until CR.EN == 0`, and the stream clears EN after its last
+// transfer -- so `sync` reads the stream's own register, not a guess. The
+// stream reads the ADC through `address_of(Adc1.DR)`: a register's
+// address, which changes no hands.
+//
+//   phase build --target=nucleo-f401re --run examples/nucleo_adc_dma.phase
+//
+// prints each round's average next to the factory calibration value ST
+// stores in the chip (VREFINT_CAL, measured at 3.3 V), and the supply
+// voltage that works out to. A host build runs it against a simulated ADC
+// and DMA (runtime/nucleo_adc_dma_extern.c).
+
+import "devices/nucleo_f401re.phase";
+
+extern fn report(samples: read buffer<u16, 64> @RAM);
+
+const SAMPLES: u32 = 64;
+// Peripheral to memory, channel 0 (ADC1), 16-bit items, the memory address
+// advancing; no interrupt: `sync` watches the stream instead.
+const ADC_TO_MEMORY: u32 = 0 << 25 | DMA_PERIPH_TO_MEM | DMA_MINC | DMA_PSIZE_16 | DMA_MSIZE_16;
+
+fn adc_init() {
+    volatile_write(Rcc.APB2ENR.ADC1EN, 1);
+    volatile_write(Rcc.AHB1ENR.DMA2EN, 1);
+    volatile_write(AdcCommon.CCR.ADCPRE, 0);            // ADC clock: 16 MHz / 2
+    volatile_write(AdcCommon.CCR.TSVREFE, 1);           // connect VREFINT to channel 17
+    volatile_write(Adc1.SMPR1.SMP17, ADC_SMP_480);      // VREFINT needs >= 10 us
+    volatile_write(Adc1.SQR1.L, 0);                     // one channel in the sequence:
+    volatile_write(Adc1.SQR3.SQ1, ADC_CH_VREFINT);      // channel 17
+    volatile_write(Adc1.CR2.CONT, 1);                   // convert continuously
+    volatile_write(Adc1.CR2.ADON, 1);
+}
+
+// One round: 64 conversions into `samples`, then back to the CPU.
+fn sample(samples: write buffer<u16, 64> @RAM) {
+    volatile_write(Adc1.CR2.DMA, 0);                    // re-arm the ADC's DMA requests
+    volatile_write(Adc1.SR, 0);                         // clear OVR and EOC (rc_w0)
+    volatile_write(Dma2.LIFCR, DMA_ALL_FLAGS_0);
+    volatile_write(Dma2.PAR[0], address_of(Adc1.DR));
+    volatile_write(Dma2.M0AR[0], address_of(samples));  // samples: the controller's now
+    volatile_write(Dma2.NDTR[0], SAMPLES);
+    volatile_write(Dma2.CR[0], ADC_TO_MEMORY | DMA_EN);
+    volatile_write(Adc1.CR2.DMA, 1);
+    volatile_write(Adc1.CR2.SWSTART, 1);
+    sync(samples);                                      // until Dma2.CR[0].EN == 0
+}
+
+fn main() {
+    adc_init();
+    buffer<u16, 64> samples @RAM;
+    let n: u32 = 0;
+    while n < 5 {
+        sample(samples);
+        report(samples);
+        n = n + 1;
+    }
+    volatile_write(Adc1.CR2, 0);                        // ADC off
+}

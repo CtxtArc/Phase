@@ -735,7 +735,11 @@ fn emit_c_writes_c_that_lives_next_to_a_vendor_header() {
         .args(["emit-c", "--out-dir=gen", "src/driver.phase"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     for f in ["driver.gen.c", "driver.gen.h", "phase_runtime.h"] {
         assert!(dir.join("gen").join(f).is_file(), "{f} not written");
     }
@@ -755,7 +759,9 @@ fn emit_c_writes_c_that_lives_next_to_a_vendor_header() {
     let cc = |defines: &[&str]| {
         Command::new("cc")
             .current_dir(&dir)
-            .args(["-std=c11", "-Wall", "-Werror", "-c", "-o", "app.o", "-Igen", "-I."])
+            .args([
+                "-std=c11", "-Wall", "-Werror", "-c", "-o", "app.o", "-Igen", "-I.",
+            ])
             .args(defines)
             .arg("app.c")
             .output()
@@ -764,7 +770,11 @@ fn emit_c_writes_c_that_lives_next_to_a_vendor_header() {
     // With PHASE_NO_SHORT_NAMES, the generated header only adds PHASE_
     // names: it compiles next to the vendor's, both sets of names usable.
     let ok = cc(&["-DPHASE_TARGET_HW", "-DPHASE_NO_SHORT_NAMES"]);
-    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
     // Without it the short names collide -- which is what the define is for.
     let clash = cc(&["-DPHASE_TARGET_HW"]);
     assert!(!clash.status.success());

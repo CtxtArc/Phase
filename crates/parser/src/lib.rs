@@ -390,6 +390,25 @@ impl Parser {
         if address {
             self.bump();
         }
+        // v3.0: `address until REG.FIELD == N` -- when the device is done.
+        let until = if address && matches!(self.peek(), TokenKind::Ident(w) if w == "until") {
+            self.bump();
+            let span = self.peek_span();
+            let reg = self.expect_ident()?;
+            self.expect(TokenKind::Dot)?;
+            let field = self.expect_ident()?;
+            self.expect(TokenKind::EqEq)?;
+            let value = self.expect_uint("the value that means done")?;
+            Some(Until {
+                reg,
+                field,
+                value,
+                span,
+                element: None,
+            })
+        } else {
+            None
+        };
         let mut fields = Vec::new();
         if self.at(&TokenKind::LBrace) {
             self.bump();
@@ -455,6 +474,7 @@ impl Parser {
             fields,
             array,
             address,
+            until,
         })
     }
 
@@ -1928,8 +1948,25 @@ mod tests {
         assert_eq!(e.name, "tick");
         let Item::Fn(h) = &p.items[1] else { panic!() };
         assert_eq!(h.irq.map(|(n, _)| n), Some(8));
+        // v3.0: an address register can say when the device is done.
+        let d = parse("device D @ 0 { A[2]: read write u32 @ 0 address until C.EN == 0; C[2]: read u32 @ 8 { EN: bit 0 } }").unwrap();
+        let Item::Device(dev) = &d.items[0] else {
+            panic!()
+        };
+        let u = dev.regs[0].until.as_ref().unwrap();
+        assert_eq!((u.reg.as_str(), u.field.as_str(), u.value), ("C", "EN", 0));
+        assert_eq!(
+            dev.regs[0].elements()[1]
+                .until
+                .as_ref()
+                .unwrap()
+                .reg_element(true),
+            "C_1"
+        );
+        assert!(parse("device D @ 0 { A: read write u32 @ 0 until C.EN == 0; }").is_err());
         // v3.0: or by a constant, resolved once the program is parsed.
-        let q = parse("const TIM2_IRQn: u32 = 4 * 7; interrupt fn t() @ irq TIM2_IRQn { }").unwrap();
+        let q =
+            parse("const TIM2_IRQn: u32 = 4 * 7; interrupt fn t() @ irq TIM2_IRQn { }").unwrap();
         let Item::Fn(t) = &q.items[1] else { panic!() };
         assert_eq!(t.irq.map(|(n, _)| n), Some(28));
         assert_eq!(t.irq_name.as_deref(), Some("TIM2_IRQn"));

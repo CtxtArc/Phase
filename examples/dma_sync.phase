@@ -1,0 +1,41 @@
+// `sync` that waits for the DMA controller itself (v3.0).
+//
+// The AN505's PL081 copies a block from `src` to `dst`. Writing the two
+// addresses into the channel's SRC and DEST registers hands both buffers
+// to the controller; the board file declares those registers
+// `address until CCONFIG.ENABLE == 0` -- the channel turns itself off when
+// the copy is done -- so `sync(dst)` waits for exactly that, reading the
+// channel's own register, and gives the buffer back. No interrupt, no
+// guess, and nothing in C.
+//
+//   phase build --target=mps2-an505 --run examples/dma_sync.phase
+//
+// runs it on QEMU's model of the board; a host build runs it against a
+// simulated PL081 (runtime/dma_sync_extern.c).
+
+import "devices/mps2_an505.phase";
+
+extern fn fill(b: write buffer<u32, 64> @RAM);
+extern fn verify(b: read buffer<u32, 64> @RAM);
+
+const WORD: u32 = 2;   // 32-bit transfers
+const COPY: u32 = 64 | WORD << 18 | WORD << 21 | 1 << 26 | 1 << 27;   // +SRC_INC +DEST_INC
+
+fn main() {
+    volatile_write(Dma0.CONFIG.ENABLE, 1);
+    buffer<u32, 64> src @RAM;
+    buffer<u32, 64> dst @RAM;
+    let n: u32 = 0;
+    while n < 4 {
+        fill(src);
+        volatile_write(Dma0.CSRC[0], address_of(src));
+        volatile_write(Dma0.CDEST[0], address_of(dst));
+        volatile_write(Dma0.CLLI[0], 0);
+        volatile_write(Dma0.CCONTROL[0], COPY);
+        volatile_write(Dma0.CCONFIG[0], PL081_MEM_TO_MEM | PL081_ENABLE);
+        sync(src);    // until Dma0.CCONFIG[0].ENABLE == 0
+        sync(dst);
+        verify(dst);
+        n = n + 1;
+    }
+}

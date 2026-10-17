@@ -419,6 +419,35 @@ pub struct RegDecl {
     /// device reads or writes (a DMA source or destination). Writing
     /// `address_of(buf)` to it hands `buf` to the hardware.
     pub address: bool,
+    /// `address until CR.EN == 0` (v3.0): when the hardware is done with a
+    /// buffer handed over through this register -- what `sync` waits for.
+    pub until: Option<Until>,
+}
+
+/// `until REG.FIELD == VALUE` on an `address` register (v3.0): the
+/// condition under which the device is done with the memory whose address
+/// it was given. `REG` is a register of the same device; if both are
+/// arrays, element `n` of one pairs with element `n` of the other.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Until {
+    pub reg: String,
+    pub field: String,
+    pub value: u64,
+    pub span: Span,
+    /// Set by [`RegDecl::elements`]: which element of an array address
+    /// register this is, so the condition can name the same element.
+    pub element: Option<u32>,
+}
+
+impl Until {
+    /// The C name of the register the condition reads, for the address
+    /// register's element `self.element`, given whether `REG` is an array.
+    pub fn reg_element(&self, target_is_array: bool) -> String {
+        match (target_is_array, self.element) {
+            (true, Some(n)) => format!("{}_{n}", self.reg),
+            _ => self.reg.clone(),
+        }
+    }
 }
 
 /// `device Uart0 @ 0x40004000 { .. }` (v2.0): a peripheral's register map;
@@ -494,6 +523,10 @@ impl RegDecl {
                     name: format!("{}_{n}", self.name),
                     offset: self.offset + u64::from(n) * step,
                     array: None,
+                    until: self.until.clone().map(|u| Until {
+                        element: Some(n),
+                        ..u
+                    }),
                     ..self.clone()
                 })
                 .collect(),

@@ -832,3 +832,68 @@ fn an_address_hand_off_runs_clean_and_the_hardware_sees_the_buffer() {
     assert_eq!(code, 0, "{stderr}");
     assert!(stderr.contains("hw wrote 42"), "{stderr}");
 }
+
+// ---- v3.0: `sync` waits on the device's own register ------------------------
+
+const UNTIL_DEV: &str = r#"
+    device Dma @ 0x40000000 {
+        DEST: read write u32 @ 0x00 address until CTRL.BUSY == 0;
+        CTRL: read write u32 @ 0x04 = 0 { BUSY: bit 0 }
+    }
+"#;
+
+fn until_prog(body: &str) -> String {
+    format!("{SIGS}\n{UNTIL_DEV}\n{body}")
+}
+
+#[test]
+fn sync_polls_the_devices_own_register_until_it_says_done() {
+    // The simulated device takes three steps to finish.
+    let sim = "\n#include \"phase_runtime.h\"\n#include <stdio.h>\nstatic int steps;\n\
+        void phase_sim_hardware(void) {\n    if (PHASE_DEV_Dma->CTRL & 1u) {\n        if (++steps == 3) {\n            \
+        unsigned char *p = phase_addr_get(&PHASE_DEV_Dma->DEST);\n            p[0] = 7;\n            \
+        PHASE_DEV_Dma->CTRL = 0;\n        }\n    }\n    fprintf(stderr, \"step %d\\n\", steps);\n}\n";
+    let (code, stderr) = run_unanalyzed_with(
+        "rt_until_ok",
+        &until_prog(
+            "fn main() {
+                 buffer<u8, 8> a @RAM;
+                 volatile_write(Dma.DEST, address_of(a));
+                 volatile_write(Dma.CTRL, 1);
+                 sync(a);
+                 look(a);
+             }",
+        ),
+        1,
+        sim,
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains("step 1\nstep 2\nstep 3\n"), "{stderr}");
+    assert_eq!(
+        stderr.matches("step ").count(),
+        3,
+        "it stopped polling once done: {stderr}"
+    );
+}
+
+#[test]
+fn sync_on_a_device_that_never_finishes_stops_instead_of_hanging() {
+    let (code, stderr) = run_unanalyzed_with(
+        "rt_until_stuck",
+        &until_prog(
+            "fn main() {
+                 buffer<u8, 8> a @RAM;
+                 volatile_write(Dma.DEST, address_of(a));
+                 volatile_write(Dma.CTRL, 1);
+                 sync(a);
+             }",
+        ),
+        1,
+        "\nvoid phase_sim_hardware(void) {}\n",
+    );
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("`sync(a)` never returns: Dma.CTRL.BUSY == 0 never holds"),
+        "{stderr}"
+    );
+}
