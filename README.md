@@ -545,14 +545,17 @@ has to discover the hard way:
   but not at run time, and the fuzzer uses three buffer types, one
   typestate machine and one device. Their silence is strong evidence for
   the rules they exercise, not a proof of everything.
-- **Two hardware targets, both emulated.** `--target=mps2-an385` (ARM
-  Cortex-M3) and `--target=mps2-an505` (Cortex-M33 with PL081 DMA),
-  validated on QEMU's models of the boards, not yet on silicon. Another
+- **Three hardware targets, none yet proven on silicon.**
+  `--target=mps2-an385` (ARM Cortex-M3) and `--target=mps2-an505`
+  (Cortex-M33 with PL081 DMA) are validated on QEMU's models of the
+  boards. `--target=nucleo-f401re` is a real board: its board file is
+  checked against ST's header and its programs partly on QEMU's STM32F405
+  model, but its DMA and ADC programs have yet to run on the chip. Another
   board needs its own startup code, linker script and wait functions
-  under `runtime/`. `@DMA` is one domain: PHASE knows a buffer is the
-  hardware's, and (since 2.4) at which register it was handed over, but
-  not which engine must finish before `sync` may return — `sync` on a
-  board still waits on a stand-in, and `wait E for b` on the program's
+  under `runtime/`. `sync` waits on the device itself only for a buffer
+  handed over through a register that says when the device is done
+  (`address until CR.EN == 0`, since 3.0); one handed over by a C extern
+  still waits on a stand-in, and `wait E for b` relies on the program's
   word that `E` means `b` is done. What else real boards need is in
   [`docs/real_boards.md`](docs/real_boards.md).
 - **Interrupts are modeled simply.** One core, one priority level
@@ -600,17 +603,24 @@ addresses written from PHASE as checked hand-offs. 2.3 let interrupts
 hand buffers to `main`, fuzzed register and interrupt code, and added
 hover and go-to-definition; 2.2 brought interrupts, 2.1 imports and
 device types, 2.0 register maps, a Cortex-M3 target and the language
-server (see [`CHANGELOG.md`](CHANGELOG.md)). Next — 3.0 is the
-real-board release:
+server (see [`CHANGELOG.md`](CHANGELOG.md)).
+
+3.0 is the real-board release, and its pieces are in
+([`CHANGELOG.md`](CHANGELOG.md), Unreleased): a NUCLEO-F401RE target with a
+board file checked against ST's own header, `sync` that waits on the DMA
+stream itself, an ADC-to-memory DMA driver written in PHASE down to the
+hand-off, board files imported from CMSIS-SVD, and `phase emit-c` for
+using PHASE as one checked layer inside an existing STM32 project
+([`docs/embedding.md`](docs/embedding.md),
+[`docs/boundary.md`](docs/boundary.md)). It ships once the three NUCLEO
+programs have run on the board ([`docs/nucleo.md`](docs/nucleo.md)).
+After that:
 
 - **The VS Code extension**, packaged as a `.vsix` and tried installed.
+- **Per-engine domains, static buffers, memory regions and caches** — the
+  rest of [`docs/real_boards.md`](docs/real_boards.md).
 - **M12 — An LLVM backend**, removing the dependency on an external `cc`
   ([`phase_specification.md`](phase_specification.md) §9).
-- **Real boards** — an STM32 Nucleo, with its own DMA controller and
-  interrupts, run on silicon instead of QEMU. What the language needs for
-  that is in [`docs/real_boards.md`](docs/real_boards.md).
-- **More from the language server** — completion of names and register
-  fields, rename.
 
 For the complete language specification, domain model, type system, and
 full milestone roadmap, see

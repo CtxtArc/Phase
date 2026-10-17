@@ -1,6 +1,6 @@
 # What PHASE needs to survive real boards
 
-PHASE 2.3 runs on two QEMU boards: the MPS2 AN385 and the AN505, which has
+PHASE 2.3 ran on two QEMU boards: the MPS2 AN385 and the AN505, which has
 a DMA controller. QEMU is a forgiving board. Its DMA finishes the instant
 a channel starts, it has no caches or clocks to enable, it has a single
 interrupt priority in practice, and no device ever fails. This is the
@@ -9,8 +9,8 @@ or similar board: the plan for 3.0. Each item says what breaks today, and
 roughly what would fix it.
 
 Items marked **(v3 core)** are the ones a real driver can't do without.
-Items marked **Done in 2.4** have been built since this list was
-written.
+Items marked **Done in 2.4** or **Done for 3.0** have been built since
+this list was written.
 
 ## 1. Describing real hardware
 
@@ -18,7 +18,9 @@ written.
   of registers per peripheral family, and every vendor ships them as a
   CMSIS-SVD file. Writing board files by hand doesn't scale and invites
   typos. Needed: a `phase svd` command that turns an SVD file into a
-  board file, so the declared map is the vendor's.
+  board file, so the declared map is the vendor's. **Done for 3.0**:
+  `phase import-svd` (docs/svd_import.md); ST's whole STM32F401 SVD
+  imports into a file `phase check` accepts.
 - **Arrays of registers and repeated blocks (v3 core).** An STM32F4 DMA
   controller has 8 streams with identical register sets, a GPIO port has
   16 identical pin fields, and the NVIC has 8 enable registers. Today each
@@ -69,7 +71,12 @@ written.
   engine to wait for. On real hardware it does, because the runtime's
   `sync` on the AN385 still polls the UART as a stand-in. Needed: domains
   parameterized by the engine (`@DMA(Dma2.S0)`), with `sync` and
-  `wait E for b` tied to that engine's own completion flag.
+  `wait E for b` tied to that engine's own completion flag. **Done for
+  3.0, the part that matters at run time**: an `address` register says when
+  its device is done (`until CR.EN == 0`) and `sync` waits for exactly
+  that. Still to do: the static half — telling two streams apart in the
+  type system, so reprogramming a stream that still owns a buffer is a
+  compile-time error.
 - **Where a buffer lives (v3 core).** Not all memory is reachable by DMA.
   On an STM32F4 the CCM RAM isn't, and on an H7 the DTCM isn't reachable
   by DMA1/DMA2. A buffer on `main`'s stack lands wherever the stack is.
@@ -100,7 +107,9 @@ written.
 - **Peripheral-driven transfers.** The AN505's PL081 has no request lines
   wired in QEMU, so only memory-to-memory transfers were tested. ADC-to-
   memory and memory-to-UART transfers, paced by the peripheral, need a
-  real board.
+  real board. **Done for 3.0, pending the board**: `address_of(Adc1.DR)`
+  names a peripheral register as a transfer's source, and
+  `examples/nucleo_adc_dma.phase` samples ADC1 through DMA2.
 
 ## 3. Interrupts and concurrency
 
@@ -149,40 +158,48 @@ written.
   C: startup, linker script and register header under `runtime/hw/`.
   Needed: a target file (CPU, memory regions, vector count, flash and RAM
   layout) and `--target=nucleo-f446re` built from it. Board support would
-  then be data, not code.
+  then be data, not code. **Partly done for 3.0**: `--target=nucleo-f401re`
+  is one more entry in the driver's board table, with its own linker
+  script and board hooks; a target file is still to do.
 - **Flashing and running on silicon (v3 core).** `--run` starts QEMU.
   Needed: flashing and running through a debug probe (probe-rs or
   OpenOCD), with the program's output over semihosting, RTT or the board's
   virtual COM port, and a hardware-in-the-loop test that CI can run when a
-  board is attached.
+  board is attached. **Done for 3.0, except CI**: `--run` flashes the
+  NUCLEO with probe-rs, OpenOCD or st-flash and shows its virtual COM
+  port.
 - **Living next to vendor code.** Real projects keep the vendor's HAL or
   CMSIS headers for everything PHASE doesn't cover. The generated C
   defines device names as macros (`#define Uart0 …`) that can clash with
   CMSIS, and its handler names (`IRQ57_Handler`) aren't the vendor's
   (`DMA2_Stream0_IRQHandler`). Needed: prefixed generated names, and
-  handlers that take the vendor's vector names.
+  handlers that take the vendor's vector names. **Done for 3.0**:
+  `PHASE_`-prefixed names, `PHASE_NO_SHORT_NAMES`, CMSIS handler names,
+  `phase emit-c` (docs/embedding.md) and the boundary contract
+  (docs/boundary.md).
 - **Debugging PHASE, not the generated C.** `#line` directives in the
   generated C, so a debugger steps through `.phase` lines.
 - **Size and stack.** Builds use `-O1` and put buffers on the stack.
   Needed: size-optimized builds, a stack-usage report, and a check that
   declared buffers fit the target's RAM.
 
-## Order of work for 3.0
+## Order of work
 
 2.4 did the parts of this that don't need a physical board: bit
 operations and constants, register arrays, `w1c`/`rc`/`rc_w0` fields, and
-buffer addresses in PHASE. What is left, in order:
+buffer addresses in PHASE. Since then: the NUCLEO-F401RE target that
+flashes and runs, SVD import, `sync` tied to the device's own done flag,
+peripheral registers as transfer sources, and the interop pieces. That is
+enough for an ADC-to-memory DMA driver in PHASE without C for the
+hand-off — `examples/nucleo_adc_dma.phase` — which is the "survives a
+real board" bar for 3.0, once it has run on the board.
 
-1. A target description and an STM32 Nucleo target that flashes and runs:
-   nothing else can be validated without it.
-2. SVD import (register clusters and named field values with it).
-3. Domains per engine, and `sync` tied to the engine's real completion
-   flag.
-4. Memory regions, static buffers and alignment, plus cache maintenance
-   if the board is a Cortex-M7.
-5. Interrupt priorities and counting events.
-6. Shared data with handlers, timeouts and error events.
+After 3.0, in order:
 
-Items 1–3, with what 2.4 added, are enough to write a real ADC-to-memory
-DMA driver on a Nucleo in PHASE without C for the hand-off. That is the
-"survives a real board" bar for 3.0.
+1. Per-engine domains in the type system (two streams told apart at
+   compile time).
+2. Memory regions, static buffers and alignment, plus cache maintenance
+   for Cortex-M7 parts.
+3. Interrupt priorities and counting events.
+4. Shared data with handlers, timeouts and error events.
+5. A target description file, so a new board is data rather than code.

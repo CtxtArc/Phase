@@ -228,7 +228,9 @@ sync(radio_buf);
 ```
 
 Makes a `DeviceOwned` entity `Owned` and CPU-visible again. Lowers to a
-runtime wait on the simulated (or real) transfer engine.
+runtime wait on the simulated (or real) transfer engine — or, since v3.0,
+for a buffer handed over through an `address .. until` register, to a
+wait on that device's own register (§3.7).
 
 ### 3.6 borrow / release
 
@@ -392,6 +394,35 @@ checked code: before 2.4 it was a C extern's job. In C, the register gets
 the buffer's address; a host build, whose pointers are wider than 32
 bits, also records the pointer so simulated hardware can find the memory
 (`phase_addr_get(&Dev->REG)`, `runtime/phase_runtime.h`).
+
+**When the device is done (v3.0).** An address register can say how the
+device signals that it has finished with the memory:
+
+```phase
+CR[8]:   read write u32 @ 0x10 step 0x18 { EN: bit 0, TCIE: bit 4 }
+M0AR[8]: read write u32 @ 0x1C step 0x18 address until CR.EN == 0;
+```
+
+`until REG.FIELD == N` names a readable field of the same device (or
+device type) and the value that means done; if `REG` is an array, the
+address register must be one with as many elements, and element `n` waits
+on element `n` (`M0AR[3]` until `CR[3].EN == 0`). `sync(buf)` on a buffer
+handed over through such a register waits until the condition holds,
+reading the device's own register, and then gives the buffer back. The
+generated C remembers, per register element, which buffer it was last
+given; `sync` on a buffer handed over some other way (an extern with a
+`@RAM -> @DMA` parameter) still calls the runtime's wait, and
+`wait E for buf` forgets the buffer. In a host build the simulated
+hardware (`phase_sim_hardware`) runs between two reads of the condition,
+and a condition that never holds stops the program with a message.
+
+**A register's address (v3.0).** `address_of(Dev.REG)` (or
+`address_of(Dev.REG[i])`) writes the bus address of a device register to
+an address register: the source or destination of a transfer that reads
+or writes a peripheral, like a DMA stream draining an ADC's data register
+(`volatile_write(Dma2.PAR[0], address_of(Adc1.DR))`). Nothing changes
+hands — the register is the device's already. A field has no address of
+its own (`address_of(Adc1.DR.DATA)` is an error).
 
 The pre-2.0 form, a bare register name tagged `@MMIO`, is still accepted
 and becomes a simulated `uint32_t` register:
@@ -667,7 +698,11 @@ fn main() {
 
 (v2.2.) `interrupt fn NAME() @ irq N { .. }` is the handler for external
 interrupt `N` (0–239 on a Cortex-M): the hardware calls it, between any
-two instructions of the code it interrupts. It takes no parameters and
+two instructions of the code it interrupts. Since v3.0 `N` can be a
+constant (`@ irq TIM2_IRQn`, with `const TIM2_IRQn: u32 = 28;`), and a
+constant named the CMSIS way, `<Name>_IRQn`, also emits the handler under
+the name a vendor's startup file gives that vector, `<Name>_IRQHandler`
+(spec §5.4). It takes no parameters and
 returns nothing, it is never called directly, and each IRQ has at most
 one handler. `event NAME;` declares an event: `signal E;` raises it, and
 `wait E;` sleeps until it is raised, then clears it. An event is a flag,
@@ -893,8 +928,9 @@ For every program `phase check` accepts, within a function body:
   in range. No field write writes back and clears another `w1c` flag,
   races an `rc_w0` flag, or reads a read-clear register, and no field read
   clears another `rc` field. A buffer's address goes to the hardware only
-  through an `address` register, as the hand-off of a buffer the CPU owns.
-  The register map itself is laid out exactly as declared, which the C
+  through an `address` register, as the hand-off of a buffer the CPU owns,
+  and `sync` on it waits for the device's own done condition when the
+  register declares one (`until`). The register map itself is laid out exactly as declared, which the C
   compiler checks.
 - **Interrupts.** No field write in thread code can lose a write made by
   an interrupt handler (it is inside `critical`, or no handler writes that
@@ -992,7 +1028,54 @@ QEMU's PL081 can't loop (a circular linked list of transfers would never
 finish inside one register write) and has no peripheral request lines, so
 the stream is double-buffered, not circular, and memory to memory. The
 same program also builds for the host, where `runtime/dma_stream_extern.c`
-plays the PL081 in `phase_sim_hardware()`.
+plays the PL081 in `phase_sim_hardware()`. `examples/dma_sync.phase` (v3.0)
+copies with the same controller and takes the buffers back with `sync`,
+which waits until the channel's own ENABLE bit drops (§3.7).
+
+**A real board: the NUCLEO-F401RE (v3.0).** `--target=nucleo-f401re` builds
+for ST's NUCLEO-F401RE (STM32F401RE: Cortex-M4, 512 KB flash at
+0x08000000, 96 KB SRAM at 0x20000000, two 8-stream DMA controllers), into
+`build/<stem>.elf` and `.bin`. The runtime keeps the chip on its 16 MHz
+internal oscillator, sets up USART2 — wired to the board's ST-LINK, which
+presents it as a USB serial port — before `main` (`phase_board_init`), and
+afterwards prints `[phase] main returned` and stops: with a semihosting
+exit when a debugger is attached, otherwise by sleeping
+(`phase_board_exit`). `--run` flashes the board with `probe-rs`, OpenOCD
+or `st-flash`, whichever is installed, and prints its console until that
+line (`PHASE_SERIAL` picks the port, `PHASE_RUN_TIMEOUT` the time limit).
+`examples/devices/nucleo_f401re.phase` declares the chip's RCC, GPIO,
+USARTs, DMA controllers, ADC1, TIM2–5 and NVIC, and
+`scripts/check_against_cmsis.sh` checks every register address, field and
+IRQ number in it against ST's own `stm32f401xe.h`. `docs/nucleo.md` lists
+the programs to run on the board: `nucleo_blink` (timer interrupts),
+`nucleo_dma_copy` (DMA2 memory to memory, handed over and back by
+interrupt) and `nucleo_adc_dma` (ADC1 into a buffer through DMA2, handed
+back by `sync`, checked against ST's factory calibration). The test suite
+runs the blink program on QEMU's STM32F405 board (`netduinoplus2`), which
+has the same core, memory map, USART2 and TIM2 but no model of the F4's
+RCC, GPIO or DMA.
+
+### 5.4 Inside another project (v3.0)
+
+PHASE needn't own the build. `phase emit-c` checks a program and writes
+its C — `<stem>.gen.c`, `<stem>.gen.h`, and the `phase_runtime.h` they
+include — for another project's build to compile, with `PHASE_TARGET_HW`
+defined (devices at their real addresses). The header declares the
+program's functions, so C can call them; such a program usually has no
+`main`. Every name it defines is prefixed — `PHASE_DEV_Usart2`,
+`PHASE_Stm32Usart_SR_TXE_Pos`, `phase_devtype_Stm32Usart_regs` — and the
+short aliases (`Usart2`, `Stm32Usart_SR_TXE_Pos`) are defined only without
+`PHASE_NO_SHORT_NAMES`, so the header can sit next to a vendor's CMSIS
+header. An interrupt handler whose IRQ is a `<Name>_IRQn` constant is also
+emitted as `<Name>_IRQHandler`, which replaces the weak default in the
+vendor's startup file. `examples/embedding/stm32f401` is an STM32 project
+built from ST's startup file and headers with its TIM2 driver in PHASE;
+`docs/embedding.md` shows the Makefile and CMake rules, and
+`docs/boundary.md` what C calling into PHASE, and C behind an `extern fn`,
+must promise.
+
+`phase import-svd <chip.svd>` (v3.0) prints a board file from the chip's
+CMSIS-SVD description (`docs/svd_import.md`).
 
 ---
 
@@ -1027,11 +1110,12 @@ phase/
     driver/         -- the `phase` CLI, including the language server
                        (`phase lsp`, §6.8)
     fuzz/           -- phase-fuzz: differential fuzzer (§6.7)
+    svd/            -- `phase import-svd`: CMSIS-SVD to board files (§5.4)
   runtime/
     phase_runtime.c / .h   -- sim_dma_wait / sim_device_wait (host)
     phase_check.c / .h     -- runtime ownership checker for --checked (§6.7)
     <program>_extern.c     -- hand-written bodies for a program's extern fns
-    hw/                    -- ARM Cortex-M3 backend (§5.3)
+    hw/                    -- bare-metal Cortex-M backends (§5.3)
   editors/                 -- TextMate grammar, VS Code extension, Vim
                               syntax (§6.8)
   examples/
@@ -1049,6 +1133,10 @@ would only duplicate the symbol tables the analyzer already builds.
 ```
 phase [options] check <file>   -- run all analysis passes, report errors, no codegen
 phase [options] build <file>   -- full pipeline, emits a native binary
+phase [options] emit-c <file>  -- check, then write the C for another
+                                  project's build (§5.4)
+phase [options] import-svd <file.svd>
+                               -- print a board file for a chip (§5.4)
 phase [options] --dump-tokens <file>
 phase [options] --dump-ast <file>
 phase [options] --dump-pir <file>
@@ -1065,9 +1153,14 @@ options:
                                 instead of requiring runtime/<stem>_extern.c
   --target=TARGET              (build) host (default), or an .elf for the
                                 MPS2 AN385 (mps2-an385, Cortex-M3) or AN505
-                                (mps2-an505, Cortex-M33) board (§5.3)
-  --run                        (build) run the result: the host binary, or
-                                the .elf on qemu-system-arm
+                                (mps2-an505, Cortex-M33) board, or the
+                                NUCLEO-F401RE (nucleo-f401re) (§5.3)
+  --run                        (build) run the result: the host binary, the
+                                .elf on qemu-system-arm, or flashed to the
+                                NUCLEO with its console shown
+  --out-dir=DIR                (emit-c) where to write the C (default: next
+                                to <file>)
+  --only=NAME,..               (import-svd) just these peripherals
 ```
 
 `build` locates the runtime by walking up from the source file to the
@@ -1710,6 +1803,16 @@ Output: `examples/dma_stream.phase` streams ten blocks through the PL081,
 programmed entirely from PHASE, each copy checked word by word;
 `docs/real_boards.md`, what PHASE needs for real boards; bug-gallery
 #45–#48.
+
+**v3.0 — Real boards, and other people's projects** *(in progress)*
+`--target=nucleo-f401re` for ST's NUCLEO-F401RE, with a board file checked
+against ST's CMSIS header (§5.3); `sync` that waits on the device's own
+register (`address until`, §3.7); `address_of(Dev.REG)`; IRQs named by
+constants, emitted under CMSIS's handler names (§3.16); `phase emit-c`,
+prefixed C names and the boundary contract, for using PHASE inside an
+existing project (§5.4); `phase import-svd`. Output: three programs for the
+board, the last an ADC-to-memory DMA driver written in PHASE down to the
+hand-off. Released once they have run on the board.
 
 **M12 — LLVM backend** *(not yet started)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead

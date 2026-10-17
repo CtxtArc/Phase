@@ -5,6 +5,12 @@ board (STM32F401RE: Cortex-M4, 512 KB flash, 96 KB RAM, two 8-stream DMA
 controllers). The board needs nothing but its USB cable: its ST-LINK
 flashes it and passes its console (USART2) through as a serial port.
 
+## What to send back
+
+For each program: the console output, and anything that differs from what
+is expected below. If one hangs, the last lines before it. That is the
+evidence 3.0 ships on.
+
 ## What you need
 
 - `arm-none-eabi-gcc` with newlib, as for the MPS2 targets.
@@ -63,7 +69,14 @@ black reset button (B2) to run it again.
    hand them back. Expect `block 0 in lo: ok` .. `block 7 in hi: ok`, then
    `ring: blocks 8 and 9`. A `TORN` line, or no output after the first
    blocks, is a finding.
-3. **`examples/embedding/stm32f401`** — a project built from ST's own
+3. **`examples/nucleo_adc_dma.phase`** — the 3.0 driver: ADC1 measures
+   the chip's internal reference voltage, DMA2 stream 0 moves 64 samples
+   at a time from the ADC's data register into a buffer, and `sync` takes
+   the buffer back once the stream's own EN bit drops. Expect five lines
+   like `round 1: VREFINT 1497 (1490..1503), factory value 1500, supply
+   3306 mV: ok` — your numbers will differ a little. `IMPLAUSIBLE`, or a
+   hang (`--run` gives up after 30 s), is a finding.
+4. **`examples/embedding/stm32f401`** — a project built from ST's own
    startup file and headers, with a PHASE driver (its README says how).
    Expect `tick`/`tock` five times, then `done`.
 
@@ -72,11 +85,13 @@ black reset button (B2) to run it again.
 - The board file (`examples/devices/nucleo_f401re.phase`) against ST's
   CMSIS header: every register address, field and IRQ number
   (`scripts/check_against_cmsis.sh`, run by CI).
-- Programs 1 and 3 on QEMU's model of the STM32F405 (`netduinoplus2`):
+- Programs 1 and 4 on QEMU's model of the STM32F405 (`netduinoplus2`):
   the same core and memory map, USART2 and TIM2 — real timer interrupts,
   the console, the vector table, the startup code. QEMU has no model of
-  the F4's RCC, GPIO or DMA, so the LED and program 2 are the board's to
-  show.
+  the F4's RCC, GPIO, ADC-with-DMA or DMA, so the LED and programs 2 and
+  3 are the board's to show.
+- Programs 1 to 3 as host builds, against simulated hardware, and in
+  checked builds (`--checked`).
 
 ## What the board runs on
 
