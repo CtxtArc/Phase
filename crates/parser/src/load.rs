@@ -72,7 +72,11 @@ pub fn load(
     });
     match l.expand(0, None) {
         Ok(()) => Ok(Loaded {
-            program: Program { items: l.items },
+            program: {
+                let mut p = Program { items: l.items };
+                phase_ast::resolve_irq_names(&mut p);
+                p
+            },
             files: l.files,
         }),
         Err(error) => Err(LoadError {

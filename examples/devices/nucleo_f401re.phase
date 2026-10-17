@@ -1,0 +1,251 @@
+// Board support for the ST NUCLEO-F401RE (STM32F401RE, Cortex-M4): the
+// peripherals PHASE's examples use, at their real addresses. Import it and
+// use the devices:
+//
+//     import "devices/nucleo_f401re.phase";
+//
+// Addresses, offsets, bit positions and IRQ numbers are ST's: the
+// reference manual (RM0368) and its CMSIS header, stm32f401xe.h.
+// scripts/check_against_cmsis.sh compiles the generated C next to that
+// header and checks every register and field below against it.
+//
+// The board runs from its 16 MHz internal oscillator (HSI), which is how
+// the chip starts: every bus clock is 16 MHz. A peripheral's clock is off
+// until its bit in RCC.AHB1ENR / APB1ENR / APB2ENR is set.
+//
+// Status flags that are cleared by writing 0 are `rc_w0`: write the whole
+// register (`volatile_write(Tim2.SR, 0)`), never one field of it, or a
+// flag the hardware sets in between is lost (bug gallery #46, spec §3.7).
+
+// ---- Reset and clock control -------------------------------------------
+
+device Rcc @ 0x40023800 {
+    CR:      read write u32 @ 0x00 { HSION: bit 0, HSIRDY: bit 1, HSEON: bit 16, PLLON: bit 24 }
+    CFGR:    read write u32 @ 0x08 { SW: bits 0..=1, SWS: bits 2..=3, HPRE: bits 4..=7, PPRE1: bits 10..=12, PPRE2: bits 13..=15 }
+    AHB1ENR: read write u32 @ 0x30 = 0 {
+        GPIOAEN: bit 0, GPIOBEN: bit 1, GPIOCEN: bit 2, DMA1EN: bit 21, DMA2EN: bit 22
+    }
+    APB1ENR: read write u32 @ 0x40 = 0 {
+        TIM2EN: bit 0, TIM3EN: bit 1, TIM4EN: bit 2, TIM5EN: bit 3, USART2EN: bit 17
+    }
+    APB2ENR: read write u32 @ 0x44 = 0 { USART1EN: bit 4, USART6EN: bit 5, ADC1EN: bit 8 }
+}
+
+// ---- GPIO ---------------------------------------------------------------
+// Two bits per pin in MODER (0 input, 1 output, 2 alternate function,
+// 3 analog) and four in AFRL/AFRH (the alternate function number).
+// BSRR sets (bits 0-15) or resets (bits 16-31) pins in one write, with
+// no read-modify-write: the way to drive a pin an interrupt also drives.
+
+device type Stm32Gpio {
+    MODER:   read write u32 @ 0x00 { MODER2: bits 4..=5, MODER3: bits 6..=7, MODER5: bits 10..=11 }
+    OTYPER:  read write u32 @ 0x04;
+    OSPEEDR: read write u32 @ 0x08;
+    PUPDR:   read write u32 @ 0x0C;
+    IDR:     read u32 @ 0x10 { IDR13: bit 13 }
+    ODR:     read write u32 @ 0x14 { ODR5: bit 5 }
+    BSRR:    write u32 @ 0x18 { BS5: bit 5, BR5: bit 21 }
+    AFRL:    read write u32 @ 0x20 { AFSEL2: bits 8..=11, AFSEL3: bits 12..=15 }
+    AFRH:    read write u32 @ 0x24;
+}
+
+device GpioA: Stm32Gpio @ 0x40020000;
+device GpioB: Stm32Gpio @ 0x40020400;
+device GpioC: Stm32Gpio @ 0x40020800;
+
+// The NUCLEO-64's green user LED, LD2, is PA5; the blue user button, B1,
+// is PC13 (reads 0 while pressed). PA2/PA3 are USART2's TX/RX (AF7),
+// wired to the ST-LINK's virtual COM port.
+const GPIO_MODE_OUTPUT: u32 = 1;
+const GPIO_MODE_AF: u32 = 2;
+const GPIO_MODE_ANALOG: u32 = 3;
+const LD2: u32 = 1 << 5;
+const AF7_USART2: u32 = 7;
+
+// ---- USART --------------------------------------------------------------
+
+device type Stm32Usart {
+    // RXNE and TC are cleared by writing 0; PE..IDLE are cleared by
+    // reading SR then DR.
+    SR:   read write u32 @ 0x00 {
+        PE: bit 0, FE: bit 1, NE: bit 2, ORE: bit 3, IDLE: bit 4,
+        RXNE: bit 5 rc_w0, TC: bit 6 rc_w0, TXE: bit 7, LBD: bit 8 rc_w0, CTS: bit 9 rc_w0
+    }
+    DR:   read write u32 @ 0x04 { DR: bits 0..=8 }
+    BRR:  read write u32 @ 0x08 { DIV_FRACTION: bits 0..=3, DIV_MANTISSA: bits 4..=15 }
+    CR1:  read write u32 @ 0x0C = 0 {
+        SBK: bit 0, RWU: bit 1, RE: bit 2, TE: bit 3, IDLEIE: bit 4, RXNEIE: bit 5,
+        TCIE: bit 6, TXEIE: bit 7, PEIE: bit 8, PS: bit 9, PCE: bit 10, WAKE: bit 11,
+        M: bit 12, UE: bit 13, OVER8: bit 15
+    }
+    CR2:  read write u32 @ 0x10;
+    CR3:  read write u32 @ 0x14 { DMAR: bit 6, DMAT: bit 7 }
+    GTPR: read write u32 @ 0x18;
+}
+
+device Usart1: Stm32Usart @ 0x40011000;
+device Usart2: Stm32Usart @ 0x40004400;
+device Usart6: Stm32Usart @ 0x40011400;
+
+// 115200 baud from a 16 MHz bus clock: 16e6 / (16 * 115200) = 8.68,
+// mantissa 8, fraction 0.68 * 16 = 11.
+const BRR_115200_AT_16MHZ: u32 = 8 << 4 | 11;
+
+// ---- DMA ------------------------------------------------------------------
+// Two controllers of eight streams each. A stream copies NDTR items
+// between the peripheral address PAR and the memory address M0AR (or
+// M1AR, in double-buffer mode); for memory-to-memory (DMA2 only) PAR is
+// the source and M0AR the destination. CHSEL picks which peripheral
+// request drives the stream (RM0368 table 28: ADC1 is DMA2 stream 0 or 4,
+// channel 0). Writing `address_of(buf)` to PAR or M0AR hands `buf` to the
+// controller; writing `address_of(Dev.REG)` names a peripheral register.
+//
+// Flags: LISR has streams 0-3, HISR streams 4-7, each at bit 0, 6, 16 and
+// 22 of its register (FEIF +0, DMEIF +2, TEIF +3, HTIF +4, TCIF +5).
+// Writing 1 to the same bit of LIFCR/HIFCR clears it.
+
+device type Stm32Dma {
+    LISR:  read u32 @ 0x00 {
+        FEIF0: bit 0, DMEIF0: bit 2, TEIF0: bit 3, HTIF0: bit 4, TCIF0: bit 5,
+        FEIF1: bit 6, DMEIF1: bit 8, TEIF1: bit 9, HTIF1: bit 10, TCIF1: bit 11,
+        FEIF2: bit 16, DMEIF2: bit 18, TEIF2: bit 19, HTIF2: bit 20, TCIF2: bit 21,
+        FEIF3: bit 22, DMEIF3: bit 24, TEIF3: bit 25, HTIF3: bit 26, TCIF3: bit 27
+    }
+    HISR:  read u32 @ 0x04 {
+        FEIF4: bit 0, DMEIF4: bit 2, TEIF4: bit 3, HTIF4: bit 4, TCIF4: bit 5,
+        FEIF5: bit 6, DMEIF5: bit 8, TEIF5: bit 9, HTIF5: bit 10, TCIF5: bit 11,
+        FEIF6: bit 16, DMEIF6: bit 18, TEIF6: bit 19, HTIF6: bit 20, TCIF6: bit 21,
+        FEIF7: bit 22, DMEIF7: bit 24, TEIF7: bit 25, HTIF7: bit 26, TCIF7: bit 27
+    }
+    LIFCR: write u32 @ 0x08;
+    HIFCR: write u32 @ 0x0C;
+
+    CR[8]: read write u32 @ 0x10 step 0x18 {
+        EN: bit 0, DMEIE: bit 1, TEIE: bit 2, HTIE: bit 3, TCIE: bit 4, PFCTRL: bit 5,
+        DIR: bits 6..=7, CIRC: bit 8, PINC: bit 9, MINC: bit 10, PSIZE: bits 11..=12,
+        MSIZE: bits 13..=14, PINCOS: bit 15, PL: bits 16..=17, DBM: bit 18, CT: bit 19,
+        PBURST: bits 21..=22, MBURST: bits 23..=24, CHSEL: bits 25..=27
+    }
+    NDTR[8]: read write u32 @ 0x14 step 0x18 { NDT: bits 0..=15 }
+    PAR[8]:  read write u32 @ 0x18 step 0x18 address;
+    M0AR[8]: read write u32 @ 0x1C step 0x18 address;
+    M1AR[8]: read write u32 @ 0x20 step 0x18 address;
+    FCR[8]:  read write u32 @ 0x24 step 0x18 { FTH: bits 0..=1, DMDIS: bit 2, FS: bits 3..=5, FEIE: bit 7 }
+}
+
+device Dma1: Stm32Dma @ 0x40026000;
+device Dma2: Stm32Dma @ 0x40026400;
+
+// Values for a stream's CR.
+const DMA_EN: u32 = 1 << 0;
+const DMA_TCIE: u32 = 1 << 4;
+const DMA_PERIPH_TO_MEM: u32 = 0 << 6;
+const DMA_MEM_TO_PERIPH: u32 = 1 << 6;
+const DMA_MEM_TO_MEM: u32 = 2 << 6;
+const DMA_CIRC: u32 = 1 << 8;
+const DMA_PINC: u32 = 1 << 9;
+const DMA_MINC: u32 = 1 << 10;
+const DMA_PSIZE_16: u32 = 1 << 11;
+const DMA_PSIZE_32: u32 = 2 << 11;
+const DMA_MSIZE_16: u32 = 1 << 13;
+const DMA_MSIZE_32: u32 = 2 << 13;
+// The transfer-complete flag of stream 0 and 4 in LISR/HISR (and the bit
+// that clears it in LIFCR/HIFCR); every stream's flags, to clear them all.
+const DMA_TCIF0: u32 = 1 << 5;
+const DMA_TCIF4: u32 = 1 << 5;
+const DMA_ALL_FLAGS_0: u32 = 0x3D;
+const DMA_ALL_FLAGS_LOW: u32 = 0x0F7D0F7D;
+const DMA_ALL_FLAGS_HIGH: u32 = 0x0F7D0F7D;
+
+// ---- ADC ------------------------------------------------------------------
+// ADC1 converts the channels listed in SQR3/SQR2/SQR1, in that order.
+// Channel 17 is the internal reference voltage VREFINT (1.21 V typical)
+// and channel 18 the temperature sensor, once ADC common CCR.TSVREFE is set.
+
+device Adc1 @ 0x40012000 {
+    SR:    read write u32 @ 0x00 {
+        AWD: bit 0 rc_w0, EOC: bit 1 rc_w0, JEOC: bit 2 rc_w0, JSTRT: bit 3 rc_w0,
+        STRT: bit 4 rc_w0, OVR: bit 5 rc_w0
+    }
+    CR1:   read write u32 @ 0x04 { EOCIE: bit 5, SCAN: bit 8, RES: bits 24..=25, OVRIE: bit 26 }
+    CR2:   read write u32 @ 0x08 = 0 {
+        ADON: bit 0, CONT: bit 1, DMA: bit 8, DDS: bit 9, EOCS: bit 10, ALIGN: bit 11,
+        EXTEN: bits 28..=29, SWSTART: bit 30
+    }
+    SMPR1: read write u32 @ 0x0C { SMP16: bits 18..=20, SMP17: bits 21..=23, SMP18: bits 24..=26 }
+    SMPR2: read write u32 @ 0x10;
+    SQR1:  read write u32 @ 0x2C { L: bits 20..=23 }
+    SQR2:  read write u32 @ 0x30;
+    SQR3:  read write u32 @ 0x34 { SQ1: bits 0..=4 }
+    DR:    read u32 @ 0x4C { DATA: bits 0..=15 }
+}
+
+device AdcCommon @ 0x40012300 {
+    CSR: read u32 @ 0x00;
+    CCR: read write u32 @ 0x04 { ADCPRE: bits 16..=17, VBATE: bit 22, TSVREFE: bit 23 }
+}
+
+const ADC_CH_VREFINT: u32 = 17;
+const ADC_CH_TEMP: u32 = 18;
+const ADC_SMP_480: u32 = 7;   // 480 cycles: VREFINT needs at least 10 us
+
+// ---- General-purpose timers ----------------------------------------------
+// TIM2 and TIM5 count to a 32-bit ARR, TIM3 and TIM4 to a 16-bit one. The
+// counter runs at the bus clock divided by PSC + 1; reaching ARR sets
+// SR.UIF, and raises the timer's interrupt with DIER.UIE set.
+
+device type Stm32GpTimer {
+    CR1:  read write u32 @ 0x00 = 0 { CEN: bit 0, UDIS: bit 1, URS: bit 2, OPM: bit 3, DIR: bit 4, ARPE: bit 7 }
+    CR2:  read write u32 @ 0x04;
+    DIER: read write u32 @ 0x0C = 0 { UIE: bit 0, CC1IE: bit 1 }
+    SR:   read write u32 @ 0x10 { UIF: bit 0 rc_w0, CC1IF: bit 1 rc_w0, CC2IF: bit 2 rc_w0 }
+    EGR:  write u32 @ 0x14 { UG: bit 0 }
+    CNT:  read write u32 @ 0x24;
+    PSC:  read write u32 @ 0x28 { PSC: bits 0..=15 }
+    ARR:  read write u32 @ 0x2C;
+}
+
+device Tim2: Stm32GpTimer @ 0x40000000;
+device Tim3: Stm32GpTimer @ 0x40000400;
+device Tim4: Stm32GpTimer @ 0x40000800;
+device Tim5: Stm32GpTimer @ 0x40000C00;
+
+// ---- NVIC -----------------------------------------------------------------
+// Writing 1 to bit n % 32 of ISER[n / 32] enables IRQ n; of ICER[n / 32]
+// disables it. Write whole registers: a 0 changes nothing.
+
+device Nvic @ 0xE000E100 {
+    ISER[3]: read write u32 @ 0x000 step 4;
+    ICER[3]: read write u32 @ 0x080 step 4;
+    ISPR[3]: read write u32 @ 0x100 step 4;
+    ICPR[3]: read write u32 @ 0x180 step 4;
+}
+
+// IRQ numbers, named as in CMSIS (stm32f401xe.h): an
+// `interrupt fn h() @ irq TIM2_IRQn` is also emitted as TIM2_IRQHandler,
+// the name ST's startup file gives that vector.
+const DMA1_Stream0_IRQn: u32 = 11;
+const DMA1_Stream1_IRQn: u32 = 12;
+const DMA1_Stream2_IRQn: u32 = 13;
+const DMA1_Stream3_IRQn: u32 = 14;
+const DMA1_Stream4_IRQn: u32 = 15;
+const DMA1_Stream5_IRQn: u32 = 16;
+const DMA1_Stream6_IRQn: u32 = 17;
+const ADC_IRQn: u32 = 18;
+const TIM2_IRQn: u32 = 28;
+const TIM3_IRQn: u32 = 29;
+const TIM4_IRQn: u32 = 30;
+const USART1_IRQn: u32 = 37;
+const USART2_IRQn: u32 = 38;
+const EXTI15_10_IRQn: u32 = 40;
+const DMA1_Stream7_IRQn: u32 = 47;
+const TIM5_IRQn: u32 = 50;
+const DMA2_Stream0_IRQn: u32 = 56;
+const DMA2_Stream1_IRQn: u32 = 57;
+const DMA2_Stream2_IRQn: u32 = 58;
+const DMA2_Stream3_IRQn: u32 = 59;
+const DMA2_Stream4_IRQn: u32 = 60;
+const DMA2_Stream5_IRQn: u32 = 68;
+const DMA2_Stream6_IRQn: u32 = 69;
+const DMA2_Stream7_IRQn: u32 = 70;
+const USART6_IRQn: u32 = 71;

@@ -217,6 +217,21 @@ pub(crate) fn check(program: &Program, devices: &HashSet<&str>, errors: &mut Vec
             continue;
         };
         handlers.push(f);
+        if let Some(name) = &f.irq_name {
+            let is_const = program
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::Const(c) if &c.name == name));
+            if !is_const {
+                errors.push(
+                    err(format!(
+                        "unknown constant '{name}': an IRQ is a number or a constant (`const {name}: u32 = N;`)"
+                    ))
+                    .at(irq_span),
+                );
+                continue;
+            }
+        }
         if f.name == "main" {
             errors.push(err("'main' cannot be an interrupt handler").at(f.name_span));
         }
@@ -574,6 +589,27 @@ mod tests {
         rejects(
             &with("interrupt fn main() @ irq 3 { }"),
             "'main' cannot be an interrupt handler",
+        );
+    }
+
+    #[test]
+    fn an_irq_can_be_named_by_a_constant() {
+        // The constant's value is the IRQ: same checks as a number.
+        check(&with(
+            "const TIM2_IRQn: u32 = 28; interrupt fn h() @ irq TIM2_IRQn { signal tick; } fn main() { wait tick; }",
+        ))
+        .unwrap();
+        rejects(
+            &with("const TIM2_IRQn: u32 = 28; interrupt fn a() @ irq TIM2_IRQn { } interrupt fn b() @ irq 28 { } fn main() {}"),
+            "IRQ 28 already has a handler, 'a'",
+        );
+        rejects(
+            &with("const BIG: u32 = 8 * 30; interrupt fn a() @ irq BIG { } fn main() {}"),
+            "IRQ 240 does not exist",
+        );
+        rejects(
+            &with("interrupt fn a() @ irq TIM9_IRQn { } fn main() {}"),
+            "unknown constant 'TIM9_IRQn': an IRQ is a number or a constant",
         );
     }
 

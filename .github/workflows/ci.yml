@@ -24,7 +24,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
-    name: test (host + ARM Cortex-M3 under QEMU)
+    name: test (host + ARM Cortex-M under QEMU)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,12 +33,14 @@ jobs:
       - name: Install cross toolchain and QEMU
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi qemu-system-arm
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi libnewlib-arm-none-eabi qemu-system-arm
       - name: cargo test
         env:
           # Fail instead of skipping the QEMU test if the tools are missing.
           PHASE_REQUIRE_HW_TOOLS: "1"
         run: cargo test --workspace
+      - name: STM32F401 board file and embedding example against ST's CMSIS
+        run: ./scripts/check_against_cmsis.sh
       - name: Volatile proof demo (naive C vs PHASE at -O2)
         run: ./demos/m6_volatile_proof/run_demo.sh
       - name: Differential fuzzing (static analysis vs. runtime-checked runs)

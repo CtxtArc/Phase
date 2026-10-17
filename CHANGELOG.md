@@ -4,6 +4,51 @@ All notable changes to PHASE are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Toward 3.0: PHASE on a real board, and inside other people's projects.
+
+### Added
+
+- **`--target=nucleo-f401re`**: ST's NUCLEO-F401RE (STM32F401RE,
+  Cortex-M4). Builds an `.elf` and a `.bin`; `--run` flashes the board
+  (probe-rs, OpenOCD or st-flash) and shows its console from the ST-LINK's
+  serial port until `main` returns. `examples/devices/nucleo_f401re.phase`
+  declares its RCC, GPIO, USARTs, both DMA controllers (stream registers as
+  arrays, PAR/M0AR/M1AR as `address` registers), ADC1, TIM2–5 and the
+  NVIC, with ST's IRQ numbers. `docs/nucleo.md` is how to run it.
+- `scripts/check_against_cmsis.sh` (run by CI): the board file against
+  ST's own `stm32f401xe.h` — 212 register addresses, 333 fields and 25 IRQ
+  numbers, checked by a C compiler.
+- `examples/nucleo_blink.phase` (TIM2 interrupts and LD2) and
+  `examples/nucleo_dma_copy.phase` (DMA2 memory-to-memory on two streams,
+  handed over by `address_of`). The blink program, and the embedding
+  example, also run in the test suite on QEMU's STM32F405 model
+  (`netduinoplus2`), which has the same core, memory map, USART2 and TIM2.
+- **`phase emit-c [--out-dir=DIR] <file>`**: check, then write the C (and
+  the `phase_runtime.h` it includes) for another project's build. The
+  generated header now declares the program's own functions, so C can call
+  them. `docs/embedding.md`, and `examples/embedding/stm32f401`: a project
+  built from ST's startup file and CMSIS header with a driver in PHASE.
+- **IRQs named by constants**: `interrupt fn h() @ irq TIM2_IRQn`. A
+  constant named `<Name>_IRQn`, the CMSIS convention, also emits the
+  handler as `<Name>_IRQHandler`, the weak symbol in every vendor startup
+  file.
+- `docs/boundary.md`: what the C side must promise for PHASE's checks to
+  hold — behind an `extern fn`, and calling into PHASE.
+- `runtime/hw/phase_hw.h`: console output for C externs on every board.
+
+### Changed
+
+- The generated header's names are prefixed: `PHASE_DEV_Uart0`,
+  `PHASE_CmsdkUart_STATE_TXFULL_Msk`. The short names (`Uart0`,
+  `CmsdkUart_STATE_TXFULL_Msk`) are still defined as aliases unless
+  `PHASE_NO_SHORT_NAMES` is, which keeps them from colliding with a
+  vendor's CMSIS header. The generated C itself uses the prefixed names.
+- The bare-metal startup calls `phase_board_init()` before `main` and
+  `phase_board_exit()` after it, both weak; the MPS2 boards keep their
+  semihosting exit.
+
 ## [2.4.0] — 2026-10-16
 
 Real DMA, and the language it takes. `--target=mps2-an505` runs on a

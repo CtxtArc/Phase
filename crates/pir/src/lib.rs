@@ -380,6 +380,8 @@ pub struct PirFn {
     pub body: Vec<PirInst>,
     /// For an `interrupt fn` (v2.2): the IRQ it handles.
     pub irq: Option<u32>,
+    /// The constant the IRQ was given by, if any (v3.0).
+    pub irq_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -566,6 +568,7 @@ pub fn build(program: &Program) -> Result<PirProgram, PirError> {
                     sig,
                     body,
                     irq: f.irq.map(|(n, _)| n),
+                    irq_name: f.irq_name.clone(),
                 });
             }
             Item::State(_) => {} // typestate is compile-time-only; nothing to lower

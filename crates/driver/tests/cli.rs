@@ -690,3 +690,88 @@ fn a_host_build_runs_handlers_when_main_waits_and_stops_a_wait_nothing_signals()
         "{stderr}"
     );
 }
+
+// ---- v3.0: generated C inside someone else's project ----------------------
+
+const DRIVER: &str = r#"
+device type USART {
+    SR: read write u32 @ 0x00 { TXE: bit 7 }
+    DR: read write u32 @ 0x04;
+}
+device Usart2: USART @ 0x40004400;
+const USART2_IRQn: u32 = 38;
+event rx;
+interrupt fn on_usart2() @ irq USART2_IRQn { signal rx; }
+fn send(c: u32) {
+    while volatile_read(Usart2.SR.TXE) == 0 { }
+    volatile_write(Usart2.DR, c);
+}
+fn wait_rx() { wait rx; }
+"#;
+
+/// A stand-in for a vendor's CMSIS header: the same macro names a device
+/// type called USART and a device called Usart2 would generate.
+const VENDOR_H: &str = "#define USART_SR_TXE_Pos (7U)\n\
+#define USART_SR_TXE_Msk (0x1UL << USART_SR_TXE_Pos)\n\
+typedef struct { volatile unsigned SR, DR; } USART_TypeDef;\n\
+#define Usart2 ((USART_TypeDef *)0x40004400UL)\n";
+
+const APP_C: &str = "#include \"vendor.h\"\n\
+#include \"driver.gen.h\"\n\
+int app(void) { send('A'); return (int)USART_SR_TXE_Pos + (int)PHASE_USART_SR_TXE_Pos; }\n";
+
+#[test]
+fn emit_c_writes_c_that_lives_next_to_a_vendor_header() {
+    let dir = std::env::temp_dir().join(format!("phase_emit_c_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/driver.phase"), DRIVER).unwrap();
+    std::fs::write(dir.join("vendor.h"), VENDOR_H).unwrap();
+    std::fs::write(dir.join("app.c"), APP_C).unwrap();
+
+    // No runtime/ directory needed; --out-dir puts the files anywhere.
+    let out = phase()
+        .current_dir(&dir)
+        .args(["emit-c", "--out-dir=gen", "src/driver.phase"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    for f in ["driver.gen.c", "driver.gen.h", "phase_runtime.h"] {
+        assert!(dir.join("gen").join(f).is_file(), "{f} not written");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("gen/phase_runtime.h")).unwrap(),
+        std::fs::read_to_string(workspace_root().join("runtime/phase_runtime.h")).unwrap()
+    );
+    // Without --out-dir: next to the source.
+    let out = phase()
+        .current_dir(&dir)
+        .args(["emit-c", "src/driver.phase"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(dir.join("src/driver.gen.c").is_file());
+
+    let cc = |defines: &[&str]| {
+        Command::new("cc")
+            .current_dir(&dir)
+            .args(["-std=c11", "-Wall", "-Werror", "-c", "-o", "app.o", "-Igen", "-I."])
+            .args(defines)
+            .arg("app.c")
+            .output()
+            .unwrap()
+    };
+    // With PHASE_NO_SHORT_NAMES, the generated header only adds PHASE_
+    // names: it compiles next to the vendor's, both sets of names usable.
+    let ok = cc(&["-DPHASE_TARGET_HW", "-DPHASE_NO_SHORT_NAMES"]);
+    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    // Without it the short names collide -- which is what the define is for.
+    let clash = cc(&["-DPHASE_TARGET_HW"]);
+    assert!(!clash.status.success());
+    assert!(String::from_utf8_lossy(&clash.stderr).contains("redefined"));
+
+    // The handler is also emitted under the vendor's vector name.
+    let gen_c = std::fs::read_to_string(dir.join("gen/driver.gen.c")).unwrap();
+    assert!(gen_c.contains("void USART2_IRQHandler(void) {\n    on_usart2();\n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

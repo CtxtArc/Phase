@@ -1,5 +1,5 @@
-/* Minimal Cortex-M startup code (the M3 of the AN385 and the M33 of the
- * AN505 boot the same way): the two-entry vector table the CPU
+/* Minimal Cortex-M startup code (the M3 of the AN385, the M33 of the
+ * AN505 and the M4 of the NUCLEO-F401RE boot the same way): the two-entry vector table the CPU
  * requires (initial stack pointer + Reset_Handler address) and the
  * .data/.bss initialization every C runtime needs before `main` can rely
  * on globals being in a defined state. This is genuinely how a bare-metal
@@ -18,8 +18,16 @@ extern uint32_t _estack; /* top of RAM -- initial stack pointer */
 
 int main(void);
 
-/* ARM semihosting SYS_EXIT (0x18) with ADP_Stopped_ApplicationExit. */
-static void phase_hw_exit(void) {
+/* Board hooks (phase_runtime_hw.c): set up what the runtime needs before
+ * `main` (the NUCLEO's console), and end the program after it. */
+void phase_board_init(void) __attribute__((weak));
+void phase_board_init(void) {
+}
+
+/* ARM semihosting SYS_EXIT (0x18) with ADP_Stopped_ApplicationExit: how a
+ * program ends under QEMU, or under a debugger that handles semihosting. */
+void phase_board_exit(void) __attribute__((weak));
+void phase_board_exit(void) {
     register uint32_t op __asm__("r0") = 0x18u;
     register uint32_t arg __asm__("r1") = 0x20026u;
     __asm__ volatile("bkpt 0xAB" : : "r"(op), "r"(arg) : "memory");
@@ -35,14 +43,16 @@ void Reset_Handler(void) {
         *bss = 0;
     }
 
+    phase_board_init();
     main();
 
     /* main() returning has nowhere to go on bare metal -- there's no OS
      * to return control to. Under QEMU with semihosting enabled (as
      * `phase build --target=mps2-an385 --run` starts it), report a clean
      * exit to the host; without semihosting the BKPT faults, and the
-     * HardFault handler halts -- the same end state as before. */
-    phase_hw_exit();
+     * HardFault handler halts -- the same end state as before. A board
+     * with no debugger attached ends differently (phase_runtime_hw.c). */
+    phase_board_exit();
 }
 
 void Default_Handler(void) {

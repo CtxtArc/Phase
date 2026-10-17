@@ -29,6 +29,8 @@ fn usage() -> String {
 usage:
   phase [options] check <file>          parse and run every safety analysis
   phase [options] build <file>          check, lower to C, and compile with `cc`
+  phase [options] emit-c <file>         check and lower to C only, for another
+                                        project's build (docs/embedding.md)
   phase [options] --dump-tokens <file>  print the token stream
   phase [options] --dump-ast <file>     print the parsed AST
   phase [options] --dump-pir <file>     check, then print the lowered PIR
@@ -53,9 +55,15 @@ options:
                                cross-compile for the ARM MPS2 AN385 board
                                (Cortex-M3) or AN505 board (Cortex-M33, with
                                PL081 DMA controllers) with arm-none-eabi-gcc
-                               into <stem>.elf, devices at their real addresses
-  --run                        (build) run the result: the host binary, or the
-                               .elf under qemu-system-arm -M <board>
+                               into <stem>.elf, devices at their real addresses;
+                               nucleo-f401re: the ST NUCLEO-F401RE board
+                               (STM32F401RE), into <stem>.elf and <stem>.bin
+  --run                        (build) run the result: the host binary, the
+                               .elf under qemu-system-arm -M <board>, or on
+                               the NUCLEO: flash it (probe-rs, openocd or
+                               st-flash) and show its serial console
+  --out-dir=DIR                (emit-c) where to write <stem>.gen.{{c,h}} and
+                               phase_runtime.h (default: next to <file>)
 
 `build` writes <project>/build/<stem>.gen.{{c,h}} and <project>/build/<stem>,
 where <project> is the nearest directory at or above <file> that contains a
@@ -183,6 +191,7 @@ fn main() -> ExitCode {
     let mut stub_externs = false;
     let mut target = "host".to_string();
     let mut run = false;
+    let mut out_dir: Option<PathBuf> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -201,6 +210,8 @@ fn main() -> ExitCode {
             stub_externs = true;
         } else if arg == "--run" {
             run = true;
+        } else if let Some(v) = arg.strip_prefix("--out-dir=") {
+            out_dir = Some(PathBuf::from(v));
         } else if arg == "--target" || arg.starts_with("--target=") {
             let v = match arg.strip_prefix("--target=") {
                 Some(v) => v.to_string(),
@@ -208,7 +219,7 @@ fn main() -> ExitCode {
             };
             if v != "host" && Board::named(&v).is_none() {
                 eprintln!(
-                    "error: unknown --target '{v}' (expected host, mps2-an385 or mps2-an505)"
+                    "error: unknown --target '{v}' (expected host, mps2-an385, mps2-an505 or nucleo-f401re)"
                 );
                 return ExitCode::FAILURE;
             }
@@ -329,6 +340,30 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        "emit-c" => {
+            let Some(program) = parse_and_analyze(path, &rep) else {
+                return ExitCode::FAILURE;
+            };
+            let pir = match phase_pir::build(&program) {
+                Ok(pir) => pir,
+                Err(e) => {
+                    eprintln!("{path}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let stem = Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("out")
+                .to_string();
+            let dir = out_dir.unwrap_or_else(|| {
+                Path::new(path)
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+            emit_c(&pir, &stem, &dir)
         }
         "build" => {
             let Some(program) = parse_and_analyze(path, &rep) else {
@@ -512,6 +547,261 @@ fn main() -> ExitCode {
     }
 }
 
+/// The runtime header the generated C includes, as this compiler knows it.
+const RUNTIME_H: &str = include_str!("../../../runtime/phase_runtime.h");
+
+/// `phase emit-c` (v3.0): the generated C for someone else's build -- a
+/// vendor IDE project, a Makefile, CMake. Writes `<stem>.gen.c`,
+/// `<stem>.gen.h` and the `phase_runtime.h` they include into `dir`, and
+/// nothing else: what to compile them with is docs/embedding.md.
+fn emit_c(pir: &phase_pir::PirProgram, stem: &str, dir: &Path) -> ExitCode {
+    let generated = phase_codegen_c::generate(pir, stem);
+    if let Err(e) = fs::create_dir_all(dir) {
+        eprintln!("error: could not create '{}': {e}", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let files = [
+        (format!("{stem}.gen.h"), generated.header.as_str()),
+        (format!("{stem}.gen.c"), generated.source.as_str()),
+        ("phase_runtime.h".to_string(), RUNTIME_H),
+    ];
+    let mut written = Vec::new();
+    for (name, text) in files {
+        let p = dir.join(name);
+        if let Err(e) = fs::write(&p, text) {
+            eprintln!("error: could not write '{}': {e}", p.display());
+            return ExitCode::FAILURE;
+        }
+        written.push(p.display().to_string());
+    }
+    println!("OK: wrote {}", written.join(", "));
+    ExitCode::SUCCESS
+}
+
+/// The line the NUCLEO runtime prints when `main` returns
+/// (runtime/hw/phase_runtime_hw.c).
+const BOARD_DONE: &str = "[phase] main returned";
+
+/// The end of a build for a board with an ST-LINK (v3.0): a `.bin` next to
+/// the `.elf` (what the board's USB drive takes), and with `--run`, flash
+/// it and show its console until `main` returns.
+fn finish_stlink_build(
+    cc: &str,
+    elf: &Path,
+    board: &str,
+    chip: &str,
+    openocd_target: &str,
+    run: bool,
+) -> ExitCode {
+    let objcopy = env::var("PHASE_ARM_OBJCOPY").unwrap_or_else(|_| match cc.strip_suffix("gcc") {
+        Some(prefix) => format!("{prefix}objcopy"),
+        None => "arm-none-eabi-objcopy".to_string(),
+    });
+    let bin = elf.with_extension("bin");
+    match Command::new(&objcopy)
+        .args(["-O", "binary"])
+        .arg(elf)
+        .arg(&bin)
+        .output()
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            eprintln!("error: {objcopy} failed:");
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("error: could not invoke '{objcopy}' ({e}); set PHASE_ARM_OBJCOPY");
+            return ExitCode::FAILURE;
+        }
+    }
+    let (elf_s, bin_s) = (elf.display().to_string(), bin.display().to_string());
+    println!("OK: built {elf_s} and {bin_s} for {board}");
+    if !run {
+        println!("    flash it: copy {bin_s} to the board's USB drive (NOD_F401RE),");
+        println!("              or: probe-rs download --chip {chip} {elf_s} && probe-rs reset --chip {chip}");
+        println!("    its console: the ST-LINK's serial port at 115200 baud (e.g. picocom -b 115200 /dev/ttyACM0)");
+        println!("    or let `phase build --target={board} --run` do both");
+        return ExitCode::SUCCESS;
+    }
+
+    // Listen before flashing: the program starts as soon as it is written.
+    let serial = env::var_os("PHASE_SERIAL")
+        .map(PathBuf::from)
+        .or_else(find_stlink_serial);
+    let lines = match &serial {
+        Some(dev) => match open_serial(dev) {
+            Ok(rx) => Some(rx),
+            Err(e) => {
+                eprintln!(
+                    "error: could not open the board's serial port '{}': {e}",
+                    dev.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            eprintln!(
+                "warning: no ST-LINK serial port found (set PHASE_SERIAL=/dev/ttyACM0 or similar); \
+                 flashing without showing the console"
+            );
+            None
+        }
+    };
+    if let Err(e) = flash_stlink(elf, &bin, chip, openocd_target) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+    let Some(rx) = lines else {
+        return ExitCode::SUCCESS;
+    };
+    let timeout = env::var("PHASE_RUN_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30u64);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    let mut seen = String::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(chunk) => {
+                let text: String = String::from_utf8_lossy(&chunk).replace('\r', "");
+                print!("{text}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                seen.push_str(&text);
+                if seen.contains(BOARD_DONE) {
+                    return ExitCode::SUCCESS;
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "\nerror: '{BOARD_DONE}' did not appear within {timeout} s \
+                     (PHASE_RUN_TIMEOUT sets the limit)"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+}
+
+/// The ST-LINK's virtual COM port, if one is plugged in.
+fn find_stlink_serial() -> Option<PathBuf> {
+    if let Ok(dir) = fs::read_dir("/dev/serial/by-id") {
+        let mut found: Vec<PathBuf> = dir
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let n = p.to_string_lossy().to_lowercase();
+                n.contains("stlink") || n.contains("st-link")
+            })
+            .collect();
+        found.sort();
+        if let Some(p) = found.into_iter().next() {
+            return Some(p);
+        }
+    }
+    if let Ok(dir) = fs::read_dir("/dev") {
+        let mut found: Vec<PathBuf> = dir
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let n = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                n.starts_with("cu.usbmodem")
+            })
+            .collect();
+        found.sort();
+        if let Some(p) = found.into_iter().next() {
+            return Some(p);
+        }
+    }
+    let acm = PathBuf::from("/dev/ttyACM0");
+    acm.exists().then_some(acm)
+}
+
+/// Set `dev` to 115200 baud, raw, and read it on a thread.
+fn open_serial(dev: &Path) -> Result<std::sync::mpsc::Receiver<Vec<u8>>, String> {
+    let flag = if cfg!(target_os = "macos") {
+        "-f"
+    } else {
+        "-F"
+    };
+    let st = Command::new("stty")
+        .arg(flag)
+        .arg(dev)
+        .args(["115200", "raw", "-echo"])
+        .status()
+        .map_err(|e| format!("could not run stty: {e}"))?;
+    if !st.success() {
+        return Err("stty could not configure it".to_string());
+    }
+    let mut f = fs::File::open(dev).map_err(|e| e.to_string())?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 256];
+        while let Ok(n) = f.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(rx)
+}
+
+/// Is `tool` on PATH?
+fn on_path(tool: &str) -> bool {
+    env::var_os("PATH")
+        .is_some_and(|paths| env::split_paths(&paths).any(|d| d.join(tool).is_file()))
+}
+
+/// Write the program to the board and start it, with the first of
+/// probe-rs, OpenOCD and st-flash that is installed.
+fn flash_stlink(elf: &Path, bin: &Path, chip: &str, openocd_target: &str) -> Result<(), String> {
+    let run = |mut cmd: Command, what: &str| -> Result<(), String> {
+        println!("flashing with {what}");
+        let out = cmd
+            .output()
+            .map_err(|e| format!("could not run {what}: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{what} failed:\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ))
+        }
+    };
+    if on_path("probe-rs") {
+        let mut dl = Command::new("probe-rs");
+        dl.args(["download", "--chip", chip]).arg(elf);
+        run(dl, "probe-rs")?;
+        let mut reset = Command::new("probe-rs");
+        reset.args(["reset", "--chip", chip]);
+        return run(reset, "probe-rs reset");
+    }
+    if on_path("openocd") {
+        let mut cmd = Command::new("openocd");
+        cmd.args(["-f", "interface/stlink.cfg", "-f", openocd_target, "-c"])
+            .arg(format!("program {} verify reset exit", elf.display()));
+        return run(cmd, "openocd");
+    }
+    if on_path("st-flash") {
+        let mut cmd = Command::new("st-flash");
+        cmd.args(["--reset", "write"]).arg(bin).arg("0x08000000");
+        return run(cmd, "st-flash");
+    }
+    Err(format!(
+        "--run needs probe-rs, openocd or st-flash on PATH to flash the board \
+         (or copy {} to its USB drive)",
+        bin.display()
+    ))
+}
+
 /// Run a built program with inherited stdio, and exit with its status.
 fn run_and_report(mut cmd: Command, what: &str) -> ExitCode {
     match cmd.status() {
@@ -530,27 +820,60 @@ fn run_and_report(mut cmd: Command, what: &str) -> ExitCode {
 /// A bare-metal target board: how to compile for it and run it on QEMU.
 #[derive(Clone, Copy)]
 struct Board {
-    /// `--target=` name, which is also QEMU's `-M` machine name.
+    /// `--target=` name.
     name: &'static str,
     cpu: &'static str,
+    /// More compiler flags for the CPU.
+    cflags: &'static [&'static str],
     linker_script: &'static str,
     /// Defined for the C (the runtime picks the board's addresses by it).
     define: &'static str,
+    /// How `--run` runs it: on QEMU's model of the board, or on the board.
+    runs_on: RunsOn,
+}
+
+#[derive(Clone, Copy)]
+enum RunsOn {
+    /// `qemu-system-arm -M <machine>`.
+    Qemu(&'static str),
+    /// The board itself, through its ST-LINK: flashed with `probe-rs`
+    /// (`--chip <chip>`), OpenOCD or `st-flash`, and its console read
+    /// from the ST-LINK's serial port.
+    StLink {
+        chip: &'static str,
+        openocd_target: &'static str,
+    },
 }
 
 impl Board {
-    const ALL: [Board; 2] = [
+    const ALL: [Board; 3] = [
         Board {
             name: "mps2-an385",
             cpu: "cortex-m3",
+            cflags: &[],
             linker_script: "mps2an385.ld",
             define: "PHASE_BOARD_MPS2_AN385",
+            runs_on: RunsOn::Qemu("mps2-an385"),
         },
         Board {
             name: "mps2-an505",
             cpu: "cortex-m33",
+            cflags: &[],
             linker_script: "mps2an505.ld",
             define: "PHASE_BOARD_MPS2_AN505",
+            runs_on: RunsOn::Qemu("mps2-an505"),
+        },
+        Board {
+            name: "nucleo-f401re",
+            cpu: "cortex-m4",
+            // The FPU is off at reset; soft float needs nothing turned on.
+            cflags: &["-mfloat-abi=soft"],
+            linker_script: "nucleo_f401re.ld",
+            define: "PHASE_BOARD_NUCLEO_F401RE",
+            runs_on: RunsOn::StLink {
+                chip: "STM32F401RETx",
+                openocd_target: "target/stm32f4x.cfg",
+            },
         },
     ];
 
@@ -613,6 +936,7 @@ fn build_mps2(b: &BuildMps2) -> ExitCode {
     let elf = b.build_dir.join(format!("{}.elf", b.stem));
     let mut cmd = Command::new(&cc);
     cmd.arg(format!("-mcpu={}", board.cpu));
+    cmd.args(board.cflags);
     cmd.arg(format!("-D{}=1", board.define));
     cmd.args([
         "-mthumb",
@@ -663,9 +987,18 @@ fn build_mps2(b: &BuildMps2) -> ExitCode {
         }
     }
     let elf_s = elf.display().to_string();
+    let machine = match board.runs_on {
+        RunsOn::Qemu(m) => m,
+        RunsOn::StLink {
+            chip,
+            openocd_target,
+        } => {
+            return finish_stlink_build(&cc, &elf, board.name, chip, openocd_target, b.run);
+        }
+    };
     let qemu_args = [
         "-M",
-        board.name,
+        machine,
         "-nographic",
         "-monitor",
         "none",

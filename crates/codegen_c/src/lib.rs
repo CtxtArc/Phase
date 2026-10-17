@@ -230,6 +230,28 @@ fn generate_header(program: &PirProgram, stem: &str) -> String {
         out.push('\n');
     }
 
+    // v3.0: the program's own functions, for C that calls into PHASE (a
+    // vendor project's `main`, say). Not `main`, which is the program's
+    // own entry point, and not interrupt handlers, which only the
+    // hardware calls.
+    let callable: Vec<&PirFn> = program
+        .fns
+        .iter()
+        .filter(|f| f.sig.name != "main" && f.irq.is_none())
+        .collect();
+    if !callable.is_empty() {
+        out.push_str("/* --- PHASE functions, callable from C ---\n");
+        out.push_str(" * PHASE checked every call to these inside the program; a call from C\n");
+        out.push_str(" * must keep the same promises (docs/boundary.md): a buffer passed in\n");
+        out.push_str(" * is the CPU's, and one a function hands to the hardware (`@RAM -> @DMA`)\n");
+        out.push_str(" * is not touched until the program hands it back.\n */\n\n");
+        for f in callable {
+            out.push_str(&format_fn_prototype(&f.sig));
+            out.push_str(";\n");
+        }
+        out.push('\n');
+    }
+
     if !program.mmio_registers.is_empty() {
         out.push_str("/* --- simulated MMIO registers (M6) ---\n");
         out.push_str(
@@ -287,8 +309,11 @@ fn device_struct(d: &PirDevice) -> String {
 
 /// A register map as a CMSIS-style struct: `volatile` members at the
 /// declared offsets (padded, and checked by `_Static_assert`), and
-/// `<prefix>_REG_FIELD_Pos`/`_Msk` macros so hand-written C can use the
-/// same fields.
+/// `PHASE_<prefix>_REG_FIELD_Pos`/`_Msk` macros so hand-written C can use
+/// the same fields -- with the short `<prefix>_REG_FIELD_Pos` too, unless
+/// `PHASE_NO_SHORT_NAMES` is defined (v3.0: next to a vendor's CMSIS
+/// header, whose `USART_SR_TXE_Pos` a device type named `USART` would
+/// otherwise redefine).
 fn format_layout(ty: &str, prefix: &str, regs: &[PirReg]) -> String {
     let mut regs: Vec<&PirReg> = regs.iter().collect();
     regs.sort_by_key(|r| r.offset);
@@ -320,15 +345,23 @@ fn format_layout(ty: &str, prefix: &str, regs: &[PirReg]) -> String {
             r.name, r.offset, r.name
         ));
     }
+    let mut short = String::new();
     for r in &regs {
         for (f, lo, hi) in &r.fields {
+            let name = format!("{prefix}_{}_{f}", r.name);
             s.push_str(&format!(
-                "#define {prefix}_{}_{f}_Pos {lo}u\n#define {prefix}_{}_{f}_Msk ({:#x}u << {lo}u)\n",
-                r.name,
-                r.name,
+                "#define PHASE_{name}_Pos {lo}u\n#define PHASE_{name}_Msk ({:#x}u << {lo}u)\n",
                 field_mask(*lo, *hi)
             ));
+            short.push_str(&format!(
+                "#define {name}_Pos PHASE_{name}_Pos\n#define {name}_Msk PHASE_{name}_Msk\n"
+            ));
         }
+    }
+    if !short.is_empty() {
+        s.push_str("#ifndef PHASE_NO_SHORT_NAMES\n");
+        s.push_str(&short);
+        s.push_str("#endif\n");
     }
     s
 }
@@ -365,9 +398,10 @@ fn format_device(d: &PirDevice) -> String {
     if d.of_type.is_none() {
         s.push_str(&format_layout(&ty, &d.name, &d.regs));
     }
+    let n = &d.name;
     s.push_str(&format!(
-        "#ifdef PHASE_TARGET_HW\n#define {} (({ty} *){:#x}u)\n#else\nextern {ty} phase_dev_{}_sim;\n#define {} (&phase_dev_{}_sim)\n#endif\n",
-        d.name, d.base, d.name, d.name, d.name
+        "#ifdef PHASE_TARGET_HW\n#define PHASE_DEV_{n} (({ty} *){:#x}u)\n#else\nextern {ty} phase_dev_{n}_sim;\n#define PHASE_DEV_{n} (&phase_dev_{n}_sim)\n#endif\n#ifndef PHASE_NO_SHORT_NAMES\n#define {n} PHASE_DEV_{n}\n#endif\n",
+        d.base
     ));
     s.push('\n');
     s
@@ -376,7 +410,7 @@ fn format_device(d: &PirDevice) -> String {
 /// `Dev->REG`, or for a field, its value shifted down and masked. A
 /// checked build first verifies the register is readable.
 fn format_reg_read(r: &RegRef, checked: bool) -> String {
-    let reg = format!("{}->{}", r.device, r.reg);
+    let reg = format!("PHASE_DEV_{}->{}", r.device, r.reg);
     let read = match &r.field {
         None => reg,
         Some((_, lo, hi)) => format!("(({reg} >> {lo}u) & {:#x}u)", field_mask(*lo, *hi)),
@@ -422,7 +456,7 @@ fn reg_access(r: &RegRef) -> &'static str {
 /// interrupt handler landing between the read and the write would write
 /// the same register (the handlers are run right there to find out).
 fn format_checked_reg_write(r: &RegRef, value: &str, has_handlers: bool, pad: &str) -> String {
-    let reg = format!("{}->{}", r.device, r.reg);
+    let reg = format!("PHASE_DEV_{}->{}", r.device, r.reg);
     let ty = reg_c_type(r.bits);
     let name = reg_display(r);
     let access = reg_access(r);
@@ -473,7 +507,7 @@ fn format_checked_reg_write(r: &RegRef, value: &str, has_handlers: bool, pad: &s
 
 /// A register write; a field write keeps the register's other bits.
 fn format_reg_write(r: &RegRef, value: &str) -> String {
-    let reg = format!("{}->{}", r.device, r.reg);
+    let reg = format!("PHASE_DEV_{}->{}", r.device, r.reg);
     let ty = reg_c_type(r.bits);
     match &r.field {
         None => format!("{reg} = ({ty})({value});"),
@@ -491,7 +525,7 @@ fn format_reg_write(r: &RegRef, value: &str) -> String {
 /// than the register, `phase_addr_set` also keeps the real pointer for the
 /// simulated hardware to find (`phase_addr_get`, runtime/phase_runtime.h).
 fn format_address_write(r: &RegRef, b: &str, cx: &FnCx, pad: &str) -> String {
-    let reg = format!("{}->{}", r.device, r.reg);
+    let reg = format!("PHASE_DEV_{}->{}", r.device, r.reg);
     let mut s = format!(
         "{pad}/* {b} is handed to the hardware at {} */\n",
         reg_display(r)
@@ -639,12 +673,22 @@ fn generate_source(program: &PirProgram, stem: &str, checked: bool) -> String {
     }
 
     for f in program.fns.iter().filter(|f| f.irq.is_some()) {
+        let irq = f.irq.unwrap_or(0);
         out.push_str(&format!(
-            "#ifdef PHASE_TARGET_HW\n/* The vector table's entry for IRQ {} (runtime/hw/startup.c). */\nvoid IRQ{}_Handler(void) {{\n    {}();\n}}\n#endif\n\n",
-            f.irq.unwrap_or(0),
-            f.irq.unwrap_or(0),
+            "#ifdef PHASE_TARGET_HW\n/* The vector table's entry for IRQ {irq} (runtime/hw/startup.c). */\nvoid IRQ{irq}_Handler(void) {{\n    {}();\n}}\n",
             f.sig.name
         ));
+        if let Some(vendor) = f
+            .irq_name
+            .as_deref()
+            .and_then(phase_ast::cmsis_handler_name)
+        {
+            out.push_str(&format!(
+                "/* The same entry under its CMSIS name, for a vendor startup file. */\nvoid {vendor}(void) {{\n    {}();\n}}\n",
+                f.sig.name
+            ));
+        }
+        out.push_str("#endif\n\n");
     }
 
     out
@@ -2213,10 +2257,12 @@ mod tests {
             "volatile uint16_t CLEAR; /* 0x0c, write */",
             "} phase_dev_Timer_regs;",
             "_Static_assert(offsetof(phase_dev_Timer_regs, CLEAR) == 0xc, \"Timer.CLEAR offset\");",
-            "#define Timer ((phase_dev_Timer_regs *)0x40000000u)",
-            "#define Timer (&phase_dev_Timer_sim)",
-            "#define Timer_CTRL_MODE_Pos 1u",
-            "#define Timer_CTRL_MODE_Msk (0x3u << 1u)",
+            "#define PHASE_DEV_Timer ((phase_dev_Timer_regs *)0x40000000u)",
+            "#define PHASE_DEV_Timer (&phase_dev_Timer_sim)",
+            "#ifndef PHASE_NO_SHORT_NAMES\n#define Timer PHASE_DEV_Timer\n#endif",
+            "#define PHASE_Timer_CTRL_MODE_Pos 1u",
+            "#define PHASE_Timer_CTRL_MODE_Msk (0x3u << 1u)",
+            "#define Timer_CTRL_MODE_Msk PHASE_Timer_CTRL_MODE_Msk",
         ] {
             assert!(
                 g.header.contains(needle),
@@ -2236,12 +2282,12 @@ mod tests {
     fn register_accesses_are_direct_volatile_reads_and_writes() {
         let g = generate_src(DEVICE_SRC, "t");
         for needle in [
-            "Timer->LOAD = (uint32_t)(1000);",
-            "Timer->CTRL = (uint8_t)((Timer->CTRL & ~(0x3u << 1u)) | (((uint8_t)(3) & 0x3u) << 1u)); /* field MODE */",
-            "Timer->CLEAR = (uint16_t)(1);",
-            "while ((((Timer->CTRL >> 0u) & 0x1u) == 0)) {",
-            "uint32_t load = Timer->LOAD;",
-            "Timer->LOAD = (uint32_t)(load);",
+            "PHASE_DEV_Timer->LOAD = (uint32_t)(1000);",
+            "PHASE_DEV_Timer->CTRL = (uint8_t)((PHASE_DEV_Timer->CTRL & ~(0x3u << 1u)) | (((uint8_t)(3) & 0x3u) << 1u)); /* field MODE */",
+            "PHASE_DEV_Timer->CLEAR = (uint16_t)(1);",
+            "while ((((PHASE_DEV_Timer->CTRL >> 0u) & 0x1u) == 0)) {",
+            "uint32_t load = PHASE_DEV_Timer->LOAD;",
+            "PHASE_DEV_Timer->LOAD = (uint32_t)(load);",
         ] {
             assert!(g.source.contains(needle), "missing {needle:?} in\n{}", g.source);
         }
@@ -2270,9 +2316,9 @@ mod tests {
         );
         for needle in [
             "} phase_devtype_Uart_regs;",
-            "#define Uart_CTRL_TX_EN_Pos 0u",
-            "#define Uart0 ((phase_devtype_Uart_regs *)0x40004000u)",
-            "#define Uart1 ((phase_devtype_Uart_regs *)0x40005000u)",
+            "#define PHASE_Uart_CTRL_TX_EN_Pos 0u",
+            "#define PHASE_DEV_Uart0 ((phase_devtype_Uart_regs *)0x40004000u)",
+            "#define PHASE_DEV_Uart1 ((phase_devtype_Uart_regs *)0x40005000u)",
             "extern phase_devtype_Uart_regs phase_dev_Uart1_sim;",
         ] {
             assert!(
@@ -2284,8 +2330,8 @@ mod tests {
         for needle in [
             "phase_devtype_Uart_regs phase_dev_Uart0_sim = { .CTRL = 0x1u };",
             "phase_devtype_Uart_regs phase_dev_Uart1_sim = { .CTRL = 0x1u };",
-            "Uart1->CTRL = (uint32_t)((Uart1->CTRL & ~(0x1u << 0u))",
-            "Uart0->DATA = (uint32_t)(65);",
+            "PHASE_DEV_Uart1->CTRL = (uint32_t)((PHASE_DEV_Uart1->CTRL & ~(0x1u << 0u))",
+            "PHASE_DEV_Uart0->DATA = (uint32_t)(65);",
         ] {
             assert!(
                 g.source.contains(needle),
@@ -2293,6 +2339,29 @@ mod tests {
                 g.source
             );
         }
+    }
+
+    #[test]
+    fn an_irq_named_like_cmsis_gets_the_vendors_handler_name_too() {
+        let g = generate_src(
+            "const DMA2_Stream0_IRQn: u32 = 56;
+             const IRQ_TIMER: u32 = 8;
+             event done;
+             interrupt fn on_dma() @ irq DMA2_Stream0_IRQn { signal done; }
+             interrupt fn on_timer() @ irq IRQ_TIMER { }
+             fn main() { wait done; }",
+            "t",
+        );
+        assert!(
+            g.source.contains(
+                "void IRQ56_Handler(void) {\n    on_dma();\n}\n/* The same entry under its CMSIS name, for a vendor startup file. */\nvoid DMA2_Stream0_IRQHandler(void) {\n    on_dma();\n}\n#endif"
+            ),
+            "{}",
+            g.source
+        );
+        // A constant not named `<Name>_IRQn` gives just the number.
+        assert!(g.source.contains("void IRQ8_Handler(void) {\n    on_timer();\n}\n#endif"));
+        assert_eq!(g.source.matches("_IRQHandler(void)").count(), 1);
     }
 
     #[test]

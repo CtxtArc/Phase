@@ -29,3 +29,6 @@
 
 # Saved by phase-fuzz when it finds something
 /fuzz-findings/
+
+# The embedding example's own build output
+/examples/embedding/*/build/

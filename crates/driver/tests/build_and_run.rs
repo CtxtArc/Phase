@@ -357,6 +357,87 @@ fn hardware_examples_run_on_the_mps2_boards_under_qemu() {
     }
 }
 
+/// The NUCLEO-F401RE programs, built for the board and run on QEMU's
+/// nearest model of it: `netduinoplus2`, an STM32F405 -- the same Cortex-M4
+/// core, flash and SRAM addresses, USART2 and TIM2 (the F405 has more
+/// RAM and peripherals; QEMU models neither its RCC, GPIO nor DMA, so
+/// their writes are ignored). This checks the startup code, vector table,
+/// console and interrupts before the program meets the real board; the
+/// real board is where it counts (docs/nucleo.md).
+#[test]
+fn nucleo_programs_run_on_qemus_stm32f4_model() {
+    let have = |tool: &str| {
+        Command::new(tool)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !(have("arm-none-eabi-gcc") && have("qemu-system-arm")) {
+        assert!(
+            std::env::var_os("PHASE_REQUIRE_HW_TOOLS").is_none(),
+            "PHASE_REQUIRE_HW_TOOLS is set but arm-none-eabi-gcc and/or \
+             qemu-system-arm is not installed"
+        );
+        eprintln!("skipping nucleo_programs_run_on_qemus_stm32f4_model: no ARM toolchain/QEMU");
+        return;
+    }
+    let root = workspace_root();
+    let ticks: String = (1..=16).map(|n| format!("tick {n}\n")).collect();
+    for (example, expected) in [("nucleo_blink", ticks.as_str())] {
+        let out = Command::new(env!("CARGO_BIN_EXE_phase"))
+            .current_dir(std::env::temp_dir())
+            .env_remove("PHASE_RUNTIME_DIR")
+            .args(["build", "--target=nucleo-f401re"])
+            .arg(root.join(format!("examples/{example}.phase")))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stderr.is_empty(),
+            "{example}: {stderr}"
+        );
+        let elf = root.join(format!("build/{example}.elf"));
+        assert!(root.join(format!("build/{example}.bin")).is_file());
+
+        // The program ends by sleeping (no debugger to exit to), so read
+        // its console until the runtime's last line, then stop QEMU.
+        let mut qemu = Command::new("qemu-system-arm")
+            .args(["-M", "netduinoplus2", "-nographic", "-monitor", "none"])
+            .args(["-serial", "null", "-serial", "stdio", "-kernel"])
+            .arg(&elf)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdout = qemu.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 256];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut seen = String::new();
+        while !seen.contains("[phase] main returned\n") {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(chunk) => seen.push_str(&String::from_utf8_lossy(&chunk).replace('\r', "")),
+                Err(_) => break,
+            }
+        }
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        assert!(
+            seen.ends_with(&format!("{expected}\n[phase] main returned\n")),
+            "{example} on QEMU's STM32F405: {seen:?}"
+        );
+    }
+}
+
 /// M11 end-to-end test: `examples/mmio_poll.phase` builds and actually
 /// runs a `while volatile_read(READY @MMIO) == 0 { .. }` loop that polls
 /// real (simulated) hardware state across multiple iterations -- the

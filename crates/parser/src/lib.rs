@@ -139,6 +139,12 @@ impl Parser {
     // ---- top level -----------------------------------------------------
 
     pub fn parse_program(&mut self) -> Result<Program, ParseError> {
+        let mut program = self.parse_items()?;
+        phase_ast::resolve_irq_names(&mut program);
+        Ok(program)
+    }
+
+    fn parse_items(&mut self) -> Result<Program, ParseError> {
         let mut items = Vec::new();
         while !self.at(&TokenKind::Eof) {
             items.push(self.parse_item()?);
@@ -563,13 +569,21 @@ impl Parser {
         let name = self.expect_ident()?;
         let params = self.parse_params()?;
         let return_type = self.parse_return_type()?;
+        let mut irq_name = None;
         let irq = if self.at(&TokenKind::At) {
-            // `interrupt fn h() @ irq N`; the caller checked `interrupt`.
+            // `interrupt fn h() @ irq N`, or `@ irq NAME` (a constant,
+            // v3.0); the caller checked `interrupt`.
             self.bump();
             self.expect_word("irq")?;
             let span = self.peek_span();
-            let n = self.expect_uint("an IRQ number")?;
-            Some((n.min(u32::MAX as u64) as u32, span))
+            if let TokenKind::Ident(name) = self.peek().clone() {
+                self.bump();
+                irq_name = Some(name);
+                Some((0, span))
+            } else {
+                let n = self.expect_uint("an IRQ number or a constant")?;
+                Some((n.min(u32::MAX as u64) as u32, span))
+            }
         } else {
             None
         };
@@ -581,6 +595,7 @@ impl Parser {
             return_type,
             body,
             irq,
+            irq_name,
         })
     }
 
@@ -1913,6 +1928,11 @@ mod tests {
         assert_eq!(e.name, "tick");
         let Item::Fn(h) = &p.items[1] else { panic!() };
         assert_eq!(h.irq.map(|(n, _)| n), Some(8));
+        // v3.0: or by a constant, resolved once the program is parsed.
+        let q = parse("const TIM2_IRQn: u32 = 4 * 7; interrupt fn t() @ irq TIM2_IRQn { }").unwrap();
+        let Item::Fn(t) = &q.items[1] else { panic!() };
+        assert_eq!(t.irq.map(|(n, _)| n), Some(28));
+        assert_eq!(t.irq_name.as_deref(), Some("TIM2_IRQn"));
         assert!(matches!(&h.body.stmts[0].node, Stmt::Signal { name } if name == "tick"));
         let Item::Fn(m) = &p.items[3] else { panic!() };
         assert!(

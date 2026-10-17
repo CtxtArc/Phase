@@ -192,6 +192,58 @@ pub struct FnDecl {
     /// `interrupt fn name() @ irq N` (v2.2): the IRQ number the hardware
     /// calls this handler for, and its span.
     pub irq: Option<(u32, Span)>,
+    /// `interrupt fn h() @ irq DMA2_Stream0_IRQn` (v3.0): the constant
+    /// the IRQ number was given by. [`resolve_irq_names`] puts its value
+    /// in `irq`; a name in CMSIS's `<Name>_IRQn` form also names the
+    /// handler a vendor's startup file expects (`<Name>_IRQHandler`).
+    pub irq_name: Option<String>,
+}
+
+/// The CMSIS handler name for an IRQ given by a constant named
+/// `<Name>_IRQn`: `<Name>_IRQHandler`, the weak symbol in every vendor
+/// startup file (`startup_stm32f401xe.s`, ...). `None` for other names.
+pub fn cmsis_handler_name(irq_name: &str) -> Option<String> {
+    let stem = irq_name.strip_suffix("_IRQn")?;
+    (!stem.is_empty()).then(|| format!("{stem}_IRQHandler"))
+}
+
+/// Give every `interrupt fn .. @ irq NAME` the value of constant `NAME`
+/// (v3.0). Constants that are missing or don't compute leave the number
+/// at 0; the analysis reports them (an unknown name, or the constant's own
+/// error). Run on each file as it is parsed, and again on the whole
+/// program once its imports are loaded.
+pub fn resolve_irq_names(program: &mut Program) {
+    let consts: std::collections::HashMap<String, Expr> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Const(c) => Some((c.name.clone(), c.value.clone())),
+            _ => None,
+        })
+        .collect();
+    fn value(
+        name: &str,
+        consts: &std::collections::HashMap<String, Expr>,
+        depth: u32,
+    ) -> Option<Result<u64, String>> {
+        let e = consts.get(name)?;
+        if depth > 64 {
+            return Some(Err(format!("'{name}' is defined in terms of itself")));
+        }
+        Some(
+            eval_const(e, &|n| value(n, consts, depth + 1))
+                .and_then(|v| v.ok_or_else(|| format!("'{name}' is not constant"))),
+        )
+    }
+    for item in &mut program.items {
+        let Item::Fn(f) = item else { continue };
+        let (Some(name), Some((n, _))) = (&f.irq_name, &mut f.irq) else {
+            continue;
+        };
+        if let Some(Ok(v)) = value(name, &consts, 0) {
+            *n = v.min(u32::MAX as u64) as u32;
+        }
+    }
 }
 
 /// `const NAME: u32 = 1 << 4;` (v2.4): a named integer, computed when the

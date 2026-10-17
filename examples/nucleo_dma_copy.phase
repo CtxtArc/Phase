@@ -1,0 +1,100 @@
+// DMA on the NUCLEO-F401RE, written in PHASE down to the hand-off: the
+// STM32's DMA2 copies blocks of samples into the two halves of a buffer,
+// one stream per half, and raises an interrupt as each finishes.
+//
+// For a memory-to-memory copy an STM32 stream reads from PAR and writes
+// to M0AR. Writing `address_of(src)` and `address_of(dest)` there hands
+// both buffers to the controller, checked like `move`; the stream's
+// transfer-complete interrupt hands them back (`wait lo_done for src_lo,
+// lo`), and `main` checks every word of the copy before starting the next.
+// The CPU never touches a buffer a stream is reading or writing.
+//
+//   phase build --target=nucleo-f401re --run examples/nucleo_dma_copy.phase
+//
+// flashes the board and shows its console; the same program runs on the
+// host against a simulated controller (runtime/nucleo_dma_copy_extern.c).
+
+import "devices/nucleo_f401re.phase";
+
+event lo_done;
+event hi_done;
+
+// Each stream's transfer-complete flag is cleared by writing 1 to the
+// same bit of LIFCR, a register of its own.
+interrupt fn dma2_stream0() @ irq DMA2_Stream0_IRQn {
+    if volatile_read(Dma2.LISR.TCIF0) == 1 {
+        volatile_write(Dma2.LIFCR, 1 << 5);
+        signal lo_done;
+    }
+}
+
+interrupt fn dma2_stream1() @ irq DMA2_Stream1_IRQn {
+    if volatile_read(Dma2.LISR.TCIF1) == 1 {
+        volatile_write(Dma2.LIFCR, 1 << 11);
+        signal hi_done;
+    }
+}
+
+// The CPU's side, in C: produce the next block, and check one that arrived.
+extern fn produce(block: write buffer<u32, 16> @RAM);
+extern fn check(h: read buffer<u32, 16> @RAM);
+extern fn summarize(x: read buffer<u32, 32> @RAM);
+
+const WORDS: u32 = 16;
+// Memory to memory, both addresses incrementing, 32-bit words, with an
+// interrupt when done; channel 0 (CHSEL) is unused for this direction.
+const COPY: u32 = DMA_MEM_TO_MEM | DMA_PINC | DMA_MINC | DMA_PSIZE_32 | DMA_MSIZE_32 | DMA_TCIE;
+const FIFO_FULL: u32 = 1 << 2 | 3;   // DMDIS (the FIFO, which this direction needs), FTH full
+
+// Copy a fresh block through `src` into `dest` on stream 0. Both buffers
+// are the controller's until its interrupt.
+fn copy_lo(src: write buffer<u32, 16> @RAM -> @DMA,
+           dest: write buffer<u32, 16> @RAM -> @DMA) {
+    produce(src);
+    volatile_write(Dma2.LIFCR, DMA_ALL_FLAGS_0);           // stale flags of stream 0
+    volatile_write(Dma2.PAR[0], address_of(src));
+    volatile_write(Dma2.M0AR[0], address_of(dest));
+    volatile_write(Dma2.NDTR[0], WORDS);
+    volatile_write(Dma2.FCR[0], FIFO_FULL);
+    volatile_write(Dma2.CR[0], COPY | DMA_EN);
+}
+
+fn copy_hi(src: write buffer<u32, 16> @RAM -> @DMA,
+           dest: write buffer<u32, 16> @RAM -> @DMA) {
+    produce(src);
+    volatile_write(Dma2.LIFCR, DMA_ALL_FLAGS_0 << 6);      // stream 1's
+    volatile_write(Dma2.PAR[1], address_of(src));
+    volatile_write(Dma2.M0AR[1], address_of(dest));
+    volatile_write(Dma2.NDTR[1], WORDS);
+    volatile_write(Dma2.FCR[1], FIFO_FULL);
+    volatile_write(Dma2.CR[1], COPY | DMA_EN);
+}
+
+fn main() {
+    volatile_write(Rcc.AHB1ENR.DMA2EN, 1);
+    volatile_write(Nvic.ISER[1], 1 << (DMA2_Stream0_IRQn - 32) | 1 << (DMA2_Stream1_IRQn - 32));
+
+    buffer<u32, 16> src_lo @RAM;
+    buffer<u32, 16> src_hi @RAM;
+    buffer<u32, 32> ring @RAM;
+    let n: u32 = 0;
+    split ring into lo, hi;
+    copy_lo(src_lo, lo);
+    copy_hi(src_hi, hi);
+
+    while n < 4 {
+        wait lo_done for src_lo, lo;    // stream 0 is done with both
+        check(lo);
+        copy_lo(src_lo, lo);            // and gets them back for the next block
+        wait hi_done for src_hi, hi;
+        check(hi);
+        copy_hi(src_hi, hi);
+        n = n + 1;
+    }
+
+    // Let the last two transfers finish, then use the buffer whole.
+    wait lo_done for src_lo, lo;
+    wait hi_done for src_hi, hi;
+    join lo, hi into ring;
+    summarize(ring);
+}

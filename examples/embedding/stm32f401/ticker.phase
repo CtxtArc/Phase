@@ -1,0 +1,38 @@
+// A PHASE driver inside an ordinary STM32 project: no `main` here. The
+// project's own C (main.c) calls these functions; ST's startup file
+// (startup_stm32f401xe.s) provides the vector table, and the handler below
+// fills its TIM2_IRQHandler slot -- PHASE emits it under that name because
+// the IRQ is given as TIM2_IRQn.
+//
+// See README.md in this directory, and docs/embedding.md.
+
+import "../../devices/nucleo_f401re.phase";
+
+event tick;
+
+interrupt fn on_tim2() @ irq TIM2_IRQn {
+    volatile_write(Tim2.SR, 0);   // rc_w0 flags: write the whole register
+    signal tick;
+}
+
+// Start TIM2 interrupting `hz` times a second, from the 16 MHz HSI.
+fn ticker_start(hz: u32) {
+    volatile_write(Rcc.APB1ENR.TIM2EN, 1);
+    volatile_write(Tim2.PSC, 15999);              // 1 kHz
+    volatile_write(Tim2.ARR, 1000 / hz - 1);
+    volatile_write(Tim2.EGR, 1);
+    volatile_write(Tim2.SR, 0);
+    volatile_write(Tim2.DIER.UIE, 1);
+    volatile_write(Nvic.ISER[0], 1 << TIM2_IRQn);
+    volatile_write(Tim2.CR1.CEN, 1);
+}
+
+// Sleep until the next tick.
+fn ticker_wait() {
+    wait tick;
+}
+
+fn ticker_stop() {
+    volatile_write(Tim2.CR1.CEN, 0);
+    volatile_write(Nvic.ICER[0], 1 << TIM2_IRQn);
+}
