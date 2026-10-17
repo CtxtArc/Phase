@@ -88,7 +88,7 @@ black reset button (B2) to run it again.
 - Programs 1 and 4 on QEMU's model of the STM32F405 (`netduinoplus2`):
   the same core and memory map, USART2 and TIM2 — real timer interrupts,
   the console, the vector table, the startup code. QEMU has no model of
-  the F4's RCC, GPIO, ADC-with-DMA or DMA, so the LED and programs 2 and
+  the F4's RCC, GPIO or DMA, so the LED and programs 2 and
   3 are the board's to show.
 - Programs 1 to 3 as host builds, against simulated hardware, and in
   checked builds (`--checked`).

@@ -57,6 +57,9 @@ fn sample(samples: write buffer<u16, 64> @RAM) {
 fn main() {
     adc_init();
     buffer<u16, 64> samples @RAM;
+    // VREFINT takes up to 10 us to start once TSVREFE is set: the first
+    // round is a warm-up, not reported.
+    sample(samples);
     let n: u32 = 0;
     while n < 5 {
         sample(samples);
