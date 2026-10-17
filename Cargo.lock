@@ -34,6 +34,7 @@ dependencies = [
  "phase_lexer",
  "phase_parser",
  "phase_pir",
+ "phase_svd",
 ]
 
 [[package]]
@@ -67,5 +68,13 @@ version = "2.4.0"
 dependencies = [
  "phase_analysis",
  "phase_ast",
+ "phase_parser",
+]
+
+[[package]]
+name = "phase_svd"
+version = "2.4.0"
+dependencies = [
+ "phase_analysis",
  "phase_parser",
 ]

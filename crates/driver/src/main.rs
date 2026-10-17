@@ -31,6 +31,8 @@ usage:
   phase [options] build <file>          check, lower to C, and compile with `cc`
   phase [options] emit-c <file>         check and lower to C only, for another
                                         project's build (docs/embedding.md)
+  phase [options] import-svd <file.svd> print a board file for a chip's CMSIS-SVD
+                                        register description
   phase [options] --dump-tokens <file>  print the token stream
   phase [options] --dump-ast <file>     print the parsed AST
   phase [options] --dump-pir <file>     check, then print the lowered PIR
@@ -64,6 +66,7 @@ options:
                                st-flash) and show its serial console
   --out-dir=DIR                (emit-c) where to write <stem>.gen.{{c,h}} and
                                phase_runtime.h (default: next to <file>)
+  --only=NAME,NAME,..          (import-svd) just these peripherals
 
 `build` writes <project>/build/<stem>.gen.{{c,h}} and <project>/build/<stem>,
 where <project> is the nearest directory at or above <file> that contains a
@@ -192,6 +195,7 @@ fn main() -> ExitCode {
     let mut target = "host".to_string();
     let mut run = false;
     let mut out_dir: Option<PathBuf> = None;
+    let mut only: Option<Vec<String>> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -212,6 +216,13 @@ fn main() -> ExitCode {
             run = true;
         } else if let Some(v) = arg.strip_prefix("--out-dir=") {
             out_dir = Some(PathBuf::from(v));
+        } else if let Some(v) = arg.strip_prefix("--only=") {
+            only = Some(
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            );
         } else if arg == "--target" || arg.starts_with("--target=") {
             let v = match arg.strip_prefix("--target=") {
                 Some(v) => v.to_string(),
@@ -341,6 +352,25 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "import-svd" => match phase_svd::import(&src, &phase_svd::Options { only }) {
+            Ok(imported) => {
+                print!("{}", imported.text);
+                for n in &imported.notes {
+                    eprintln!("note: {n}");
+                }
+                eprintln!(
+                    "OK: imported {} device{} ({} register declarations) from {path}",
+                    imported.devices,
+                    if imported.devices == 1 { "" } else { "s" },
+                    imported.registers
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {path}: {e}");
+                ExitCode::FAILURE
+            }
+        },
         "emit-c" => {
             let Some(program) = parse_and_analyze(path, &rep) else {
                 return ExitCode::FAILURE;

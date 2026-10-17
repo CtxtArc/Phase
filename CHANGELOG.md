@@ -48,6 +48,14 @@ Toward 3.0: PHASE on a real board, and inside other people's projects.
 - **`address_of(Dev.REG)`**: a peripheral register's address, for a
   transfer to or from it (a DMA stream reading an ADC's data register).
   Nothing changes hands.
+- **`phase import-svd [--only=A,B] <chip.svd>`**: a board file from the
+  chip's CMSIS-SVD description — peripherals, registers, fields, shared
+  layouts as device types, arrays (including registers written out one by
+  one), write semantics where the vendor gives them, and the IRQ numbers
+  under CMSIS's names. ST's whole STM32F401 SVD imports into a file
+  `phase check` accepts, and agrees with the CMSIS-checked board file on
+  every register and field they share. `docs/svd_import.md`. New crate
+  `phase_svd`, with a small XML reader of its own (no dependencies).
 - `examples/nucleo_adc_dma.phase`: ADC1 sampling the chip's internal
   reference into a buffer through DMA2, written entirely in PHASE and
   `sync`ed on the stream; the C side checks the readings against ST's

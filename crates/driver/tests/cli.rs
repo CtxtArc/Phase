@@ -785,3 +785,77 @@ fn emit_c_writes_c_that_lives_next_to_a_vendor_header() {
     assert!(gen_c.contains("void USART2_IRQHandler(void) {\n    on_usart2();\n}"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn import_svd_prints_a_board_file_that_checks() {
+    let dir = std::env::temp_dir().join(format!("phase_svd_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("chip.svd"),
+        r#"<?xml version="1.0"?>
+<device><name>CHIP</name><size>32</size><peripherals>
+  <peripheral><name>UART0</name><baseAddress>0x40001000</baseAddress>
+    <interrupt><name>UART0</name><value>5</value></interrupt>
+    <registers>
+      <register><name>DR</name><addressOffset>0</addressOffset></register>
+      <register><name>SR</name><addressOffset>4</addressOffset><access>read-only</access>
+        <fields><field><name>TXE</name><bitOffset>7</bitOffset><bitWidth>1</bitWidth></field></fields>
+      </register>
+      <register><name>SR_ALT</name><addressOffset>4</addressOffset></register>
+    </registers>
+  </peripheral>
+  <peripheral derivedFrom="UART0"><name>UART1</name><baseAddress>0x40002000</baseAddress></peripheral>
+</peripherals></device>
+"#,
+    )
+    .unwrap();
+    let out = phase()
+        .arg("import-svd")
+        .arg(dir.join("chip.svd"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stdout.contains("device UART0: UART0_Type @ 0x40001000;"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("const UART0_IRQn: u32 = 5;"), "{stdout}");
+    assert!(
+        stderr.contains("note: UART0.SR_ALT: at the same offset as 'SR'"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("OK: imported 2 devices"), "{stderr}");
+    std::fs::write(dir.join("board.phase"), stdout.as_bytes()).unwrap();
+    std::fs::write(
+        dir.join("main.phase"),
+        "import \"board.phase\";\nfn main() {}\n",
+    )
+    .unwrap();
+    let check = phase()
+        .arg("check")
+        .arg(dir.join("main.phase"))
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let only = phase()
+        .args(["import-svd", "--only=uart1"])
+        .arg(dir.join("chip.svd"))
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&only.stdout).contains("device UART1 @ 0x40002000 {"));
+    let bad = phase()
+        .arg("import-svd")
+        .arg(dir.join("main.phase"))
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    let _ = std::fs::remove_dir_all(&dir);
+}
