@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.4.0"
+version = "3.0.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "PHASE: a compiler that statically checks physical-domain safety (DMA, MMIO, devices) for hardware pipelines"

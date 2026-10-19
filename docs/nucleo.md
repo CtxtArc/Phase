@@ -9,7 +9,8 @@ flashes it and passes its console (USART2) through as a serial port.
 
 For each program: the console output, and anything that differs from what
 is expected below. If one hangs, the last lines before it. That is the
-evidence 3.0 ships on.
+evidence these programs still owe: 3.0 shipped on the NUCLEO-F103RB blink
+program (last section), and these are not yet run on a board.
 
 ## What you need
 
@@ -128,8 +129,13 @@ Expect `tick 1` .. `tick 16` and LD2 blinking four times a second, as with
   debugger reports a Cortex-M3 where you expected an M4: `phase` builds
   for the board you name, so name the one in front of you.
 
-Checked without the board: the board file and the blink program pass
-`phase check`, run as a host build, and the runtime compiles for both
-boards. The board file has not yet been compared with ST's CMSIS header
-(`stm32f103xb.h`) the way the F401RE's is, and the program has not yet
-run on the board.
+Verified on a real NUCLEO-F103RB: the blink program builds, flashes with
+probe-rs, prints `tick 1` .. `tick 16` and `[phase] main returned` on the
+ST-LINK's serial port, and blinks LD2 (the console, TIM2 interrupts and
+the F1's GPIO configuration all work on the chip). If the board was
+running another program, its last console lines can show before the
+first `tick`.
+
+Not yet done: the board file has not been compared with ST's CMSIS header
+(`stm32f103xb.h`) the way the F401RE's is, and there is no DMA support for
+this board.

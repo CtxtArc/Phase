@@ -192,10 +192,14 @@ flashes and runs, SVD import, `sync` tied to the device's own done flag,
 peripheral registers as transfer sources, and the interop pieces. That is
 enough for an ADC-to-memory DMA driver in PHASE without C for the
 hand-off — `examples/nucleo_adc_dma.phase` — which is the "survives a
-real board" bar for 3.0, once it has run on the board.
+real board" bar. 3.0 shipped before that bar was met: the program that
+has run on silicon is the NUCLEO-F103RB blink program, and
+`nucleo_adc_dma` is still to run on a NUCLEO-F401RE.
 
 After 3.0, in order:
 
+0. DMA on silicon: a DMA1 model for the NUCLEO-F103RB (channels, not
+   streams), or the F401RE programs on a real F401RE.
 1. Per-engine domains in the type system (two streams told apart at
    compile time).
 2. Memory regions, static buffers and alignment, plus cache maintenance

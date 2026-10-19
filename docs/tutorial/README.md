@@ -28,7 +28,7 @@ $ cd docs/tutorial
 
 ```console
 $ phase --version
-phase 2.4.0
+phase 3.0.0
 ```
 
 Work inside the clone (here, `docs/tutorial/`): `phase build` finds the

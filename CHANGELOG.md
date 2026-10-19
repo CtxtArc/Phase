@@ -6,7 +6,12 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Toward 3.0: PHASE on a real board, and inside other people's projects.
+## [3.0.0] — 2026-10-19
+
+PHASE on a real board, and inside other people's projects. What has run on
+silicon: the NUCLEO-F103RB blink program. The NUCLEO-F401RE target, its
+DMA and ADC programs included, is implemented and tested on QEMU, and
+still awaits a board.
 
 ### Added
 
@@ -15,7 +20,9 @@ Toward 3.0: PHASE on a real board, and inside other people's projects.
   (`.elf` and `.bin`, `--run` flashes with probe-rs, OpenOCD or st-flash
   and shows the console). `examples/devices/nucleo_f103rb.phase` declares
   its RCC, GPIO (CRL/CRH), USART1-3, TIM2-4 and NVIC;
-  `examples/nucleo_f103rb_blink.phase` is its first program. No DMA yet.
+  `examples/nucleo_f103rb_blink.phase` is its first program, and has run
+  on a real NUCLEO-F103RB: the console, TIM2 interrupts and LD2. No DMA
+  yet (the F103 has DMA1 only, with channels instead of streams).
   The NUCLEO runtime also sets `DBGMCU_CR` so the debugger survives the
   final `wfi`, and `probe-rs` is now run with `--connect-under-reset`.
 - **`--target=nucleo-f401re`**: ST's NUCLEO-F401RE (STM32F401RE,
@@ -24,7 +31,8 @@ Toward 3.0: PHASE on a real board, and inside other people's projects.
   serial port until `main` returns. `examples/devices/nucleo_f401re.phase`
   declares its RCC, GPIO, USARTs, both DMA controllers (stream registers as
   arrays, PAR/M0AR/M1AR as `address` registers), ADC1, TIM2–5 and the
-  NVIC, with ST's IRQ numbers. `docs/nucleo.md` is how to run it.
+  NVIC, with ST's IRQ numbers. `docs/nucleo.md` is how to run it. Its
+  programs have not yet run on the chip.
 - `scripts/check_against_cmsis.sh` (run by CI): the board file against
   ST's own `stm32f401xe.h` — 212 register addresses, 333 fields and 25 IRQ
   numbers, checked by a C compiler.

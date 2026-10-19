@@ -1055,6 +1055,18 @@ runs the blink program on QEMU's STM32F405 board (`netduinoplus2`), which
 has the same core, memory map, USART2 and TIM2 but no model of the F4's
 RCC, GPIO or DMA.
 
+**A second board: the NUCLEO-F103RB (v3.0).** `--target=nucleo-f103rb`
+builds for ST's NUCLEO-F103RB (STM32F103RB: Cortex-M3, 128 KB flash at
+0x08000000, 20 KB SRAM at 0x20000000, one DMA controller), the same way:
+`.elf` and `.bin`, `--run` flashing with `probe-rs` (`STM32F103RBTx`),
+OpenOCD (`stm32f1x.cfg`) or `st-flash`, the console on USART2 through the
+ST-LINK. The chip runs from its 8 MHz internal oscillator; the F1's GPIO
+has CRL/CRH instead of MODER/AFR, and port A's clock is in
+`RCC.APB2ENR`. `examples/devices/nucleo_f103rb.phase` declares RCC, GPIO,
+USART1-3, TIM2-4 and the NVIC; `examples/nucleo_f103rb_blink.phase` is the
+program that has run on this board. DMA is not modeled yet: the F103 has
+DMA1 only, with channels rather than streams.
+
 ### 5.4 Inside another project (v3.0)
 
 PHASE needn't own the build. `phase emit-c` checks a program and writes
@@ -1154,7 +1166,8 @@ options:
   --target=TARGET              (build) host (default), or an .elf for the
                                 MPS2 AN385 (mps2-an385, Cortex-M3) or AN505
                                 (mps2-an505, Cortex-M33) board, or the
-                                NUCLEO-F401RE (nucleo-f401re) (§5.3)
+                                NUCLEO-F401RE (nucleo-f401re) or
+                                NUCLEO-F103RB (nucleo-f103rb) (§5.3)
   --run                        (build) run the result: the host binary, the
                                 .elf on qemu-system-arm, or flashed to the
                                 NUCLEO with its console shown
@@ -1804,15 +1817,17 @@ programmed entirely from PHASE, each copy checked word by word;
 `docs/real_boards.md`, what PHASE needs for real boards; bug-gallery
 #45–#48.
 
-**v3.0 — Real boards, and other people's projects** *(in progress)*
-`--target=nucleo-f401re` for ST's NUCLEO-F401RE, with a board file checked
-against ST's CMSIS header (§5.3); `sync` that waits on the device's own
+**v3.0 — Real boards, and other people's projects** *(released 2026-10-19)*
+`--target=nucleo-f103rb` for ST's NUCLEO-F103RB, whose blink program has
+run on the board; `--target=nucleo-f401re` for ST's NUCLEO-F401RE, with a
+board file checked against ST's CMSIS header (§5.3); `sync` that waits on the device's own
 register (`address until`, §3.7); `address_of(Dev.REG)`; IRQs named by
 constants, emitted under CMSIS's handler names (§3.16); `phase emit-c`,
 prefixed C names and the boundary contract, for using PHASE inside an
-existing project (§5.4); `phase import-svd`. Output: three programs for the
-board, the last an ADC-to-memory DMA driver written in PHASE down to the
-hand-off. Released once they have run on the board.
+existing project (§5.4); `phase import-svd`. Output: the F103RB blink
+program on silicon, and three F401RE programs, the last an ADC-to-memory
+DMA driver written in PHASE down to the hand-off, written and tested on
+QEMU, still to run on that board.
 
 **M12 — LLVM backend** *(not yet started)*
 An alternative to `codegen_c` that lowers PIR straight to LLVM IR instead

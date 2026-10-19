@@ -7,7 +7,7 @@
 **A compiler that statically checks memory safety for hardware pipelines — DMA, MMIO, and zero-copy devices — before the code ever runs.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.4.0-success" alt="Version 2.4.0">
+  <img src="https://img.shields.io/badge/version-3.0.0-success" alt="Version 3.0.0">
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
 </p>
@@ -545,14 +545,17 @@ has to discover the hard way:
   but not at run time, and the fuzzer uses three buffer types, one
   typestate machine and one device. Their silence is strong evidence for
   the rules they exercise, not a proof of everything.
-- **Three hardware targets, none yet proven on silicon.**
+- **Four hardware targets, one proven on silicon.**
   `--target=mps2-an385` (ARM Cortex-M3) and `--target=mps2-an505`
   (Cortex-M33 with PL081 DMA) are validated on QEMU's models of the
-  boards. `--target=nucleo-f401re` is a real board: its board file is
-  checked against ST's header and its programs partly on QEMU's STM32F405
-  model, but its DMA and ADC programs have yet to run on the chip. Another
-  board needs its own startup code, linker script and wait functions
-  under `runtime/`. `sync` waits on the device itself only for a buffer
+  boards. `--target=nucleo-f103rb` (ST NUCLEO-F103RB, Cortex-M3) is the
+  one that has run on a real board: its blink program (TIM2 interrupts,
+  GPIO and the ST-LINK console) was flashed and run on the chip, and it
+  has no DMA support yet. `--target=nucleo-f401re` (NUCLEO-F401RE) has a
+  board file checked against ST's header and its blink program run on
+  QEMU's STM32F405 model, but its DMA and ADC programs have yet to run on
+  the chip. Another board needs its own startup code, linker script and
+  wait functions under `runtime/`. `sync` waits on the device itself only for a buffer
   handed over through a register that says when the device is done
   (`address until CR.EN == 0`, since 3.0); one handed over by a C extern
   still waits on a stand-in, and `wait E for b` relies on the program's
@@ -605,17 +608,20 @@ hover and go-to-definition; 2.2 brought interrupts, 2.1 imports and
 device types, 2.0 register maps, a Cortex-M3 target and the language
 server (see [`CHANGELOG.md`](CHANGELOG.md)).
 
-3.0 is the real-board release, and its pieces are in
-([`CHANGELOG.md`](CHANGELOG.md), Unreleased): a NUCLEO-F401RE target with a
-board file checked against ST's own header, `sync` that waits on the DMA
-stream itself, an ADC-to-memory DMA driver written in PHASE down to the
-hand-off, board files imported from CMSIS-SVD, and `phase emit-c` for
-using PHASE as one checked layer inside an existing STM32 project
-([`docs/embedding.md`](docs/embedding.md),
-[`docs/boundary.md`](docs/boundary.md)). It ships once the three NUCLEO
-programs have run on the board ([`docs/nucleo.md`](docs/nucleo.md)).
-After that:
+3.0 is the real-board release ([`CHANGELOG.md`](CHANGELOG.md)): a
+NUCLEO-F103RB target whose blink program has run on the board, a
+NUCLEO-F401RE target with a board file checked against ST's own header,
+`sync` that waits on the DMA stream itself, an ADC-to-memory DMA driver
+written in PHASE down to the hand-off, board files imported from
+CMSIS-SVD, and `phase emit-c` for using PHASE as one checked layer inside
+an existing STM32 project ([`docs/embedding.md`](docs/embedding.md),
+[`docs/boundary.md`](docs/boundary.md)). What ran on silicon is the
+F103RB blink program; the F401RE's three programs are written and
+QEMU-tested, and still to run on a board
+([`docs/nucleo.md`](docs/nucleo.md)). After that:
 
+- **DMA on silicon**: a DMA1 model for the F103RB, or the F401RE
+  programs on a real F401RE.
 - **The VS Code extension**, packaged as a `.vsix` and tried installed.
 - **Per-engine domains, static buffers, memory regions and caches** — the
   rest of [`docs/real_boards.md`](docs/real_boards.md).
