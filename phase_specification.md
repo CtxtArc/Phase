@@ -2,7 +2,7 @@
 
 **A physical-domain safety language for signal, RF, and embedded pipelines**
 
-Version 2.4
+Version 3.0
 
 ---
 
@@ -65,7 +65,9 @@ class a compile-time error instead of a runtime incident.
   GPU/FPGA support is explicitly future work.
 - Not tied to real silicon. The default target is simulated hardware
   running on the host, so the project is fully testable without an SDR or a
-  microcontroller; a real ARM Cortex-M3 runtime exists alongside it (§5.3).
+  microcontroller; bare-metal ARM runtimes exist alongside it, for two
+  MPS2 boards on QEMU and two ST NUCLEO boards (§5.3), of which the
+  NUCLEO-F103RB has run a PHASE program on the chip.
 
 ### 1.4 Why this is a good portfolio compiler project
 
@@ -299,7 +301,8 @@ is an error, as is using `Uart0` as a value.
 Codegen lays each device out as a C struct of `volatile` members at the
 declared offsets (each one checked by `_Static_assert`), with
 `Dev_REG_FIELD_Pos`/`_Msk` macros so hand-written C can use the same
-fields. On a hardware target (`--target=mps2-an385` or `mps2-an505`, §5.3) the device
+fields. On a hardware target (`--target=mps2-an385`, `mps2-an505`, `nucleo-f401re` or
+`nucleo-f103rb`, §5.3) the device
 macro is the declared address; in a host build it is a simulated register
 block that starts from the declared reset values. A field write is a
 read-modify-write and is not atomic with respect to an interrupt handler
@@ -1847,8 +1850,9 @@ immediately as the language grows.
 
 - Not a replacement for C, Rust, or CUDA.
 - No LLVM backend (documented future work, M12).
-- One hardware target (the MPS2 AN385 board, §5.3). Others need their own
-  startup, linker script and wait functions under `runtime/`.
+- Four hardware targets (the MPS2 AN385 and AN505 boards on QEMU, and the
+  NUCLEO-F103RB and NUCLEO-F401RE, §5.3). Others need their own startup,
+  linker script and wait functions under `runtime/`.
 - No interprocedural analysis beyond signatures: each function is checked
   against the signatures of the functions it calls — including any
   declared domain changes (§3.11) — and `extern fn` bodies are trusted

@@ -806,6 +806,12 @@ OK: built /path/to/phase/build/uart_hello.elf for mps2-an385; running it on qemu
 Hello from PHASE
 ```
 
+The same style runs on a real board: `examples/nucleo_f103rb_blink.phase`
+blinks the LED of ST's NUCLEO-F103RB from a timer interrupt and prints a
+line per tick on the board's USB serial port. `phase build
+--target=nucleo-f103rb --run` flashes it (this needs the board and
+`probe-rs`, OpenOCD or `st-flash`; see [`docs/nucleo.md`](../nucleo.md)).
+
 ## 9. Interrupts
 
 Hardware doesn't wait to be asked: a timer reaching zero, a UART that
@@ -1096,3 +1102,5 @@ OK: built /path/to/phase/build/7_packet-checked
 - Writing the C side: `runtime/radio_pipeline_extern.c` shows how
   `extern fn`s are implemented — each buffer arrives as a pointer and a
   length.
+- [`docs/nucleo.md`](../nucleo.md) — running PHASE on a NUCLEO board:
+  build, flash, and read the console.

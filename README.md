@@ -217,6 +217,21 @@ with real DMA controllers: `examples/dma_stream.phase` streams ten blocks
 through its PL081, each half of the buffer handed to `main` by the
 controller's interrupt.
 
+PHASE also runs on real boards. `--target=nucleo-f103rb` and
+`--target=nucleo-f401re` build for ST's NUCLEO-F103RB and NUCLEO-F401RE;
+`--run` flashes the board (with `probe-rs`, OpenOCD or `st-flash`) and
+shows its console from the ST-LINK's USB serial port.
+`phase build --target=nucleo-f103rb --run examples/nucleo_f103rb_blink.phase`
+blinks LD2 from a timer interrupt and prints `tick 1` .. `tick 16`; that
+program has run on a NUCLEO-F103RB. The F401RE target is checked against
+ST's own CMSIS header and its blink program runs on QEMU's STM32F405
+model; its DMA and ADC programs have yet to run on the chip
+([`docs/nucleo.md`](docs/nucleo.md)). `phase emit-c` writes the checked C
+for use inside an existing STM32 project
+([`docs/embedding.md`](docs/embedding.md)), and `phase import-svd` makes
+a board file from a chip's CMSIS-SVD description
+([`docs/svd_import.md`](docs/svd_import.md)).
+
 Interrupts are part of the language too — a handler bound to its IRQ,
 an event it signals, and `main` sleeping until it does:
 
@@ -322,13 +337,15 @@ crates/
   codegen_c/   lowers PIR to raw C source
   driver/      the `phase` CLI, including the language server (`phase lsp`)
   fuzz/        phase-fuzz: differential fuzzer (+ regressions/, every past finding)
+  svd/         `phase import-svd`: CMSIS-SVD to board files
 
 runtime/
   phase_runtime.h/.c   generic sim_dma_wait/sim_device_wait, always linked
   phase_check.h/.c     runtime ownership checker, linked by `phase build --checked`
   *_extern.c           one per demo program, implementing that program's extern fns
-  hw/                  bare-metal ARM backend for --target=mps2-an385 / mps2-an505 (startup,
-                       linker script, real sim_dma_wait/sim_device_wait, memset/memcpy)
+  hw/                  bare-metal ARM backend for --target=mps2-an385 / mps2-an505 /
+                       nucleo-f401re / nucleo-f103rb (startup, linker script, board
+                       header, real sim_dma_wait/sim_device_wait, memset/memcpy)
 
 editors/
   vscode/              TextMate grammar + an extension that starts `phase lsp`
@@ -338,6 +355,7 @@ editors/
 examples/
   *.phase              programs that pass analysis (sdr_session.phase is the fullest)
   devices/             board support: device types and devices to `import`
+  embedding/           PHASE as one layer inside a vendor (STM32) project
   bug_gallery/         one deliberately-broken file per bug class
 
 demos/
@@ -347,11 +365,16 @@ docs/
   tutorial/                   PHASE in 15 minutes: the programs, and the page generated from them
   bug_gallery_transcript.md   generated: real compiler output for every example
   security_mapping.md         the CWE/CVE write-up
+  nucleo.md                   running PHASE on the NUCLEO-F103RB / F401RE boards
+  embedding.md, boundary.md   PHASE inside another project, and what the C side must promise
+  svd_import.md               board files from CMSIS-SVD
+  real_boards.md              what real boards still need
 
 scripts/
   capture_bug_gallery.sh      regenerates the transcript from real compiler output
   render_tutorial.py          regenerates docs/tutorial/README.md by running its programs
   build_hw_demo.sh            runs the hardware examples on QEMU (--target=<board> --run)
+  check_against_cmsis.sh      checks the NUCLEO-F401RE board file against ST's CMSIS header
 ```
 
 ## Building and testing
@@ -363,7 +386,10 @@ gcc-arm-none-eabi qemu-system-arm`) — everything else works without them,
 and the one test that needs them
 (`hardware_examples_run_on_the_mps2_boards_under_qemu`) skips itself
 with a clear message if they're missing. (CI sets
-`PHASE_REQUIRE_HW_TOOLS=1`, which turns that skip into a failure.)
+`PHASE_REQUIRE_HW_TOOLS=1`, which turns that skip into a failure.) The
+NUCLEO targets build with the same `arm-none-eabi-gcc`; flashing one with
+`--run` also needs `probe-rs`, OpenOCD or `st-flash`, and access to the
+board's serial port ([`docs/nucleo.md`](docs/nucleo.md)).
 
 ```bash
 cargo build --release
@@ -401,6 +427,13 @@ phase build examples/mmio_registers.phase
 
 # Cross-compile for the ARM MPS2 AN385 board (Cortex-M3) and run it on QEMU
 phase build --target=mps2-an385 --run examples/uart_hello.phase
+
+# Build for a NUCLEO board, flash it and show its console (needs the board)
+phase build --target=nucleo-f103rb --run examples/nucleo_f103rb_blink.phase
+
+# The checked C for another project's build; a board file from an SVD
+phase emit-c --out-dir=generated examples/nucleo_adc_dma.phase
+phase import-svd --only=GPIOA,USART2 STM32F401.svd
 
 # The language server your editor talks to (see editors/README.md)
 phase lsp
@@ -497,6 +530,15 @@ host build runs the same program against a simulated PL081.
 `examples/hw_uart_echo.phase`: a buffer handed to the UART as a device,
 built for the same board — its `sync()` is a real register poll on real
 (emulated) hardware, not the host's simulated address space.
+
+`examples/nucleo_f103rb_blink.phase` and `examples/nucleo_blink.phase`:
+a TIM2 interrupt blinks the board's LED (LD2) and counts the blinks on
+its console, for the NUCLEO-F103RB and NUCLEO-F401RE. The F103RB one has
+run on the board. `examples/nucleo_dma_copy.phase` (DMA2 memory to memory)
+and `examples/nucleo_adc_dma.phase` (ADC1 into a buffer through DMA2,
+taken back by `sync` on the stream's own enable bit) are the F401RE's DMA
+programs, and have yet to run on the chip. `examples/dma_sync.phase`
+shows the same `sync` on QEMU's PL081.
 
 `examples/mmio_poll.phase`: a real
 `while volatile_read(READY @MMIO) == 0 { .. }` polling loop, with the
