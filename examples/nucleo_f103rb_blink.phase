@@ -1,0 +1,63 @@
+// The first program for the NUCLEO-F103RB: a timer interrupt blinks the
+// board's green LED (LD2) and counts the blinks on its console.
+//
+// TIM2 counts the 8 MHz bus clock down to 1 kHz (PSC) and raises its
+// interrupt four times a second (ARR). The handler clears the flag and
+// signals `tick`; `main` sleeps in `wait tick`, toggles LD2 through BSRR,
+// and reports. Its status flag is `rc_w0` -- cleared by writing 0 -- so
+// the handler writes the whole register: a field write there would read
+// SR and write back the flags it found, losing one set in between.
+//
+//   phase build --target=nucleo-f103rb --run examples/nucleo_f103rb_blink.phase
+//
+// flashes the board and shows its console (the ST-LINK's serial port at
+// 115200 baud): `tick 1` .. `tick 16`, four a second, with LD2 blinking.
+// A host build runs the same program, with each `wait` running the
+// handler once, as if the timer had just fired.
+
+import "devices/nucleo_f103rb.phase";
+
+event tick;
+
+// Emitted as TIM2_IRQHandler too: the vector's name in ST's startup file.
+interrupt fn on_tim2() @ irq TIM2_IRQn {
+    volatile_write(Tim2.SR, 0);
+    signal tick;
+}
+
+extern fn report(n: u32);
+
+const TICKS: u32 = 16;
+
+fn main() {
+    // Clocks for port A (LD2) and TIM2; PA5 a push-pull output (the F1
+    // sets a pin's mode and configuration in one four-bit field).
+    volatile_write(Rcc.APB2ENR.IOPAEN, 1);
+    volatile_write(Rcc.APB1ENR.TIM2EN, 1);
+    volatile_write(GpioA.CRL.CNF5, GPIO_CNF_OUT_PUSH_PULL);
+    volatile_write(GpioA.CRL.MODE5, GPIO_MODE_OUTPUT_2MHZ);
+
+    // 8 MHz / 8000 = 1 kHz; 250 counts = 4 Hz.
+    volatile_write(Tim2.PSC, 7999);
+    volatile_write(Tim2.ARR, 249);
+    volatile_write(Tim2.EGR, 1);    // UG: load PSC now (this sets UIF)
+    volatile_write(Tim2.SR, 0);     // so clear it before enabling the interrupt
+    volatile_write(Tim2.DIER.UIE, 1);
+    volatile_write(Nvic.ISER[0], 1 << TIM2_IRQn);
+    volatile_write(Tim2.CR1.CEN, 1);
+
+    let n: u32 = 0;
+    while n < TICKS {
+        wait tick;
+        n = n + 1;
+        if n - n / 2 * 2 == 1 {
+            volatile_write(GpioA.BSRR, LD2);         // on
+        } else {
+            volatile_write(GpioA.BSRR, LD2 << 16);   // off
+        }
+        report(n);
+    }
+
+    volatile_write(Tim2.CR1.CEN, 0);
+    volatile_write(Nvic.ICER[0], 1 << TIM2_IRQn);
+}

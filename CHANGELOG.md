@@ -10,6 +10,14 @@ Toward 3.0: PHASE on a real board, and inside other people's projects.
 
 ### Added
 
+- **`--target=nucleo-f103rb`**: ST's NUCLEO-F103RB (STM32F103RB,
+  Cortex-M3, 128 KB flash, 20 KB RAM). Same flow as the F401RE target
+  (`.elf` and `.bin`, `--run` flashes with probe-rs, OpenOCD or st-flash
+  and shows the console). `examples/devices/nucleo_f103rb.phase` declares
+  its RCC, GPIO (CRL/CRH), USART1-3, TIM2-4 and NVIC;
+  `examples/nucleo_f103rb_blink.phase` is its first program. No DMA yet.
+  The NUCLEO runtime also sets `DBGMCU_CR` so the debugger survives the
+  final `wfi`, and `probe-rs` is now run with `--connect-under-reset`.
 - **`--target=nucleo-f401re`**: ST's NUCLEO-F401RE (STM32F401RE,
   Cortex-M4). Builds an `.elf` and a `.bin`; `--run` flashes the board
   (probe-rs, OpenOCD or st-flash) and shows its console from the ST-LINK's

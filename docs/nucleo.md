@@ -99,3 +99,37 @@ The chip's 16 MHz internal oscillator, as it starts: no PLL, every bus at
 16 MHz. The runtime sets up USART2 (PA2/PA3, 115200 baud) before `main`
 and prints the last line after it. With a debugger attached the program
 then stops with a semihosting exit; without one, the core sleeps.
+
+## The NUCLEO-F103RB (Cortex-M3)
+
+`--target=nucleo-f103rb` builds for ST's NUCLEO-F103RB (STM32F103RB:
+Cortex-M3, 128 KB flash, 20 KB RAM, one DMA controller). Same ST-LINK, same
+virtual COM port (USART2 on PA2/PA3), same LD2 on PA5 as the F401RE, so
+the steps above apply: build, flash with `--run`, read the console at
+115200 baud.
+
+```sh
+phase build --target=nucleo-f103rb --run examples/nucleo_f103rb_blink.phase
+```
+
+Expect `tick 1` .. `tick 16` and LD2 blinking four times a second, as with
+`nucleo_blink`. What differs from the F401RE:
+
+- The chip starts on its 8 MHz internal oscillator, so every bus runs at
+  8 MHz; the console's baud rate and TIM2's prescaler are set for that.
+- The GPIO ports have no MODER/AFR registers; a pin's mode and
+  configuration sit in four-bit fields of CRL/CRH, and port A's clock is
+  `RCC.APB2ENR.IOPAEN`. `examples/devices/nucleo_f103rb.phase` declares
+  RCC, GPIO, USART1-3, TIM2-4 and the NVIC, with ST's IRQ numbers.
+- No DMA yet: the F103 has DMA1 only, with channels, not streams, so
+  `nucleo_dma_copy` and `nucleo_adc_dma` need their own versions.
+- Flashing uses `probe-rs --chip STM32F103RBTx` or OpenOCD's
+  `target/stm32f1x.cfg`. A board is not the chip you think it is if the
+  debugger reports a Cortex-M3 where you expected an M4: `phase` builds
+  for the board you name, so name the one in front of you.
+
+Checked without the board: the board file and the blink program pass
+`phase check`, run as a host build, and the runtime compiles for both
+boards. The board file has not yet been compared with ST's CMSIS header
+(`stm32f103xb.h`) the way the F401RE's is, and the program has not yet
+run on the board.

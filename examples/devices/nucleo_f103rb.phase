@@ -1,0 +1,146 @@
+// Board support for the ST NUCLEO-F103RB (STM32F103RB, Cortex-M3): the
+// peripherals PHASE's examples use, at their real addresses. Import it and
+// use the devices:
+//
+//     import "devices/nucleo_f103rb.phase";
+//
+// Addresses, offsets, bit positions and IRQ numbers are ST's: the
+// reference manual (RM0008) and its CMSIS header, stm32f103xb.h.
+//
+// The board runs from its 8 MHz internal oscillator (HSI), which is how
+// the chip starts: every bus clock is 8 MHz. A peripheral's clock is off
+// until its bit in RCC.AHBENR / APB1ENR / APB2ENR is set.
+//
+// Only what the blink program needs so far: no DMA, no ADC. The F103 has
+// one DMA controller (DMA1, seven channels, no streams), so the F401RE's
+// DMA programs do not carry over as they are.
+//
+// Status flags that are cleared by writing 0 are `rc_w0`: write the whole
+// register (`volatile_write(Tim2.SR, 0)`), never one field of it, or a
+// flag the hardware sets in between is lost (bug gallery #46, spec §3.7).
+
+// ---- Reset and clock control -------------------------------------------
+
+device Rcc @ 0x40021000 {
+    CR:      read write u32 @ 0x00 { HSION: bit 0, HSIRDY: bit 1, HSEON: bit 16, PLLON: bit 24 }
+    CFGR:    read write u32 @ 0x04 { SW: bits 0..=1, SWS: bits 2..=3, HPRE: bits 4..=7, PPRE1: bits 8..=10, PPRE2: bits 11..=13 }
+    AHBENR:  read write u32 @ 0x14 = 0 { DMA1EN: bit 0 }
+    APB2ENR: read write u32 @ 0x18 = 0 {
+        AFIOEN: bit 0, IOPAEN: bit 2, IOPBEN: bit 3, IOPCEN: bit 4, USART1EN: bit 14
+    }
+    APB1ENR: read write u32 @ 0x1C = 0 {
+        TIM2EN: bit 0, TIM3EN: bit 1, TIM4EN: bit 2, USART2EN: bit 17, USART3EN: bit 18
+    }
+}
+
+// ---- GPIO ---------------------------------------------------------------
+// Four bits per pin in CRL (pins 0-7) and CRH (pins 8-15): MODE (0 input,
+// 1 / 2 / 3 output at 10 / 2 / 50 MHz) then CNF. For an output, CNF 0 is
+// push-pull and 2 alternate-function push-pull; for an input, 1 is
+// floating (the reset state), 2 pull-up / pull-down.
+// BSRR sets (bits 0-15) or resets (bits 16-31) pins in one write, with
+// no read-modify-write: the way to drive a pin an interrupt also drives.
+
+device type Stm32F1Gpio {
+    CRL:  read write u32 @ 0x00 = 0x44444444 {
+        MODE2: bits 8..=9, CNF2: bits 10..=11, MODE3: bits 12..=13, CNF3: bits 14..=15,
+        MODE5: bits 20..=21, CNF5: bits 22..=23
+    }
+    CRH:  read write u32 @ 0x04 = 0x44444444;
+    IDR:  read u32 @ 0x08 { IDR13: bit 13 }
+    ODR:  read write u32 @ 0x0C { ODR5: bit 5 }
+    BSRR: write u32 @ 0x10 { BS5: bit 5, BR5: bit 21 }
+    BRR:  write u32 @ 0x14;
+}
+
+device GpioA: Stm32F1Gpio @ 0x40010800;
+device GpioB: Stm32F1Gpio @ 0x40010C00;
+device GpioC: Stm32F1Gpio @ 0x40011000;
+
+// The NUCLEO-64's green user LED, LD2, is PA5; the blue user button, B1,
+// is PC13 (reads 0 while pressed). PA2/PA3 are USART2's TX/RX, wired to
+// the ST-LINK's virtual COM port.
+const GPIO_MODE_OUTPUT_2MHZ: u32 = 2;
+const GPIO_CNF_OUT_PUSH_PULL: u32 = 0;
+const GPIO_CNF_OUT_AF_PUSH_PULL: u32 = 2;
+const LD2: u32 = 1 << 5;
+
+// ---- USART --------------------------------------------------------------
+
+device type Stm32Usart {
+    // RXNE and TC are cleared by writing 0; PE..IDLE are cleared by
+    // reading SR then DR.
+    SR:   read write u32 @ 0x00 {
+        PE: bit 0, FE: bit 1, NE: bit 2, ORE: bit 3, IDLE: bit 4,
+        RXNE: bit 5 rc_w0, TC: bit 6 rc_w0, TXE: bit 7, LBD: bit 8 rc_w0, CTS: bit 9 rc_w0
+    }
+    DR:   read write u32 @ 0x04 { DR: bits 0..=8 }
+    BRR:  read write u32 @ 0x08 { DIV_FRACTION: bits 0..=3, DIV_MANTISSA: bits 4..=15 }
+    CR1:  read write u32 @ 0x0C = 0 {
+        SBK: bit 0, RWU: bit 1, RE: bit 2, TE: bit 3, IDLEIE: bit 4, RXNEIE: bit 5,
+        TCIE: bit 6, TXEIE: bit 7, PEIE: bit 8, PS: bit 9, PCE: bit 10, WAKE: bit 11,
+        M: bit 12, UE: bit 13
+    }
+    CR2:  read write u32 @ 0x10;
+    CR3:  read write u32 @ 0x14 { DMAR: bit 6, DMAT: bit 7 }
+    GTPR: read write u32 @ 0x18;
+}
+
+device Usart1: Stm32Usart @ 0x40013800;
+device Usart2: Stm32Usart @ 0x40004400;
+device Usart3: Stm32Usart @ 0x40004800;
+
+// 115200 baud from an 8 MHz bus clock: 8e6 / (16 * 115200) = 4.34,
+// mantissa 4, fraction 0.34 * 16 = 5.
+const BRR_115200_AT_8MHZ: u32 = 4 << 4 | 5;
+
+// ---- General-purpose timers ----------------------------------------------
+// The F103's TIM2-4 count to a 16-bit ARR. The counter runs at the bus
+// clock divided by PSC + 1; reaching ARR sets SR.UIF, and raises the
+// timer's interrupt with DIER.UIE set.
+
+device type Stm32GpTimer {
+    CR1:  read write u32 @ 0x00 = 0 { CEN: bit 0, UDIS: bit 1, URS: bit 2, OPM: bit 3, DIR: bit 4, ARPE: bit 7 }
+    CR2:  read write u32 @ 0x04;
+    DIER: read write u32 @ 0x0C = 0 { UIE: bit 0, CC1IE: bit 1 }
+    SR:   read write u32 @ 0x10 { UIF: bit 0 rc_w0, CC1IF: bit 1 rc_w0, CC2IF: bit 2 rc_w0 }
+    EGR:  write u32 @ 0x14 { UG: bit 0 }
+    CNT:  read write u32 @ 0x24;
+    PSC:  read write u32 @ 0x28 { PSC: bits 0..=15 }
+    ARR:  read write u32 @ 0x2C;
+}
+
+device Tim2: Stm32GpTimer @ 0x40000000;
+device Tim3: Stm32GpTimer @ 0x40000400;
+device Tim4: Stm32GpTimer @ 0x40000800;
+
+// ---- NVIC -----------------------------------------------------------------
+// Writing 1 to bit n % 32 of ISER[n / 32] enables IRQ n; of ICER[n / 32]
+// disables it. Write whole registers: a 0 changes nothing. (The F103RB has
+// 60 interrupts, so two words of each register are in use.)
+
+device Nvic @ 0xE000E100 {
+    ISER[3]: read write u32 @ 0x000 step 4;
+    ICER[3]: read write u32 @ 0x080 step 4;
+    ISPR[3]: read write u32 @ 0x100 step 4;
+    ICPR[3]: read write u32 @ 0x180 step 4;
+}
+
+// IRQ numbers, named as in CMSIS (stm32f103xb.h): an
+// `interrupt fn h() @ irq TIM2_IRQn` is also emitted as TIM2_IRQHandler,
+// the name ST's startup file gives that vector.
+const DMA1_Channel1_IRQn: u32 = 11;
+const DMA1_Channel2_IRQn: u32 = 12;
+const DMA1_Channel3_IRQn: u32 = 13;
+const DMA1_Channel4_IRQn: u32 = 14;
+const DMA1_Channel5_IRQn: u32 = 15;
+const DMA1_Channel6_IRQn: u32 = 16;
+const DMA1_Channel7_IRQn: u32 = 17;
+const ADC1_2_IRQn: u32 = 18;
+const TIM2_IRQn: u32 = 28;
+const TIM3_IRQn: u32 = 29;
+const TIM4_IRQn: u32 = 30;
+const USART1_IRQn: u32 = 37;
+const USART2_IRQn: u32 = 38;
+const USART3_IRQn: u32 = 39;
+const EXTI15_10_IRQn: u32 = 40;

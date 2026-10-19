@@ -34,6 +34,10 @@
 
 /* Debug Halting Control and Status: C_DEBUGEN is set while a debugger
  * (the ST-LINK, under probe-rs or OpenOCD) is attached. */
+/* DBGMCU_CR (RM0368 section 29.16): keep the debug port alive in
+ * Sleep/Stop/Standby, so a `wfi` never cuts the ST-LINK off. */
+#define DBGMCU_CR F4_REG(0xE0042004u)
+#define DBGMCU_CR_DBG_ALL_LOW_POWER (0x7u)
 #define DHCSR F4_REG(0xE000EDF0u)
 #define DHCSR_C_DEBUGEN (1u << 0)
 

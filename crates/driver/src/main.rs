@@ -58,8 +58,10 @@ options:
                                (Cortex-M3) or AN505 board (Cortex-M33, with
                                PL081 DMA controllers) with arm-none-eabi-gcc
                                into <stem>.elf, devices at their real addresses;
-                               nucleo-f401re: the ST NUCLEO-F401RE board
-                               (STM32F401RE), into <stem>.elf and <stem>.bin
+                               nucleo-f401re / nucleo-f103rb: the ST
+                               NUCLEO-F401RE (STM32F401RE) or NUCLEO-F103RB
+                               (STM32F103RB) board, into <stem>.elf and
+                               <stem>.bin
   --run                        (build) run the result: the host binary, the
                                .elf under qemu-system-arm -M <board>, or on
                                the NUCLEO: flash it (probe-rs, openocd or
@@ -230,7 +232,7 @@ fn main() -> ExitCode {
             };
             if v != "host" && Board::named(&v).is_none() {
                 eprintln!(
-                    "error: unknown --target '{v}' (expected host, mps2-an385, mps2-an505 or nucleo-f401re)"
+                    "error: unknown --target '{v}' (expected host, mps2-an385, mps2-an505, nucleo-f401re or nucleo-f103rb)"
                 );
                 return ExitCode::FAILURE;
             }
@@ -648,7 +650,7 @@ fn finish_stlink_build(
     let (elf_s, bin_s) = (elf.display().to_string(), bin.display().to_string());
     println!("OK: built {elf_s} and {bin_s} for {board}");
     if !run {
-        println!("    flash it: copy {bin_s} to the board's USB drive (NOD_F401RE),");
+        println!("    flash it: copy {bin_s} to the board's USB drive (NOD_*),");
         println!("              or: probe-rs download --chip {chip} {elf_s} && probe-rs reset --chip {chip}");
         println!("    its console: the ST-LINK's serial port at 115200 baud (e.g. picocom -b 115200 /dev/ttyACM0)");
         println!("    or let `phase build --target={board} --run` do both");
@@ -807,11 +809,15 @@ fn flash_stlink(elf: &Path, bin: &Path, chip: &str, openocd_target: &str) -> Res
         }
     };
     if on_path("probe-rs") {
+        // Connect under reset: a program that sleeps (the final `wfi`) or
+        // reconfigures SWD pins can leave the core unreachable, and the
+        // flash algorithm then times out on a normal attach.
         let mut dl = Command::new("probe-rs");
-        dl.args(["download", "--chip", chip]).arg(elf);
+        dl.args(["download", "--chip", chip, "--connect-under-reset"])
+            .arg(elf);
         run(dl, "probe-rs")?;
         let mut reset = Command::new("probe-rs");
-        reset.args(["reset", "--chip", chip]);
+        reset.args(["reset", "--chip", chip, "--connect-under-reset"]);
         return run(reset, "probe-rs reset");
     }
     if on_path("openocd") {
@@ -876,7 +882,7 @@ enum RunsOn {
 }
 
 impl Board {
-    const ALL: [Board; 3] = [
+    const ALL: [Board; 4] = [
         Board {
             name: "mps2-an385",
             cpu: "cortex-m3",
@@ -903,6 +909,17 @@ impl Board {
             runs_on: RunsOn::StLink {
                 chip: "STM32F401RETx",
                 openocd_target: "target/stm32f4x.cfg",
+            },
+        },
+        Board {
+            name: "nucleo-f103rb",
+            cpu: "cortex-m3",
+            cflags: &[],
+            linker_script: "nucleo_f103rb.ld",
+            define: "PHASE_BOARD_NUCLEO_F103RB",
+            runs_on: RunsOn::StLink {
+                chip: "STM32F103RBTx",
+                openocd_target: "target/stm32f1x.cfg",
             },
         },
     ];

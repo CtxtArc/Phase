@@ -17,17 +17,31 @@
 #include "phase_hw.h"
 #include "phase_runtime.h"
 
-#if defined(PHASE_BOARD_NUCLEO_F401RE)
+#if defined(PHASE_BOARD_NUCLEO_F401RE) || defined(PHASE_BOARD_NUCLEO_F103RB)
+#if defined(PHASE_BOARD_NUCLEO_F103RB)
+#include "nucleo_f103rb.h"
+#else
 #include "nucleo_f401re.h"
+#endif
 
-/* USART2 on PA2 (TX) / PA3 (RX), alternate function 7: the ST-LINK's
- * virtual COM port. The chip runs from its 16 MHz HSI, as it starts. */
+/* USART2 on PA2 (TX) / PA3 (RX): the ST-LINK's virtual COM port, the same
+ * on both Nucleo-64 boards. The F401RE runs from its 16 MHz HSI, the F103RB
+ * from its 8 MHz one, as they start. */
 void phase_board_init(void) {
+    DBGMCU_CR |= DBGMCU_CR_DBG_ALL_LOW_POWER; /* debugger survives the final wfi */
+#if defined(PHASE_BOARD_NUCLEO_F103RB)
+    RCC_APB2ENR |= RCC_APB2ENR_IOPAEN;
+    RCC_APB1ENR |= RCC_APB1ENR_USART2EN;
+    (void)RCC_APB1ENR; /* the clock is on before the next access */
+    /* PA2: AF push-pull 2 MHz (0xA), PA3: floating input (0x4). */
+    GPIOA_CRL = (GPIOA_CRL & ~(0xFFu << 8)) | (0x4Au << 8);
+#else
     RCC_AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
     RCC_APB1ENR |= RCC_APB1ENR_USART2EN;
     (void)RCC_APB1ENR; /* the clock is on before the next access */
     GPIOA_MODER = (GPIOA_MODER & ~(0xFu << 4)) | (0xAu << 4); /* PA2, PA3: AF */
     GPIOA_AFRL = (GPIOA_AFRL & ~(0xFFu << 8)) | (0x77u << 8); /* AF7 */
+#endif
     USART2_BRR = USART_BRR_115200_HSI;
     USART2_CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
 }
@@ -88,7 +102,7 @@ static void wait_for_console_drain(void) {
 
 void phase_hw_puts(const char *s) {
     for (; *s; s++) {
-#if defined(PHASE_BOARD_NUCLEO_F401RE)
+#if defined(PHASE_BOARD_NUCLEO_F401RE) || defined(PHASE_BOARD_NUCLEO_F103RB)
         if (*s == '\n') {
             phase_hw_putc('\r'); /* a serial terminal wants CR LF */
         }
