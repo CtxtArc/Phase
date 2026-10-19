@@ -82,6 +82,12 @@ OK: examples/nucleo_blink.phase parsed and passed domain/ownership analysis (0 e
 OK: examples/nucleo_dma_copy.phase parsed and passed domain/ownership analysis (0 entities, 5 fns, 2 files)
 ```
 
+### `examples/nucleo_f103rb_blink.phase`
+
+```
+OK: examples/nucleo_f103rb_blink.phase parsed and passed domain/ownership analysis (0 entities, 2 fns, 2 files)
+```
+
 ### `examples/overlapped_capture.phase`
 
 ```
