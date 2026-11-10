@@ -37,6 +37,7 @@ module PhaseCore {
   type Env = map<BufId, Dom>
 
   function Check(env: Env, s: Stmt): Option<Env>
+    decreases s
   {
     match s
     case Skip => Some(env)
@@ -51,14 +52,14 @@ module PhaseCore {
     case Destroy(b) =>
       if b in env && env[b] == RAM then Some(env[b := Dead]) else None
     case Seq(s1, s2) =>
-      match Check(env, s1)
-      case None => None
-      case Some(mid) => Check(mid, s2)
+      (match Check(env, s1)
+       case None => None
+       case Some(mid) => Check(mid, s2))
     case If(t, e) =>
       // Rule 5: both branches must leave every buffer in the same domain.
-      match (Check(env, t), Check(env, e))
-      case (Some(a), Some(c)) => if a == c then Some(a) else None
-      case _ => None
+      (match (Check(env, t), Check(env, e))
+       case (Some(a), Some(c)) => if a == c then Some(a) else None
+       case _ => None)
     case While(body) =>
       // Rule 5: a loop body must leave every buffer as it found it.
       if Check(env, body) == Some(env) then Some(env) else None
@@ -220,7 +221,18 @@ module PhaseCore {
   lemma AcceptsCaptureLoop()
     ensures Check(map[0 := RAM], While(Seq(Start(0), Seq(Sync(0), Read(0)))))
             == Some(map[0 := RAM])
-  {}
+  {
+    var ram: Env := map[0 := RAM];
+    var dma: Env := map[0 := DMA];
+    assert ram[0 := DMA] == dma;
+    assert dma[0 := RAM] == ram;
+    // Unfold Check one level at a time, innermost first.
+    assert Check(ram, Read(0)) == Some(ram);
+    assert Check(dma, Sync(0)) == Some(ram);
+    assert Check(dma, Seq(Sync(0), Read(0))) == Some(ram);
+    assert Check(ram, Start(0)) == Some(dma);
+    assert Check(ram, Seq(Start(0), Seq(Sync(0), Read(0)))) == Some(ram);
+  }
 }
 
 // ===========================================================================
