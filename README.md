@@ -135,11 +135,12 @@ checked the same way, one analyzer check removed at a time, and caught. Details,
 were *not* caught until the generator was fixed, in
 [`phase_specification.md`](phase_specification.md) §6.7.
 
-Fuzzing is evidence, not proof. [`proofs/dafny/`](proofs/dafny) is
-working toward the proof: PHASE's core domain, branch and loop rules
-stated in Dafny, with a soundness theorem over every path of every
-accepted program. It is in progress and not yet machine-checked; its
-README says what it covers and what comes next.
+Fuzzing is evidence, not proof. [`proofs/dafny/`](proofs/dafny) is the
+start of the proof: PHASE's core domain, branch and loop rules stated in
+Dafny, with a machine-checked soundness theorem over every path of every
+accepted program, re-verified by CI on every push. It covers a model of
+the analyzer and a subset of the rules so far; its README says exactly
+what is proved and what comes next.
 
 Once these checks pass, PHASE lowers the pipeline to plain, readable C.
 Domain, borrow, and typestate checks are all compile-time-only and fully
@@ -368,7 +369,7 @@ demos/
   m6_volatile_proof/   before/after proof that a C compiler really does delete non-volatile writes
 
 proofs/
-  dafny/               the core rules in Dafny, with a soundness proof in progress
+  dafny/               the core rules in Dafny, with a machine-checked soundness proof
 
 docs/
   tutorial/                   PHASE in 15 minutes: the programs, and the page generated from them

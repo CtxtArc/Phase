@@ -64,3 +64,14 @@ jobs:
         run: |
           ./scripts/capture_bug_gallery.sh
           git diff --exit-code docs/bug_gallery_transcript.md
+
+  proofs:
+    name: Dafny soundness proof
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dafny-lang/setup-dafny-action@v1
+        with:
+          dafny-version: "4.9.1"
+      - name: Verify the core rules
+        run: dafny verify proofs/dafny/PhaseCore.dfy

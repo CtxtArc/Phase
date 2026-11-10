@@ -1,14 +1,19 @@
-# A mechanized soundness proof for PHASE's rules (in progress)
+# A mechanized soundness proof for PHASE's rules
 
-The fuzzer is evidence that the analyzer is sound; this directory is
-working toward a proof of it. `PhaseCore.dfy` states PHASE's core rules
-in [Dafny](https://dafny.org) and proves them sound against a run-time
-semantics, so the guarantee holds for every program and every path, not
-just the ones phase-fuzz happens to generate.
+The fuzzer is evidence that the analyzer is sound; this directory is a
+proof of it, for the rules modeled so far. `PhaseCore.dfy` states
+PHASE's core rules in [Dafny](https://dafny.org) and proves them sound
+against a run-time semantics, so the guarantee holds for every program
+and every path, not just the ones phase-fuzz happens to generate.
 
-**Status: not yet machine-checked.** The file has not been run through
-the verifier yet; until `dafny verify` passes, nothing here counts as a
-proof.
+**Status: machine-checked** (`dafny verify`: 19 verified, 0 errors), and
+CI re-verifies it on every push.
+
+**What it does not yet say.** The proof is about a model of the analyzer,
+not the Rust code in `crates/analysis`; closing that gap is step 6 of the
+roadmap. It covers the domain, branch and loop rules only, and tracks who
+owns each buffer but not what is in it, so "no DMA race" in the sense of
+step 1 is not proved yet.
 
 ## What it covers so far
 
